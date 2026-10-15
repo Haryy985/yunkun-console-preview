@@ -14,7 +14,15 @@ Rowan · 云鲲安全
 
 </div>
 
-> 本仓库提供产品介绍、界面预览与使用说明，暂不包含产品源码和安装包。下文介绍当前交付代码中的能力，不代表全部场景已完成实测。
+> 本仓库提供产品介绍、界面预览、源码和 Windows 完全离线交付包。下文介绍当前交付代码中的能力，不代表全部场景已完成实测。
+
+## 获取产品
+
+- 源码：[`source/`](source/)
+- Windows 完全离线版：见 [Releases](https://github.com/Haryy985/yunkun-console-preview/releases)
+- 在线构建版：源码目录中的 `setup-and-start.bat` 会在首次启动时下载依赖并编译
+
+完全离线版已包含编译后的控制台和 PostgreSQL 运行时。解压后双击 `setup-and-start-offline.bat`，不需要 Go、Node.js、npm、Docker 或联网下载依赖。
 
 ## 云鲲是什么
 
@@ -172,7 +180,9 @@ RAG 知识库和代理池是 Rowan / 云鲲安全在原始源码基础上后续�
 
 ## 部署说明
 
-采用原生部署路线，不要求 Docker。**当前文章仓库没有安装脚本，以下步骤仅适用于获取正式源码交付包之后。**
+采用原生部署路线，不要求 Docker。源码交付包和完全离线版分别提供两种启动方式。
+
+完全离线版：从 [Releases](https://github.com/Haryy985/yunkun-console-preview/releases) 下载压缩包，解压后双击 `setup-and-start-offline.bat`，等待本机数据库初始化和应用就绪。
 
 Windows x64 全新安装的操作路径：
 
