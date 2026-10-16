@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"iter"
 	"net/http"
@@ -26,7 +27,15 @@ func (p *budgetProbe) Stream(_ context.Context, req llm.CompletionRequest) iter.
 	return func(yield func(llm.StreamEvent, error) bool) {
 		p.calls++
 		p.last = req
-		yield(llm.StreamEvent{Type: llm.SETextDelta, Text: "ok"}, nil)
+		for _, ev := range []llm.StreamEvent{
+			{Type: llm.SETextDelta, Text: "ok"},
+			{Type: llm.SEMessageDelta, StopReason: "end_turn"},
+			{Type: llm.SEMessageStop},
+		} {
+			if !yield(ev, nil) {
+				return
+			}
+		}
 	}
 }
 
@@ -43,10 +52,10 @@ func TestRequestBudgetCapacityAndOutput(t *testing.T) {
 		request, limit, output int
 		source                 string
 	}{
-		{"unknown", Config{}, 0, 64000, 8192, "unknown_local_policy"},
-		{"unconfirmed", Config{ContextWindowK: 200}, 0, 64000, 8192, "unconfirmed_local_policy"},
-		{"small_unconfirmed", Config{ContextWindowK: 8}, 0, 8000, 2000, "unconfirmed_local_policy"},
-		{"confirmed", Config{ContextWindowK: 8, ContextWindowConfirmed: true}, 0, 8000, 2000, "confirmed_profile"},
+		{"unknown", Config{}, 0, 64000, 0, "unknown_local_policy"},
+		{"unconfirmed", Config{ContextWindowK: 200}, 0, 64000, 0, "unconfirmed_local_policy"},
+		{"small_unconfirmed", Config{ContextWindowK: 8}, 0, 8000, -1, "unconfirmed_local_policy"},
+		{"confirmed", Config{ContextWindowK: 8, ContextWindowConfirmed: true}, 0, 8000, -1, "confirmed_profile"},
 		{"configured_cap", Config{MaxTokens: 512}, 1024, 64000, 512, "unknown_local_policy"},
 		{"smaller_request", Config{MaxTokens: 512}, 128, 64000, 128, "unknown_local_policy"},
 		{"explicit_request", Config{}, 16000, 64000, 16000, "unknown_local_policy"},
@@ -57,10 +66,71 @@ func TestRequestBudgetCapacityAndOutput(t *testing.T) {
 			}
 			p := &budgetProvider{config: tc.cfg}
 			prepared, err := p.prepare(llm.CompletionRequest{MaxTokens: tc.request})
-			if err != nil || prepared.MaxTokens != tc.output {
+			if err != nil || (tc.output >= 0 && prepared.MaxTokens != tc.output) ||
+				(tc.output < 0 && (prepared.MaxTokens <= 0 || prepared.MaxTokens >= defaultOutputBudget)) {
 				t.Fatalf("output=%d err=%v", prepared.MaxTokens, err)
 			}
 		})
+	}
+}
+
+func TestRequestBudgetCompactionWindowMatchesGuard(t *testing.T) {
+	if got := compactionConfig(0).ContextWindow; got != unknownContextBudget {
+		t.Fatalf("default compaction window = %d, want %d", got, unknownContextBudget)
+	}
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+		want int
+	}{
+		{"unknown", Config{}, 64000},
+		{"unconfirmed_large", Config{ContextWindowK: 200}, 64000},
+		{"unconfirmed_small", Config{ContextWindowK: 48}, 48000},
+		{"confirmed", Config{ContextWindowK: 200, ContextWindowConfirmed: true}, 200000},
+		{"confirmed_small", Config{ContextWindowK: 8, ContextWindowConfirmed: true}, 8000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.cfg.CompactionWindow(); got != tc.want {
+				t.Fatalf("compaction window = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRequestBudgetShrinksExcessOutputOnFirstTurn(t *testing.T) {
+	probe := &budgetProbe{}
+	p := &budgetProvider{Provider: probe}
+	req := llm.CompletionRequest{System: []string{strings.Repeat("x", 100000)}, MaxTokens: 32768}
+	if _, _, _, err := p.Complete(t.Context(), req); err != nil {
+		t.Fatal(err)
+	}
+	if probe.calls != 1 || probe.last.MaxTokens >= req.MaxTokens || probe.last.MaxTokens < 28000 {
+		t.Fatalf("first request rejected or output not adjusted: calls=%d maxTokens=%d", probe.calls, probe.last.MaxTokens)
+	}
+	if req.MaxTokens != 32768 {
+		t.Fatal("caller request was mutated")
+	}
+	for range p.Stream(t.Context(), req) {
+	}
+	if probe.calls != 2 || probe.last.MaxTokens >= req.MaxTokens {
+		t.Fatal("stream request did not apply the same output cap")
+	}
+}
+
+func TestRequestBudgetPreservesProviderDefaultUntilCapacityRequiresCap(t *testing.T) {
+	probe := &budgetProbe{}
+	p := &budgetProvider{Provider: probe}
+	if _, _, _, err := p.Complete(t.Context(), llm.CompletionRequest{Messages: []llm.Message{llm.UserText("hello")}}); err != nil {
+		t.Fatal(err)
+	}
+	if probe.calls != 1 || probe.last.MaxTokens != 0 {
+		t.Fatalf("unconfigured output changed provider default: calls=%d output=%d", probe.calls, probe.last.MaxTokens)
+	}
+	if _, _, _, err := p.Complete(t.Context(), llm.CompletionRequest{System: []string{strings.Repeat("x", 174000)}}); err != nil {
+		t.Fatal(err)
+	}
+	if probe.last.MaxTokens <= 0 || probe.last.MaxTokens >= defaultOutputBudget {
+		t.Fatalf("near-capacity request did not receive a bounded output: %d", probe.last.MaxTokens)
 	}
 }
 
@@ -116,15 +186,76 @@ func TestRequestBudgetCountsAllInputBeforeDelivery(t *testing.T) {
 	}
 }
 
-func TestRequestBudgetRejectsInvalidEncodingAndOversizedOutput(t *testing.T) {
+func TestRequestBudgetHonorsSmallExplicitOutputNearLimit(t *testing.T) {
+	p := &budgetProvider{}
+	req := llm.CompletionRequest{System: []string{strings.Repeat("x", 174000)}, MaxTokens: 321}
+	prepared, err := p.prepare(req)
+	if err != nil || prepared.MaxTokens != 321 {
+		t.Fatalf("small explicit output rejected: output=%d err=%v", prepared.MaxTokens, err)
+	}
+	req.MaxTokens = 32768
+	prepared, err = p.prepare(req)
+	if err != nil || prepared.MaxTokens <= minForwardOutput || prepared.MaxTokens >= req.MaxTokens {
+		t.Fatalf("large output should shrink to remaining space: output=%d err=%v", prepared.MaxTokens, err)
+	}
+}
+
+func TestRequestBudgetShrinksToRemainingSpaceNearLimit(t *testing.T) {
+	p := &budgetProvider{}
+	req := llm.CompletionRequest{
+		System:    []string{strings.Repeat("x", 184000)},
+		MaxTokens: 32768,
+	}
+	prepared, err := p.prepare(req)
+	if err != nil {
+		t.Fatalf("near-limit request should shrink output instead of failing: %v", err)
+	}
+	if prepared.MaxTokens <= minForwardOutput || prepared.MaxTokens >= req.MaxTokens {
+		t.Fatalf("unexpected shrunk output: %d", prepared.MaxTokens)
+	}
+}
+
+func TestRequestBudgetAllowsSmallUnknownNearEdgeProbe(t *testing.T) {
+	p := &budgetProvider{}
+	req := llm.CompletionRequest{
+		System:    []string{strings.Repeat("x", 194000)},
+		MaxTokens: 32768,
+	}
+	prepared, err := p.prepare(req)
+	if err != nil || prepared.MaxTokens != minForwardOutput {
+		t.Fatalf("near-edge unknown request should use bounded probe: output=%d err=%v", prepared.MaxTokens, err)
+	}
+}
+
+func TestRequestBudgetSDKFirstTurnSucceeds(t *testing.T) {
+	probe := &budgetProbe{}
+	cfg := Config{MaxTokens: 32768}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	_, err := agentcore.Run(ctx, agentcore.Options{
+		Provider:     &budgetProvider{Provider: probe, config: cfg},
+		SystemPrompt: []string{strings.Repeat("x", 100000)},
+		MaxTokens:    cfg.MaxTokens,
+		Compaction:   compactionConfig(cfg.CompactionWindow()),
+	}, "hello")
+	if err != nil || probe.calls != 1 || probe.last.MaxTokens >= cfg.MaxTokens {
+		t.Fatalf("first SDK turn failed: calls=%d output=%d err=%v", probe.calls, probe.last.MaxTokens, err)
+	}
+}
+
+func TestRequestBudgetRejectsInvalidEncodingAndOversizedInput(t *testing.T) {
 	p := &budgetProvider{}
 	for _, req := range []llm.CompletionRequest{
-		{MaxTokens: 64000},
+		{System: []string{strings.Repeat("x", 300000)}, MaxTokens: 64000},
 		{Tools: []llm.ToolSchema{{InputSchema: map[string]any{"private": make(chan int)}}}},
 	} {
 		if _, err := p.prepare(req); err == nil || strings.Contains(err.Error(), "private") {
 			t.Fatalf("unexpected error: %v", err)
 		}
+	}
+	prepared, err := p.prepare(llm.CompletionRequest{MaxTokens: 64000})
+	if err != nil || prepared.MaxTokens >= 64000 {
+		t.Fatalf("oversized output should fit the local budget: output=%d err=%v", prepared.MaxTokens, err)
 	}
 }
 
@@ -167,6 +298,44 @@ func TestRequestBudgetWireOutputCaps(t *testing.T) {
 			}
 			if calls != 1 {
 				t.Fatalf("calls=%d", calls)
+			}
+		})
+	}
+}
+
+func TestRequestBudgetWireProviderDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		format llm.Format
+		want   float64
+		body   string
+		window int
+	}{
+		{llm.FormatAnthropic, 8192, `{"id":"m","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`, 0},
+		{llm.FormatOpenAI, 0, `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`, 0},
+		{llm.FormatAnthropic, -1, `{"id":"m","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`, 8},
+	} {
+		t.Run(fmt.Sprintf("%s/%dk", tc.format, tc.window), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+				}
+				got, present := body["max_tokens"].(float64)
+				if (tc.want >= 0 && (got != tc.want || present != (tc.want != 0))) ||
+					(tc.want < 0 && (!present || got <= 0 || got >= 8000)) {
+					t.Errorf("wire max_tokens = %v (present=%v), want %v", got, present, tc.want)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
+			provider, err := (Config{Format: tc.format, Model: "test", APIKey: "test", BaseURL: srv.URL,
+				ContextWindowK: tc.window, ContextWindowConfirmed: tc.window > 0}).NewProvider()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, _, err := provider.Complete(t.Context(), llm.CompletionRequest{Messages: []llm.Message{llm.UserText("hello")}}); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}

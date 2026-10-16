@@ -47,7 +47,7 @@ func (m *MainAgent) SetNonStreaming(fn func() bool) { m.nonStreamingFn = fn }
 func (m *MainAgent) nonStreaming() bool { return m.nonStreamingFn != nil && m.nonStreamingFn() }
 
 // SetMaxTokens wires a resolver for the per-reply output cap. nil/unset or 0 =
-// use the provider's local default budget. Read per run, like nonStreaming.
+// use the SDK adapter default. Read per run, like nonStreaming.
 func (m *MainAgent) SetMaxTokens(fn func() int) { m.maxTokensFn = fn }
 
 func (m *MainAgent) maxTokens() int {
@@ -162,7 +162,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 		// 命中预算(步数)→ SDK 跑收尾:向用户输出一句进展总结。Prompt 与收尾轮数可后台编辑(默认 10 轮)。
 		Settlement:   wrapupSettlement("mainagent", nil),
 		NonStreaming: m.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
-		MaxTokens:    m.maxTokens(),    // 0 = 使用 provider 本地预算默认值
+		MaxTokens:    m.maxTokens(),    // 0 = 沿用 SDK 适配器默认值
 	}
 	if m.tx != nil { // persist raw human↔AI conversation; one accumulating file per segment
 		opts.Transcript = m.tx

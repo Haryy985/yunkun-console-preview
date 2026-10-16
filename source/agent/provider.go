@@ -62,7 +62,8 @@ type Config struct {
 	// 某些网关糟糕的 SSE 实现(空帧、思考字段丢帧),代价是失去运行中的实时进度/实时
 	// token 计数。映射为 agentcore.Options.NonStreaming = !Stream。
 	Stream bool
-	// MaxTokens 是单次回复的输出上限(token)。0 = 使用本地预算默认上限(通常 8192)。
+	// MaxTokens 是单次回复的输出上限(token)。0 = 沿用 SDK 适配器默认值：
+	// OpenAI 格式不发送该字段，Anthropic 格式使用 8192。
 	// 与 ContextWindowK 不同:后者是模型总容量,用于本地预算与压缩阈值,
 	// 不出现在请求里;本值随每次请求发出。映射为 agentcore.Options.MaxTokens。
 	MaxTokens int
@@ -102,30 +103,14 @@ type RetryConfig struct {
 	StreamInterval time.Duration
 }
 
-// compaction window resolution bounds (in K tokens). Below the floor the
-// threshold math (window − summary reserve − buffer) would go non-positive and
-// compaction would fire every turn; above the cap it would never fire.
-const (
-	defaultWindowK = 200  // unset → assume a 200K window (Claude default)
-	minWindowK     = 32   // floor so effectiveWindow stays comfortably positive
-	maxWindowK     = 1000 // cap at 1M tokens (user request)
-)
+const maxWindowK = 1000 // cap at 1M tokens (user request)
 
-// CompactionWindow returns the model context window in TOKENS for compaction
-// thresholds, resolved from the user-configured size (ContextWindowK). 0/unset →
-// a 200K default; otherwise clamped to [32K, 1M] so compaction stays effective.
+// CompactionWindow returns the effective request budget in tokens for history
+// compaction. An unknown or unconfirmed capacity must not let the SDK postpone
+// compaction past the local request guard's 64K ceiling.
 func (c Config) CompactionWindow() int {
-	k := c.ContextWindowK
-	if k <= 0 {
-		k = defaultWindowK
-	}
-	if k < minWindowK {
-		k = minWindowK
-	}
-	if k > maxWindowK {
-		k = maxWindowK
-	}
-	return k * 1000
+	limit, _ := c.requestBudget()
+	return limit
 }
 
 // compactionConfig builds the agent-core compaction config for a context window
@@ -133,7 +118,7 @@ func (c Config) CompactionWindow() int {
 // is set on Options.Compaction.
 func compactionConfig(windowTokens int) *compaction.Config {
 	if windowTokens <= 0 {
-		windowTokens = defaultWindowK * 1000
+		windowTokens = unknownContextBudget
 	}
 	return &compaction.Config{ContextWindow: windowTokens}
 }
@@ -284,7 +269,10 @@ func (c Config) NewProvider() (llm.Provider, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &budgetProvider{Provider: provider, config: c}, nil
+	return &budgetProvider{
+		Provider: &validatedProvider{Provider: provider, format: c.Provider()},
+		config:   c,
+	}, nil
 }
 
 // IsQuotaExhaustedMessage deliberately recognizes only explicit balance,

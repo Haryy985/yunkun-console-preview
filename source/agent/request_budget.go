@@ -12,6 +12,8 @@ import (
 const (
 	unknownContextBudget = 64000
 	defaultOutputBudget  = 8192
+	minForwardOutput     = 1024
+	unknownBudgetOverage = 16384
 )
 
 // RequestBudgetError carries numbers only, never prompts, tool data or keys.
@@ -50,8 +52,9 @@ func (p *budgetProvider) prepare(req llm.CompletionRequest) (llm.CompletionReque
 	if p.config.MaxTokens > 0 && (req.MaxTokens <= 0 || req.MaxTokens > p.config.MaxTokens) {
 		req.MaxTokens = p.config.MaxTokens
 	}
-	if req.MaxTokens <= 0 {
-		req.MaxTokens = min(defaultOutputBudget, limit/4)
+	outputReserve := req.MaxTokens
+	if outputReserve <= 0 {
+		outputReserve = defaultOutputBudget
 	}
 	// Serializing the whole neutral request includes system segments, schemas,
 	// signatures and recursively nested tool results. This deliberately estimates
@@ -69,12 +72,34 @@ func (p *budgetProvider) prepare(req llm.CompletionRequest) (llm.CompletionReque
 		}
 	}
 	estimated := (ascii+2)/3 + other + 64 + 16*len(req.Messages) + 32*len(req.Tools)
-	safety := min(max(512, limit/20), limit/4)
-	if req.MaxTokens > limit-safety || estimated > limit-safety-req.MaxTokens {
+	// Keep a small tokenizer-estimation margin without consuming the entire
+	// tail of an unknown 64K window. The request estimate already includes
+	// structural overhead; a fixed 5% reserve made otherwise executable
+	// planner turns fail before the provider was contacted.
+	safety := min(max(512, limit/64), limit/8)
+	available := limit - safety - estimated
+	// A configured output cap is an upper bound, not a minimum reservation.
+	// When the request is close to the local ceiling, forward the largest
+	// output that still fits instead of rejecting a potentially executable
+	// planner turn. Keep a small floor so the provider cannot receive a
+	// request that is guaranteed to be empty.
+	minimumOutput := min(outputReserve, minForwardOutput)
+	if available < minimumOutput {
+		// Unknown provider capacities are guarded conservatively, but the
+		// neutral estimate intentionally overcounts JSON and token boundaries.
+		// Permit a small near-edge probe with the minimum output budget; a
+		// materially oversized request must still fail locally.
+		if source == "unknown_local_policy" && estimated <= limit+unknownBudgetOverage {
+			req.MaxTokens = minimumOutput
+			return req, nil
+		}
 		return req, &RequestBudgetError{
-			EstimatedInput: estimated, OutputReserve: req.MaxTokens,
+			EstimatedInput: estimated, OutputReserve: outputReserve,
 			SafetyReserve: safety, Limit: limit, CapacitySource: source,
 		}
+	}
+	if available < outputReserve {
+		req.MaxTokens = available
 	}
 	return req, nil
 }

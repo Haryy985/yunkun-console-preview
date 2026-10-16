@@ -53,7 +53,7 @@ func (c *ChatAgent) nonStreaming() bool { return c.nonStreamingFn != nil && c.no
 func (c *ChatAgent) SetNoaEnabled(fn func() bool) { c.noaEnabledFn = fn }
 
 // SetMaxTokens wires a resolver for the per-reply output cap. nil/unset or 0 =
-// use the provider's local default budget. Read per run, like nonStreaming.
+// use the SDK adapter default. Read per run, like nonStreaming.
 func (c *ChatAgent) SetMaxTokens(fn func() int) { c.maxTokensFn = fn }
 
 func (c *ChatAgent) maxTokens() int {
@@ -167,7 +167,7 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		// (自定义 agent 各自一份;留空/0 用通用默认:10 轮)。
 		Settlement:   wrapupSettlement(agentKey, nil),
 		NonStreaming: c.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
-		MaxTokens:    c.maxTokens(),    // 0 = 使用 provider 本地预算默认值
+		MaxTokens:    c.maxTokens(),    // 0 = 沿用 SDK 适配器默认值
 	}
 	if c.guard != nil {
 		opts.Hooks = c.guard.Hooks()

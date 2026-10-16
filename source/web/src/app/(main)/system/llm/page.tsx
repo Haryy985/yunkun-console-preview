@@ -678,7 +678,7 @@ function ProfileEditor({
           </div>
           <p className="-mt-2 text-muted-foreground text-xs">
             限速 0 = 不限，全 Agent 共享。上下文窗口单位 K（千 token），上限 1000（即 1M）。
-            未核实容量时，请求预算按本地策略最多 64K 估算；0 的历史压缩阈值仍默认按 200K 计算。
+            未核实容量时，请求预算与历史压缩窗口按本地策略最多 64K 估算；输出上限超过本次剩余容量时会自动降低。
           </p>
           <div className="flex items-center justify-between gap-4">
             <Label htmlFor="p-cw-confirmed">已核实该模型的上下文容量</Label>

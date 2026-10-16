@@ -159,7 +159,7 @@ func DecomposeGoalsWithProvider(ctx context.Context, prov llm.Provider, dataDir,
 		// 3 步(抽约束 → 登记范围 → 拆目标)各需一次工具调用,给足回合避免收尾前漏调 set_goals。
 		MaxTurns:     8,
 		NonStreaming: nonStreaming, // 该 profile 选非流式时走 Provider.Complete
-		MaxTokens:    maxTokens,    // 0 = 使用 provider 本地预算默认值
+		MaxTokens:    maxTokens,    // 0 = 沿用 SDK 适配器默认值
 	}, userMsg, captureEmit)
 	// set_goals persisted the goals directly; read them back so the caller sees what
 	// was written (empty slice ⇒ the LLM produced nothing ⇒ caller falls back).

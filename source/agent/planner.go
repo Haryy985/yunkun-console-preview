@@ -71,7 +71,7 @@ func (p *Planner) nonStreaming() bool { return p.nonStreamingFn != nil && p.nonS
 func (p *Planner) SetNoaEnabled(fn func() bool) { p.noaEnabledFn = fn }
 
 // SetMaxTokens wires a resolver for the per-reply output cap. nil/unset or 0 =
-// use the provider's local default budget. Read per run, like nonStreaming.
+// use the SDK adapter default. Read per run, like nonStreaming.
 func (p *Planner) SetMaxTokens(fn func() int) { p.maxTokensFn = fn }
 
 func (p *Planner) maxTokens() int {
@@ -436,7 +436,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		// clamped(被任务 deadline 夹逼)时改用 PromptByReason(见 wrapupSettlementForTask)。
 		Settlement:   settle,
 		NonStreaming: p.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
-		MaxTokens:    p.maxTokens(),    // 0 = 使用 provider 本地预算默认值
+		MaxTokens:    p.maxTokens(),    // 0 = 沿用 SDK 适配器默认值
 	}
 	if p.tx != nil { // persist raw LLM conversation; one accumulating file per task's planner
 		opts.Transcript = p.tx

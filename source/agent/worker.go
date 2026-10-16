@@ -124,7 +124,7 @@ func (w *Worker) nonStreaming() bool { return w.nonStreamingFn != nil && w.nonSt
 func (w *Worker) SetNoaEnabled(fn func() bool) { w.noaEnabledFn = fn }
 
 // SetMaxTokens wires a resolver for the per-reply output cap. nil/unset or 0 =
-// use the provider's local default budget. Read per run, like nonStreaming.
+// use the SDK adapter default. Read per run, like nonStreaming.
 func (w *Worker) SetMaxTokens(fn func() int) { w.maxTokensFn = fn }
 
 func (w *Worker) maxTokens() int {
@@ -467,7 +467,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		Compaction:    compactionConfig(w.compactionWindow()), // long tool-heavy runs stay within the window
 		Todos:         actool.NewTodoStore(),                  // 会话级临时待办（TodoWrite），纯规划用，退出即丢
 		NonStreaming:  w.nonStreaming(),                       // 该 profile 选非流式时走 Provider.Complete
-		MaxTokens:     w.maxTokens(),                          // 0 = 使用 provider 本地预算默认值
+		MaxTokens:     w.maxTokens(),                          // 0 = 沿用 SDK 适配器默认值
 	}
 	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
 		opts.Hooks = hooks

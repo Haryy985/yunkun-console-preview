@@ -11,12 +11,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"yunkun/console/agent"
-	"yunkun/console/db"
-	"yunkun/console/intercept"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/jackc/pgx/v5/pgconn"
+	"yunkun/console/agent"
+	"yunkun/console/db"
+	"yunkun/console/intercept"
 )
 
 // isFKViolation reports whether err is a Postgres foreign-key violation (SQLSTATE
@@ -80,6 +80,13 @@ var errWorkControlConflict = errors.New("work control conflict")
 // In particular, a quota error after partial streaming advances the task cursor
 // for the next LLM call but must not replay this whole intent on the backup.
 func retryableWorkerModelError(reason harness.TerminalReason, err error) bool {
+	// Response validation failures must not replay tools from earlier turns.
+	// An incomplete response can only be retried by the request router before
+	// any output has been delivered.
+	var responseErr *agent.ModelResponseError
+	if errors.As(err, &responseErr) {
+		return false
+	}
 	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err)
 }
 

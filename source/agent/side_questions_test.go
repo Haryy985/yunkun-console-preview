@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"yunkun/console/db"
-	"yunkun/console/sidequestion"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
+	"yunkun/console/db"
+	"yunkun/console/sidequestion"
 )
 
 type sideAgentProvider struct {
@@ -53,6 +53,28 @@ func (p *sideAgentProvider) Complete(_ context.Context, req llm.CompletionReques
 		return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: llm.BlockToolUse, ID: "fixture-read", Name: "Read", Input: input}}}, "tool_use", llm.Usage{}, nil
 	}
 	return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("main finished")}}, "end_turn", llm.Usage{}, nil
+}
+
+func TestSideParentFromRunInfoKeepsOwnershipExclusive(t *testing.T) {
+	parent, ok := sideParentFromRunInfo(RunInfo{
+		TaskID:        7,
+		ExplorationID: 8,
+		IntentID:      9,
+		SessionID:     "conv-42",
+	})
+	if !ok || parent.ConversationID != 42 || parent.TaskID != 0 || parent.ExplorationID != 0 || parent.IntentID != 0 {
+		t.Fatalf("conversation parent mixed task ownership: ok=%t parent=%+v", ok, parent)
+	}
+
+	parent, ok = sideParentFromRunInfo(RunInfo{TaskID: 7, ExplorationID: 8, IntentID: 9})
+	if !ok || parent.ConversationID != 0 || parent.TaskID != 7 || parent.ExplorationID != 8 || parent.IntentID != 9 {
+		t.Fatalf("task parent malformed: ok=%t parent=%+v", ok, parent)
+	}
+
+	parent, ok = sideParentFromRunInfo(RunInfo{TaskID: 7, SessionID: "conv-invalid"})
+	if ok || parent != (sidequestion.Parent{}) {
+		t.Fatalf("incomplete parent should not attach: ok=%t parent=%+v", ok, parent)
+	}
 }
 
 func TestSideActualChatCheckpointToolResultAndTranscriptIsolation(t *testing.T) {

@@ -24,6 +24,14 @@ Rowan · 云鲲安全
 
 完全离线版已包含编译后的控制台和 PostgreSQL 运行时。解压后双击 `setup-and-start-offline.bat`，不需要 Go、Node.js、npm、Docker 或联网下载依赖。
 
+### 2026-10-16 离线更新
+
+`v1.0.1-offline` 修复了 Agent 请求接近上下文容量时过早终止、旁路会话检查点归属错误，并保留未配置输出上限时的适配器默认行为。下载 Release 附件 `yunkun-v1.0.1-offline-windows-x64.zip`；GitHub 自动生成的 Source code ZIP **不是**可直接启动的离线包。
+
+ZIP SHA-256：`DBDFBB8792AE9462D90B838497091AB7F493033216ED28B93382D1D222E5CA51`
+
+已安装用户请先阅读[离线安装与更新手册](docs/OFFLINE_UPDATE.md)，备份私有数据库、配置和 Skills，再迁移到新目录。修复范围、测试结果和未验证项见[Agent 稳定性记录](docs/agent-reliability-2026-10-16.md)。新包不会自动替换正在运行的本机安装。
+
 ## 云鲲是什么
 
 云鲲自动化渗透控制台是一套面向授权安全测试的 Agent 工作台，将对话、任务、工具、知识库、代理资源、HTTP 流量、漏洞发现与报告集中管理。

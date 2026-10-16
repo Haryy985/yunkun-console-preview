@@ -12,11 +12,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/norma/transcript"
 	"yunkun/console/agent"
 	"yunkun/console/db"
 	"yunkun/console/llmrec"
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/transcript"
 )
 
 type taskAgentBundle struct {
@@ -430,6 +430,10 @@ func sameProviderRetryPolicy(r agent.RetryConfig) (retries int, backoff func(int
 //   - 4xx 确定性拒绝(400/401/403/404/422):到哪个 provider 都一样会失败
 func isRetryableStreamError(err error) bool {
 	if err == nil {
+		return false
+	}
+	var responseErr *agent.ModelResponseError
+	if errors.As(err, &responseErr) && !responseErr.Incomplete {
 		return false
 	}
 	if isQuotaExhaustedError(err) {
