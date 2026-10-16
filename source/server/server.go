@@ -717,8 +717,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/logs/history", s.getLogsHistory)
 	mux.HandleFunc("GET /api/logs/stream", s.streamLogs)
 
-	// Keep legacy endpoints fail-closed until a trusted release feed exists.
-	mux.HandleFunc("GET /api/update/check", updateUnavailable)
+	// Release discovery is read-only; binary replacement stays fail-closed.
+	mux.HandleFunc("GET /api/update/check", updateCheck)
 	mux.HandleFunc("POST /api/update/apply", updateUnavailable)
 	mux.HandleFunc("POST /api/update/rollback", updateUnavailable)
 	mux.HandleFunc("GET /api/update/stream", updateUnavailable)

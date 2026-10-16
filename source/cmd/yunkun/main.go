@@ -46,8 +46,13 @@ func run() int {
 		addr    = flag.String("addr", ":8787", "HTTP listen address")
 		dataDir = flag.String("data", filepath.Join(config.BaseDir(), "data"), "data directory for SQLite stores (default: data/ next to the executable)")
 		proxy   = flag.String("proxy", "127.0.0.1:8788", "traffic recording proxy address (empty to disable)")
+		showVersion = flag.Bool("version", false, "print build version and exit")
 	)
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version)
+		return 0
+	}
 
 	// hand the build version to the server package so GET /api/health can report it
 	// to the frontend top bar.
@@ -59,7 +64,7 @@ func run() int {
 	// page can show a live log stream. Do this first, to catch startup logs too.
 	server.StartLogCapture()
 
-	// Application updates remain disabled until a trusted Yunkun release feed exists.
+	// Release discovery is read-only; applying updates remains an offline, backed-up operation.
 
 	// surface which config file the binary reads (absolute, so `go run`'s relative
 	// "config.json" — resolved against the CWD — is unambiguous).

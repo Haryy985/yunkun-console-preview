@@ -302,6 +302,15 @@ export const api = {
   reassignTaskProxyLease: (id: string) => post<{ ok: boolean }>(`/tasks/${encodeURIComponent(id)}/network/lease`),
   // 后端应用版本号（release 时由 ldflags 注入，默认 "dev"）。
   health: () => get<{ ok: boolean; service: string; version: string }>("/health"),
+  checkUpdate: (refresh = false) => get<{
+    status: "available" | "current" | "unavailable" | "unsupported";
+    current_version: string;
+    latest_version?: string;
+    release_url?: string;
+    package_url?: string;
+    package_sha256?: string;
+    checked_at?: string;
+  }>(refresh ? "/update/check?refresh=1" : "/update/check"),
 
   // ---- auth ----
   authStatus: () => get<{ initialized: boolean }>("/auth/status"),

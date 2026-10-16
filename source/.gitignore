@@ -2,6 +2,7 @@
 /data/
 /.tools/
 /.yunkun-local/
+/.yunkun-local-*/
 /yunkun
 /yunkun.exe
 /*.exe
@@ -39,6 +40,10 @@ web/next-env.d.ts
 # Only reviewed documentation and UI evidence are published.
 /docs/*
 !/docs/README.md
+!/docs/OFFLINE_UPDATE.md
+!/docs/DEPLOYMENT.md
+!/docs/WINDOWS.md
+!/docs/agent-reliability-2026-10-16.md
 !/docs/upstream-README.md
 !/docs/ui-layout-review/
 /docs/ui-layout-review/*

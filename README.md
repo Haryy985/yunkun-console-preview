@@ -24,7 +24,15 @@ Rowan · 云鲲安全
 
 完全离线版已包含编译后的控制台和 PostgreSQL 运行时。解压后双击 `setup-and-start-offline.bat`，不需要 Go、Node.js、npm、Docker 或联网下载依赖。
 
-### 2026-10-16 离线更新
+### 2026-10-16 v1.0.2 离线更新
+
+`v1.0.2-offline` 增加管理员版本提醒和手动离线升级脚本。升级会先备份并核对旧安装，再迁移私有数据库、配置、Skills 与登录签名密钥；不会自动替换正在运行的程序。旧版没有版本提醒，需先手动升级一次。
+
+下载 Release 附件 `yunkun-v1.0.2-offline-windows-x64.zip`，不要使用 GitHub 自动生成的 Source code ZIP 作为离线安装包。ZIP SHA-256：`33B19E3020099A86BF806E693929532318B25639E4CFEA767E0CCD13E664A90C`。
+
+已在本机隔离数据库上验证首次启动、健康接口和登录页，以及模拟数据的迁移；尚未在另一台干净 Windows 电脑完成设置密码、登录和真实模型任务的端到端验收。更新前请阅读[离线安装与更新手册](docs/OFFLINE_UPDATE.md)，勿覆盖旧目录。
+
+### v1.0.1 Agent 稳定性修复
 
 `v1.0.1-offline` 修复了 Agent 请求接近上下文容量时过早终止、旁路会话检查点归属错误，并保留未配置输出上限时的适配器默认行为。下载 Release 附件 `yunkun-v1.0.1-offline-windows-x64.zip`；GitHub 自动生成的 Source code ZIP **不是**可直接启动的离线包。
 
