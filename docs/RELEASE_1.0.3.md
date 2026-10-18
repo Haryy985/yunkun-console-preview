@@ -9,9 +9,11 @@
 下载 `yunkun-v1.0.3-offline-windows-x64.zip` 和 `SHA256SUMS.txt`。
 GitHub 自动生成的 Source code ZIP 是源码快照，不是离线安装包。
 
-- 压缩包：70,813,354 字节，约 70.8 MB。
-- SHA-256：`82e00cc162c3c4a23f9b05621a14d29102f107cd38b4ff77c78affb88a8768fb`
+- 修订后压缩包：约 96.2 MB，内含官方 VC++ x64 离线运行库安装器。
+- 修订版 SHA-256 以发布页最新 `SHA256SUMS.txt` 为准。
 - 解压后双击 `setup-and-start-offline.bat`，等待就绪后访问 `http://127.0.0.1:5173/`。
+- 需要公网访问时，在云安全组和 Windows 防火墙放行 TCP 5173，再运行
+  `powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\setup-and-start-offline.ps1 -Public -NoBrowser`。
 - 管理员账号为 `yunkun`，首次自行设置密码，没有统一默认密码。
 
 包内含编译后的控制台、当前内嵌页面、PostgreSQL 18.4 和工作流资料。
@@ -65,11 +67,12 @@ GitHub 自动生成的 Source code ZIP 是源码快照，不是离线安装包�
 - 升级：实际 1.0.2 程序建立合成数据后迁移到实际 1.0.3，历史任务、知识库、
   登录会话、代理凭据解密、自定义 Skills 和新工作流均验证通过。
 - 提醒：用模拟高版本发布数据验证提醒、说明和忽略状态；发布后另核对 GitHub 最新 Release。
-- 交付：ZIP 内 1,954 个文件逐项哈希核对；附源码与交付文件清单。
+- 交付：修订 ZIP 内 1,955 个文件逐项哈希核对；附源码与交付文件清单。
 
 跳过项包括 10 项依赖 Unix 假程序或文件名的自更新测试、5 项缺少 Windows 链接权限的测试、
 1 项需要真实模型的检查。完整记录见[验收记录](RELEASE_1.0.3_ACCEPTANCE.md)。
-包内记录写于发布前，候选状态是该次测试的时间点说明；本发布未更换经审核的 ZIP。
+本次修订补齐 Windows VC++ x64 运行库依赖、修复批处理编码，并增加显式 `-Public` 公网监听模式；
+默认仍只监听本机，避免下载后误暴露管理端。
 
 ## 当前边界
 
