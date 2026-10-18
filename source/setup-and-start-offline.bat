@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 setlocal
 cd /d "%~dp0"
 echo 云鲲自动化渗透控制台 - 离线启动

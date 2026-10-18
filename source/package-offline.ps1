@@ -29,6 +29,7 @@ foreach ($required in @(
     'runtime\pgsql-18.4\bin\pg_ctl.exe',
     'runtime\pgsql-18.4\bin\initdb.exe',
     'runtime\pgsql-18.4\bin\psql.exe',
+    'runtime\vc_redist.x64.exe',
     'setup-and-start-offline.bat',
     'setup-and-start-offline.ps1',
     'stop-offline.bat',
@@ -72,6 +73,7 @@ try {
     $entries = @($zip.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
     foreach ($required in @(
         "$name/bin/yunkun.exe", "$name/runtime/pgsql-18.4/bin/pg_ctl.exe",
+        "$name/runtime/vc_redist.x64.exe",
         "$name/upgrade-offline.ps1"
     )) {
         if ($entries -notcontains $required) { throw "Release ZIP lacks $required" }

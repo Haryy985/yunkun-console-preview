@@ -3,6 +3,7 @@
 param(
     [switch]$NoBrowser,
     [switch]$Stop,
+    [switch]$Public,
     [ValidateRange(1024, 65535)][int]$DatabasePort = 5433,
     [ValidateRange(1024, 65535)][int]$ConsolePort = 5173
 )
@@ -154,6 +155,34 @@ function Test-Ready {
     }
 }
 
+function Test-VCRuntime {
+    foreach ($name in @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $env:WINDIR "System32\$name") -PathType Leaf)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Ensure-VCRuntime([string]$Root) {
+    if (Test-VCRuntime) { return }
+    $installer = Join-Path $Root 'runtime\vc_redist.x64.exe'
+    if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+        throw 'Microsoft Visual C++ x64 runtime is missing. The package has no runtime installer.'
+    }
+    Write-Host 'Microsoft Visual C++ x64 runtime is missing. Installing the bundled offline runtime...' -ForegroundColor Yellow
+    try {
+        $setup = Start-Process -FilePath $installer -ArgumentList @('/install', '/quiet', '/norestart') `
+            -Verb RunAs -Wait -PassThru
+        $exitCode = $setup.ExitCode
+    } catch {
+        throw "Could not install the bundled Microsoft Visual C++ x64 runtime: $($_.Exception.Message)"
+    }
+    if ($exitCode -notin @(0, 1638, 3010) -or -not (Test-VCRuntime)) {
+        throw "Microsoft Visual C++ x64 runtime installation failed (exit $exitCode). Run runtime\vc_redist.x64.exe as Administrator."
+    }
+}
+
 function Invoke-OfflineSetup {
     if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitProcess -or
         $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
@@ -223,6 +252,8 @@ function Invoke-OfflineSetup {
         Write-Host 'Offline console stopped. Private data was preserved.'
         return
     }
+
+    Ensure-VCRuntime $root
 
     $owners = @(Get-PortOwners $ConsolePort)
     if ($run -and (Test-OwnedProcess $run.pid $app)) {
@@ -307,9 +338,10 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'yunkun') \gexec
     $env:YUNKUN_CONFIG = $configPath
     $env:YUNKUN_PG_DSN = $null
     $env:YUNKUN_SKILL_DIR = Join-Path $root 'skills'
+    $listenAddress = if ($Public) { '0.0.0.0' } else { '127.0.0.1' }
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $process = Start-Process -FilePath $app -WorkingDirectory $script:LocalHome -WindowStyle Hidden -PassThru `
-        -ArgumentList @('-addr', "127.0.0.1:$ConsolePort", '-proxy=', '-data', ('"' + $dataDir + '"')) `
+        -ArgumentList @('-addr', "$listenAddress`:$ConsolePort", '-proxy=', '-data', ('"' + $dataDir + '"')) `
         -RedirectStandardOutput (Join-Path $script:LocalHome "logs\console-$stamp.out.log") `
         -RedirectStandardError (Join-Path $script:LocalHome "logs\console-$stamp.err.log")
     Write-Json $runPath @{ pid = $process.Id; started = $process.StartTime.ToUniversalTime().ToString('o') }
@@ -318,7 +350,7 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'yunkun') \gexec
         if ($process.HasExited) { throw 'Offline console exited before readiness. Check .yunkun-local\logs.' }
         if (@(Get-PortOwners $ConsolePort).Count -eq 1 -and (Test-Ready)) {
             Write-Host "Ready: http://127.0.0.1:$ConsolePort/"
-            Write-Host "Console port: $ConsolePort. Private PostgreSQL: $($state.databasePort)."
+            Write-Host "Console listen address: $listenAddress`:$ConsolePort. Private PostgreSQL: $($state.databasePort)."
             Write-Host 'Offline mode: no dependency download or compilation was performed.'
             Write-Host 'First login: username yunkun; set your own console password in the browser.'
             if (-not $NoBrowser) { Start-Process "http://127.0.0.1:$ConsolePort/" }

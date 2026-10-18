@@ -31,7 +31,7 @@ Windows 用户可双击 `setup-and-start.bat`，首次联网下载依赖、编�
 从本仓库 Releases 下载的完整离线 ZIP 包含已编译的云鲲控制台、静态前端和 PostgreSQL 运行时。该 ZIP 的使用者无需安装 Go、Node.js、npm、Docker，也无需联网下载依赖；仓库自动生成的源码 ZIP 不具备这些运行时。
 
 1. 将完整目录解压到可写的短路径，例如 `F:\yunkun-offline`。
-2. 双击根目录的 `setup-and-start-offline.bat`。
+2. 双击根目录的 `setup-and-start-offline.bat`。如果目标机缺少 VC++ x64 运行库，启动器会请求管理员权限并使用包内安装器补齐。
 3. 等待本机数据库初始化和应用就绪检查完成。
 4. 打开 `http://127.0.0.1:5173/`。
 5. 使用账号 `yunkun`，首次自行设置控制台密码。
@@ -40,7 +40,7 @@ Windows 用户可双击 `setup-and-start.bat`，首次联网下载依赖、编�
 
 | 项目 | 默认值 |
 | --- | --- |
-| 控制台 | `127.0.0.1:5173` |
+| 控制台 | `127.0.0.1:5173`（公网部署使用 `-Public`） |
 | 独立 PostgreSQL | `127.0.0.1:5433` |
 | 管理员账号 | `yunkun` |
 | 默认密码 | 没有统一默认密码，首次自行设置 |
@@ -51,6 +51,14 @@ Windows 用户可双击 `setup-and-start.bat`，首次联网下载依赖、编�
 ```powershell
 .\setup-and-start-offline.ps1 -DatabasePort 55433 -NoBrowser
 ```
+
+需要通过公网访问时，在云安全组和 Windows 防火墙放行 TCP 5173，然后运行：
+
+```powershell
+.\setup-and-start-offline.ps1 -Public -NoBrowser
+```
+
+`-Public` 会让控制台监听 `0.0.0.0:5173`；默认仍只监听本机，避免误暴露管理端。
 
 ## 功能
 
