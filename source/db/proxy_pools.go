@@ -469,29 +469,53 @@ func (d *DB) MarkProxyDiscoveryRun(id int64, lastError string) error {
 
 // StoreProxyDiscoveryRun commits candidates and the provider cursor together.
 func (d *DB) StoreProxyDiscoveryRun(sourceID int64, results []ProxyDiscoveryResult, nextOffset int, exhausted bool) error {
+	_, err := d.StoreProxyDiscoveryRunWithIDs(sourceID, results, nextOffset, exhausted)
+	return err
+}
+
+// StoreProxyDiscoveryRunWithIDs is the same atomic write as StoreProxyDiscoveryRun,
+// and also returns IDs that were newly inserted during this run. Existing
+// candidates are refreshed without being re-queued for automatic verification.
+func (d *DB) StoreProxyDiscoveryRunWithIDs(sourceID int64, results []ProxyDiscoveryResult, nextOffset int, exhausted bool) ([]int64, error) {
 	tx, err := d.Begin()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback()
+	newIDs := make([]int64, 0, len(results))
 	for _, item := range results {
 		raw, err := json.Marshal(item.Metadata)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if _, err = tx.Exec(`INSERT INTO proxy_discovery_results(source_id,address,protocol,host,port,metadata,authorized)
+		var id int64
+		var inserted bool
+		err = tx.QueryRow(`WITH existing AS MATERIALIZED (
+SELECT id FROM proxy_discovery_results WHERE source_id=$1 AND address=$2
+), upserted AS (
+INSERT INTO proxy_discovery_results(source_id,address,protocol,host,port,metadata,authorized)
 VALUES($1,$2,$3,$4,$5,$6,$7)
 ON CONFLICT(source_id,address) DO UPDATE SET protocol=EXCLUDED.protocol,host=EXCLUDED.host,
-port=EXCLUDED.port,metadata=EXCLUDED.metadata,authorized=EXCLUDED.authorized,updated_at=now()`,
-			sourceID, item.Address, item.Protocol, item.Host, item.Port, string(raw), item.Authorized); err != nil {
-			return err
+port=EXCLUDED.port,metadata=EXCLUDED.metadata,authorized=EXCLUDED.authorized,updated_at=now()
+RETURNING id
+)
+SELECT upserted.id, NOT EXISTS (SELECT 1 FROM existing) FROM upserted`,
+			sourceID, item.Address, item.Protocol, item.Host, item.Port, string(raw), item.Authorized).Scan(&id, &inserted)
+		if err != nil {
+			return nil, err
+		}
+		if inserted {
+			newIDs = append(newIDs, id)
 		}
 	}
 	if _, err = tx.Exec(`UPDATE proxy_discovery_sources SET next_offset=$2,exhausted=$3,
 last_run_at=now(),last_error='',updated_at=now() WHERE id=$1`, sourceID, nextOffset, exhausted); err != nil {
-		return err
+		return nil, err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return newIDs, nil
 }
 
 func (d *DB) UpsertProxyDiscoveryResults(sourceID int64, results []ProxyDiscoveryResult) error {
