@@ -315,7 +315,15 @@ export const api = {
       `/proxy-discovery/results/ids?${sourceID ? `source_id=${sourceID}&` : ""}state=${encodeURIComponent(state)}`,
     ),
   runProxyDiscovery: (id: number) =>
-    post<{ fetched: number; candidates: number; exhausted: boolean }>(`/proxy-discovery/sources/${id}/run`),
+    post<{
+      fetched: number;
+      candidates: number;
+      new_candidates?: number;
+      exhausted: boolean;
+      auto_verify_started?: boolean;
+      auto_verify_total?: number;
+      auto_verify_skipped?: boolean;
+    }>(`/proxy-discovery/sources/${id}/run`),
   verifyProxyDiscoveryResult: (id: number) => post<{ ok: boolean }>(`/proxy-discovery/results/${id}/verify`),
   approveProxyDiscoveryResult: (id: number, poolID: number, target: "candidate" | "production") =>
     post<{ node_id: number }>(`/proxy-discovery/results/${id}/approve`, { pool_id: poolID, target }),
@@ -1588,7 +1596,7 @@ export const api = {
     get<{ models: ModelTokenStat[] }>(`/llm/records/by-model?task=${encodeURIComponent(task)}`),
 
   // Update checks use the fixed Yunkun GitHub release feed. Applying a release
-  // stays disabled until the offline-package restart flow is supported.
+  // downloads and verifies the selected latest package before restarting.
   checkUpdate: (force = false) => get<UpdateCheck>(`/update/check${force ? "?force=true" : ""}`),
   applyUpdate: () => post<UpdateProgress>("/update/apply", {}),
   rollbackUpdate: () => post<UpdateProgress>("/update/rollback", {}),
