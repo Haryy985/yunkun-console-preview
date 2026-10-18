@@ -30,9 +30,11 @@ type proxyDiscoveryService struct {
 }
 
 const (
-	defaultProxyDiscoveryFetchLimit = 100
+	defaultProxyDiscoveryFetchLimit = 500
 	minProxyDiscoveryFetchLimit     = 100
 	maxProxyDiscoveryFetchLimit     = 1000
+	defaultProxyDiscoveryQuery      = `service:socks5 AND country: "CN" AND response:"No authentication"`
+	defaultProxyDiscoveryVerifyURL  = "https://api.ipify.org?format=json"
 	fofaDiscoveryURL                = "https://fofa.info/api/v1/search/all"
 	quakeDiscoveryURL               = "https://quake.360.net/api/v3/search/quake_service"
 	discoveryBatchVerifyTimeout     = 3 * time.Second
@@ -92,7 +94,28 @@ func (s *Server) listProxyDiscoverySources(w http.ResponseWriter, r *http.Reques
 		writeErr(w, http.StatusInternalServerError, "读取发现来源失败")
 		return
 	}
+	for i := range items {
+		normalizeProxyDiscoverySource(&items[i])
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"sources": items})
+}
+
+// normalizeProxyDiscoverySource keeps sources created by older releases
+// usable after the defaults were introduced. Empty legacy values are treated
+// as unset; existing candidates and approval state are left untouched.
+func normalizeProxyDiscoverySource(source *db.ProxyDiscoverySource) {
+	if source == nil {
+		return
+	}
+	if strings.TrimSpace(source.Query) == "" {
+		source.Query = defaultProxyDiscoveryQuery
+	}
+	if strings.TrimSpace(source.VerifyURL) == "" {
+		source.VerifyURL = defaultProxyDiscoveryVerifyURL
+	}
+	if source.FetchLimit < minProxyDiscoveryFetchLimit || source.FetchLimit > maxProxyDiscoveryFetchLimit {
+		source.FetchLimit = defaultProxyDiscoveryFetchLimit
+	}
 }
 
 func (s *Server) saveProxyDiscoverySource(w http.ResponseWriter, r *http.Request) {
@@ -112,6 +135,12 @@ func (s *Server) saveProxyDiscoverySource(w http.ResponseWriter, r *http.Request
 	req.Query = strings.TrimSpace(req.Query)
 	req.AuthorizedScope = normalizeDiscoveryScope(req.AuthorizedScope)
 	req.VerifyURL = strings.TrimSpace(req.VerifyURL)
+	if req.Query == "" {
+		req.Query = defaultProxyDiscoveryQuery
+	}
+	if req.VerifyURL == "" {
+		req.VerifyURL = defaultProxyDiscoveryVerifyURL
+	}
 	if req.FetchLimit == 0 {
 		req.FetchLimit = defaultProxyDiscoveryFetchLimit
 	}
@@ -297,27 +326,32 @@ func (s *Server) runProxyDiscovery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.proxyDiscovery.mu.Lock()
-	defer s.proxyDiscovery.mu.Unlock()
 	id, ok := pathInt(r, "id")
 	if !ok {
+		s.proxyDiscovery.mu.Unlock()
 		writeErr(w, http.StatusBadRequest, "来源 ID 无效")
 		return
 	}
 	source, raw, err := s.m.pg.ProxyDiscoverySource(id)
 	if err != nil || source == nil {
+		s.proxyDiscovery.mu.Unlock()
 		writeErr(w, http.StatusNotFound, "发现来源不存在")
 		return
 	}
+	normalizeProxyDiscoverySource(source)
 	if !source.Enabled {
+		s.proxyDiscovery.mu.Unlock()
 		writeErr(w, http.StatusConflict, "发现来源已停用")
 		return
 	}
 	if source.Exhausted {
+		s.proxyDiscovery.mu.Unlock()
 		writeErr(w, http.StatusConflict, "查询结果已取尽；修改查询语句或每次抓取数量可重新开始")
 		return
 	}
 	credentials, err := s.proxyPools.vault.Open(raw)
 	if err != nil {
+		s.proxyDiscovery.mu.Unlock()
 		writeErr(w, http.StatusServiceUnavailable, "发现来源凭据不可用")
 		return
 	}
@@ -333,16 +367,44 @@ func (s *Server) runProxyDiscovery(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		_ = s.m.pg.MarkProxyDiscoveryRun(id, err.Error())
+		s.proxyDiscovery.mu.Unlock()
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	if err := s.m.pg.StoreProxyDiscoveryRun(id, authorizeDiscoveryResults(source, items),
-		source.NextOffset+fetched, fetched < discoveryFetchLimit(source)); err != nil {
+	authorizedItems := authorizeDiscoveryResults(source, items)
+	newIDs, err := s.m.pg.StoreProxyDiscoveryRunWithIDs(id, authorizedItems,
+		source.NextOffset+fetched, fetched < discoveryFetchLimit(source))
+	s.proxyDiscovery.mu.Unlock()
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "保存发现结果失败")
 		return
 	}
+	autoVerify := strings.TrimSpace(source.AuthorizedScope) != "" && strings.TrimSpace(source.VerifyURL) != ""
+	if autoVerify && len(newIDs) > 0 {
+		go s.autoVerifyDiscoveryCandidates(newIDs)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"fetched": fetched, "candidates": len(items),
-		"exhausted": fetched < discoveryFetchLimit(source)})
+		"new_candidates": len(newIDs), "exhausted": fetched < discoveryFetchLimit(source),
+		"auto_verify_started": autoVerify && len(newIDs) > 0, "auto_verify_total": len(newIDs),
+		"auto_verify_skipped": !autoVerify && len(newIDs) > 0})
+}
+
+// autoVerifyDiscoveryCandidates updates only candidate evidence. It never
+// approves a result or creates/enables a proxy-pool node.
+func (s *Server) autoVerifyDiscoveryCandidates(ids []int64) {
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			return
+		}
+		wg.Add(1)
+		go func(id int64) {
+			defer wg.Done()
+			_, _, _ = s.verifyDiscoveryCandidateWithTimeout(ctx, id, discoveryBatchVerifyTimeout)
+		}(id)
+	}
+	wg.Wait()
 }
 
 func (s *Server) fetchFOFA(ctx context.Context, source *db.ProxyDiscoverySource, secrets proxypool.Secrets) ([]db.ProxyDiscoveryResult, int, error) {
@@ -662,6 +724,7 @@ func (s *Server) verifyDiscoveryCandidateWithTimeout(ctx context.Context, id int
 		s.proxyDiscovery.mu.Unlock()
 		return nil, http.StatusNotFound, errors.New("发现来源不存在")
 	}
+	normalizeProxyDiscoverySource(source)
 	if !source.Enabled || result.State == "approved" || result.State == "ignored" || s.proxyDiscovery.verifying[id] {
 		s.proxyDiscovery.mu.Unlock()
 		return nil, http.StatusConflict, errors.New("该结果或来源当前不可验证")
@@ -799,6 +862,7 @@ func (s *Server) approveDiscoveryCandidate(ctx context.Context, id, poolID int64
 	if sourceErr != nil || source == nil {
 		return 0, http.StatusNotFound, errors.New("发现来源不存在")
 	}
+	normalizeProxyDiscoverySource(source)
 	if !source.Enabled || !hostInScope(result.Host, source.AuthorizedScope) {
 		return 0, http.StatusForbidden, errors.New("来源已停用或结果不在当前授权范围内")
 	}
