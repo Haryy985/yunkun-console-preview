@@ -1,0 +1,64 @@
+name: Unix offline package smoke test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-startup:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            package: linux-amd64
+          - runner: ubuntu-24.04-arm
+            package: linux-arm64
+          - runner: macos-15-intel
+            package: macos-intel
+          - runner: macos-15
+            package: macos-apple-silicon
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Download published archive and verify SHA-256
+        shell: bash
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/Haryy985/yunkun-console-preview/releases/download/v1.0.3-offline"
+          archive="yunkun-v1.0.3-offline-${PACKAGE}.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl --fail --location --retry 3 "$base/$archive" -o "$archive"
+          curl --fail --location --retry 3 "$base/SHA256SUMS.txt" -o SHA256SUMS.txt
+          python3 - "$archive" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+          name = sys.argv[1]
+          expected = dict(line.split()[::-1] for line in pathlib.Path("SHA256SUMS.txt").read_text().splitlines())[name]
+          actual = hashlib.file_digest(open(name, "rb"), "sha256").hexdigest()
+          assert actual == expected, (name, actual, expected)
+          print("Archive SHA-256 verified:", name)
+          PY
+          tar -xzf "$archive"
+      - name: Verify first startup, embedded UI, authentication and retained data
+        shell: bash
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          python3 source/tests/unix-offline-smoke.py \
+            "$RUNNER_TEMP/yunkun-v1.0.3-offline-${PACKAGE}" \
+            "$RUNNER_TEMP/smoke-result.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-result-${{ matrix.package }}
+          path: ${{ runner.temp }}/smoke-result.json
+          if-no-files-found: ignore
