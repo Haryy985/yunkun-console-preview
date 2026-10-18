@@ -56,7 +56,7 @@ jobs:
           YUNKUN_COMPRESS: "off"
           YUNKUN_PACKAGE: "1"
           YUNKUN_PACKAGE_DIR: dist
-        run: ./build.sh --target "${YUNKUN_TARGET_OS}/${YUNKUN_TARGET_ARCH}"
+        run: bash ./build.sh --target "${YUNKUN_TARGET_OS}/${YUNKUN_TARGET_ARCH}"
       - name: Smoke test Linux amd64 binary
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         run: source/dist/yunkun-linux-amd64/yunkun -h
