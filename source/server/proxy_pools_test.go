@@ -17,10 +17,10 @@ import (
 	"testing"
 	"time"
 
+	actool "github.com/Autumn-27/norma/tool"
 	"yunkun/console/agent"
 	"yunkun/console/db"
 	"yunkun/console/proxypool"
-	actool "github.com/Autumn-27/norma/tool"
 )
 
 func newProxyFixture(t *testing.T) *Server {
@@ -400,10 +400,16 @@ func TestProxyDiscoverySourceAllowsOptionalScopeAndVerifyURL(t *testing.T) {
 	if err != nil || source == nil {
 		t.Fatalf("read optional source: %v %#v", err, source)
 	}
-	if source.AuthorizedScope != "" || source.VerifyURL != "" {
-		t.Fatalf("optional fields were not preserved as empty: %#v", source)
+	if source.AuthorizedScope != "" {
+		t.Fatalf("optional scope was not preserved as empty: %#v", source)
 	}
-	if source.FetchLimit != 100 {
+	if source.VerifyURL != defaultProxyDiscoveryVerifyURL {
+		t.Fatalf("default verification URL: got %q", source.VerifyURL)
+	}
+	if source.Query != defaultProxyDiscoveryQuery {
+		t.Fatalf("default query: got %q", source.Query)
+	}
+	if source.FetchLimit != defaultProxyDiscoveryFetchLimit {
 		t.Fatalf("default fetch limit: got %d", source.FetchLimit)
 	}
 }
