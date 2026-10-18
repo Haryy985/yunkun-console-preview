@@ -36,7 +36,7 @@ jobs:
           name: web-dist
           path: web/out
 
-  # ② 五平台交叉编译（内嵌前端）+ 打 zip
+  # ② 三个平台交叉编译（内嵌前端）+ 打 zip
   binaries:
     needs: frontend
     runs-on: ubuntu-latest
@@ -44,8 +44,6 @@ jobs:
       matrix:
         include:
           - { goos: linux, goarch: amd64 }
-          - { goos: linux, goarch: arm64 }
-          - { goos: darwin, goarch: amd64 }
           - { goos: darwin, goarch: arm64 }
           - { goos: windows, goarch: amd64 }
     steps:
