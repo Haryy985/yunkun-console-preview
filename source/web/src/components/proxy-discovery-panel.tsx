@@ -5,18 +5,33 @@ import * as React from "react";
 import { PencilIcon, PlayIcon, PlusIcon, RefreshCwIcon, SearchIcon, ShieldCheckIcon, Trash2Icon } from "lucide-react";
 import { toast } from "sonner";
 
+import { TablePagination } from "@/components/table-pagination";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import { TablePagination } from "@/components/table-pagination";
 import { api } from "@/lib/api";
-import { proxyVerificationMessage } from "@/lib/proxy-verification";
 import type { ProxyDiscoveryResult, ProxyDiscoverySource, ProxyPool } from "@/lib/proxy-pool-types";
+import { proxyVerificationMessage } from "@/lib/proxy-verification";
 
 const providerLabels = { fofa: "FOFA", quake: "Quake" } as const;
+const defaultDiscoveryQuery = 'service:socks5 AND country: "CN" AND response:"No authentication"';
+const defaultDiscoveryVerifyURL = "https://api.ipify.org?format=json";
+
+function emptyDiscoveryForm() {
+  return {
+    provider: "fofa" as "fofa" | "quake",
+    name: "",
+    query: defaultDiscoveryQuery,
+    authorized_scope: "",
+    verify_url: defaultDiscoveryVerifyURL,
+    fetch_limit: 500,
+    email: "",
+    key: "",
+  };
+}
 
 function formatTime(value?: string) {
   return value ? new Date(value).toLocaleString("zh-CN") : "未运行";
@@ -35,7 +50,12 @@ function resultLabel(result: ProxyDiscoveryResult) {
   return "未验证";
 }
 
-export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refreshKey = 0 }: {
+export function ProxyDiscoveryPanel({
+  onCreatePool,
+  onOpenPool,
+  onChanged,
+  refreshKey = 0,
+}: {
   onCreatePool: () => void;
   onOpenPool: (poolID: number) => void;
   onChanged: () => void;
@@ -60,22 +80,21 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
   const [selectedIds, setSelectedIds] = React.useState<Set<number>>(() => new Set());
   const [selectingAll, setSelectingAll] = React.useState(false);
   const selectionRequest = React.useRef(0);
-  const [summary, setSummary] = React.useState({ total: 0, pending: 0, verified: 0, invalid: 0, approved: 0, ignored: 0 });
+  const [summary, setSummary] = React.useState({
+    total: 0,
+    pending: 0,
+    verified: 0,
+    invalid: 0,
+    approved: 0,
+    ignored: 0,
+  });
   const [batchProgress, setBatchProgress] = React.useState<{ done: number; total: number } | null>(null);
   const stopBatch = React.useRef(false);
   const batchLock = React.useRef(false);
   const mounted = React.useRef(true);
   const resultRequest = React.useRef(0);
-  const [form, setForm] = React.useState({
-    provider: "fofa" as "fofa" | "quake",
-    name: "",
-    query: "",
-    authorized_scope: "",
-    verify_url: "",
-    fetch_limit: 100,
-    email: "",
-    key: "",
-  });
+  const [form, setForm] = React.useState(emptyDiscoveryForm);
+  const [autoVerification, setAutoVerification] = React.useState<{ sourceID: number; total: number } | null>(null);
 
   React.useEffect(() => {
     mounted.current = true;
@@ -88,14 +107,14 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
   const load = React.useCallback(async () => {
     setLoading(true);
     try {
-      const [sourceResponse, poolResponse] = await Promise.all([
-        api.proxyDiscoverySources(),
-        api.proxyPools(),
-      ]);
+      const [sourceResponse, poolResponse] = await Promise.all([api.proxyDiscoverySources(), api.proxyPools()]);
       setSources(sourceResponse.sources);
       setPools(poolResponse.pools);
-      setTargetPool((current) => poolResponse.pools.some((pool) => String(pool.id) === current)
-        ? current : String(poolResponse.pools[0]?.id ?? ""));
+      setTargetPool((current) =>
+        poolResponse.pools.some((pool) => String(pool.id) === current)
+          ? current
+          : String(poolResponse.pools[0]?.id ?? ""),
+      );
       setSelectedSource((current) =>
         current && sourceResponse.sources.some((source) => source.id === current)
           ? current
@@ -124,18 +143,24 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
       return;
     }
     setResultLoading(true);
-    void api.proxyDiscoveryResults(selectedSource, page, pageSize, stateFilter).then((response) => {
-      if (request !== resultRequest.current) return;
-      setResults(response.results);
-      setTotal(response.total);
-      setSummary(response.summary);
-      if (response.page !== page) setPage(response.page);
-    }).catch((error) => {
-      if (request === resultRequest.current) setResultError((error as Error).message);
-    }).finally(() => {
-      if (request === resultRequest.current) setResultLoading(false);
-    });
-    return () => { resultRequest.current++; };
+    void api
+      .proxyDiscoveryResults(selectedSource, page, pageSize, stateFilter)
+      .then((response) => {
+        if (request !== resultRequest.current) return;
+        setResults(response.results);
+        setTotal(response.total);
+        setSummary(response.summary);
+        if (response.page !== page) setPage(response.page);
+      })
+      .catch((error) => {
+        if (request === resultRequest.current) setResultError((error as Error).message);
+      })
+      .finally(() => {
+        if (request === resultRequest.current) setResultLoading(false);
+      });
+    return () => {
+      resultRequest.current++;
+    };
   }, [selectedSource, page, pageSize, revision, stateFilter]);
 
   React.useEffect(() => {
@@ -147,47 +172,49 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
   function editSource(source?: ProxyDiscoverySource) {
     setEditing(source?.id);
     setForm({
-      provider: source?.provider ?? "fofa", name: source?.name ?? "", query: source?.query ?? "",
-      authorized_scope: source?.authorized_scope ?? "", verify_url: source?.verify_url ?? "",
-      fetch_limit: source?.fetch_limit ?? 100, email: "", key: "",
+      provider: source?.provider ?? "fofa",
+      name: source?.name ?? "",
+      query: source?.query?.trim() || defaultDiscoveryQuery,
+      authorized_scope: source?.authorized_scope ?? "",
+      verify_url: source?.verify_url?.trim() || defaultDiscoveryVerifyURL,
+      fetch_limit: source?.fetch_limit || 500,
+      email: "",
+      key: "",
     });
     setShowForm(true);
   }
 
   async function saveSource(event: React.FormEvent) {
     event.preventDefault();
-    if (hasGlobalScope(form.authorized_scope) &&
-      !window.confirm("该配置包含全地址范围：0.0.0.0 或 0.0.0.0/0 表示全部 IPv4，::/0 表示全部 IPv6。确认保存？")) return;
+    if (
+      hasGlobalScope(form.authorized_scope) &&
+      !window.confirm("该配置包含全地址范围：0.0.0.0 或 0.0.0.0/0 表示全部 IPv4，::/0 表示全部 IPv6。确认保存？")
+    )
+      return;
     setBusy(true);
     try {
       const credentials: Record<string, string> =
         form.provider === "fofa"
           ? { email: form.email.trim(), key: form.key.trim() }
           : { key: form.key.trim(), email: "" };
-      const response = await api.saveProxyDiscoverySource({
-        provider: form.provider,
-        name: form.name.trim(),
-        query: form.query.trim(),
-        authorized_scope: form.authorized_scope.trim(),
-        verify_url: form.verify_url.trim(),
-        fetch_limit: form.fetch_limit,
-        ...(editing && !form.key.trim() ? {} : { credentials }),
-      }, editing);
+      const response = await api.saveProxyDiscoverySource(
+        {
+          provider: form.provider,
+          name: form.name.trim(),
+          query: form.query.trim(),
+          authorized_scope: form.authorized_scope.trim(),
+          verify_url: form.verify_url.trim(),
+          fetch_limit: form.fetch_limit,
+          ...(editing && !form.key.trim() ? {} : { credentials }),
+        },
+        editing,
+      );
       toast.success("发现来源已保存");
       setShowForm(false);
       setSelectedSource(response.id);
       setSelectedIds(new Set());
       setPage(1);
-      setForm({
-        provider: "fofa",
-        name: "",
-        query: "",
-        authorized_scope: "",
-        verify_url: "",
-        fetch_limit: 100,
-        email: "",
-        key: "",
-      });
+      setForm(emptyDiscoveryForm());
       await load();
       onChanged();
     } catch (error) {
@@ -201,9 +228,18 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
     setBusy(true);
     try {
       const response = await api.runProxyDiscovery(source.id);
-      toast.success(response.exhausted
-        ? `已读取 ${response.fetched} 条，本查询已取尽`
-        : `已读取新一批 ${response.fetched} 条，其中 ${response.candidates} 条为候选`);
+      if (response.auto_verify_started) {
+        setAutoVerification({ sourceID: source.id, total: response.auto_verify_total ?? response.new_candidates ?? 0 });
+        toast.success(
+          `已读取 ${response.fetched} 条，正在自动验证 ${response.auto_verify_total ?? response.new_candidates ?? 0} 条候选；验证通过后仍需手动入池`,
+        );
+      } else {
+        toast.success(
+          response.exhausted
+            ? `已读取 ${response.fetched} 条，本查询已取尽`
+            : `已读取新一批 ${response.fetched} 条，其中 ${response.candidates} 条为候选${response.auto_verify_skipped ? "；请先配置授权范围和验证地址" : ""}`,
+        );
+      }
       await load();
       setSelectedIds(new Set());
       setPage(1);
@@ -214,6 +250,29 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
       setBusy(false);
     }
   }
+
+  React.useEffect(() => {
+    if (!autoVerification || selectedSource !== autoVerification.sourceID) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const response = await api.proxyDiscoveryResults(autoVerification.sourceID, 1, 1, "verifying");
+        if (cancelled || response.total > 0) return;
+        await load();
+        if (!cancelled) {
+          setAutoVerification(null);
+          toast.success("自动验证完成；验证通过的候选仍需手动选择入池");
+        }
+      } catch {
+        // The normal result refresh will surface any API error; keep polling.
+      }
+    };
+    const timer = window.setInterval(() => void poll(), 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [autoVerification, load, selectedSource]);
 
   async function verifyResult(result: ProxyDiscoveryResult) {
     setBusy(true);
@@ -287,7 +346,8 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
       if (request === selectionRequest.current) setSelectingAll(false);
     }
   }
-  const verifyBlocked = !selectedSourceItem?.enabled || !selectedSourceItem.authorized_scope || !selectedSourceItem.verify_url;
+  const verifyBlocked =
+    !selectedSourceItem?.enabled || !selectedSourceItem.authorized_scope || !selectedSourceItem.verify_url;
 
   function admissionReason(result: ProxyDiscoveryResult) {
     if (!selectedSourceItem?.enabled) return "查询来源已停用";
@@ -300,12 +360,15 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
 
   const selectedOnPageResults = results.filter((result) => selectedIds.has(result.id));
   const eligibleOnPage = selectedOnPageResults.filter((result) => !admissionReason(result)).length;
-  const batchAdmissionReason = !selectedIds.size ? "请先勾选候选"
-    : !selectedSourceItem?.enabled ? "查询来源已停用"
-    : !targetPool ? "请选择目标代理池"
-    : selectedOnPageResults.length === selectedIds.size && eligibleOnPage === 0
-      ? "所选候选尚未满足入池条件，请检查验证状态和授权范围"
-      : "";
+  const batchAdmissionReason = !selectedIds.size
+    ? "请先勾选候选"
+    : !selectedSourceItem?.enabled
+      ? "查询来源已停用"
+      : !targetPool
+        ? "请选择目标代理池"
+        : selectedOnPageResults.length === selectedIds.size && eligibleOnPage === 0
+          ? "所选候选尚未满足入池条件，请检查验证状态和授权范围"
+          : "";
 
   async function runBatch(action: "verify" | "delete" | "approve", target?: "candidate" | "production") {
     const ids = [...selectedIds];
@@ -314,9 +377,19 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
       toast.error(batchAdmissionReason);
       return;
     }
-    if (action === "delete" && !window.confirm(`永久删除勾选的 ${ids.length} 个候选（含其他分页）？验证失败不一定代表代理失效，建议检查失败原因。`)) return;
-    if (action === "approve" && target === "production" &&
-      !window.confirm(`将勾选的 ${ids.length} 个候选入池并启用？仅验证通过且在当前范围内的候选会成功。`)) return;
+    if (
+      action === "delete" &&
+      !window.confirm(
+        `永久删除勾选的 ${ids.length} 个候选（含其他分页）？验证失败不一定代表代理失效，建议检查失败原因。`,
+      )
+    )
+      return;
+    if (
+      action === "approve" &&
+      target === "production" &&
+      !window.confirm(`将勾选的 ${ids.length} 个候选入池并启用？仅验证通过且在当前范围内的候选会成功。`)
+    )
+      return;
     batchLock.current = true;
     setBusy(true);
     stopBatch.current = false;
@@ -328,21 +401,23 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
       // Admission can also reverify when the destination pool uses different credentials.
       if (action === "verify") {
         let next = 0;
-        await Promise.all(Array.from({ length: Math.min(10, ids.length) }, async () => {
-          while (next < ids.length && !stopBatch.current && mounted.current) {
-            const id = ids[next++];
-            try {
-              const response = await api.batchProxyDiscoveryResults([id], "verify");
-              const item = response.items[0];
-              if (item?.ok) succeeded.add(id);
-              else failures.push(`#${id}: ${proxyVerificationMessage(item?.error || "操作失败")}`);
-            } catch (error) {
-              failures.push(`#${id}: ${proxyVerificationMessage((error as Error).message || "请求失败")}`);
+        await Promise.all(
+          Array.from({ length: Math.min(10, ids.length) }, async () => {
+            while (next < ids.length && !stopBatch.current && mounted.current) {
+              const id = ids[next++];
+              try {
+                const response = await api.batchProxyDiscoveryResults([id], "verify");
+                const item = response.items[0];
+                if (item?.ok) succeeded.add(id);
+                else failures.push(`#${id}: ${proxyVerificationMessage(item?.error || "操作失败")}`);
+              } catch (error) {
+                failures.push(`#${id}: ${proxyVerificationMessage((error as Error).message || "请求失败")}`);
+              }
+              done++;
+              if (mounted.current) setBatchProgress({ done, total: ids.length });
             }
-            done++;
-            if (mounted.current) setBatchProgress({ done, total: ids.length });
-          }
-        }));
+          }),
+        );
         if (mounted.current) setRevision((value) => value + 1);
       } else {
         const chunkSize = action === "delete" ? 100 : 1;
@@ -359,7 +434,8 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
           setRevision((value) => value + 1);
         }
       }
-      if (succeeded.size) toast.success(`成功 ${succeeded.size} 条${done < ids.length ? `，另 ${ids.length - done} 条未执行` : ""}`);
+      if (succeeded.size)
+        toast.success(`成功 ${succeeded.size} 条${done < ids.length ? `，另 ${ids.length - done} 条未执行` : ""}`);
       if (failures.length) toast.error(`失败 ${failures.length} 条，已保留勾选`, { description: failures[0] });
     } catch (error) {
       if (mounted.current) toast.error(`批量操作中断，未确认成功的项保留勾选：${(error as Error).message}`);
@@ -449,7 +525,11 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
                     <PencilIcon data-icon="inline-start" />
                     编辑配置
                   </Button>
-                  <Button size="sm" disabled={busy || selectedSourceItem.exhausted} onClick={() => void runSource(selectedSourceItem)}>
+                  <Button
+                    size="sm"
+                    disabled={busy || selectedSourceItem.exhausted}
+                    onClick={() => void runSource(selectedSourceItem)}
+                  >
                     <PlayIcon data-icon="inline-start" />
                     手动执行
                   </Button>
@@ -491,7 +571,10 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
                 </div>
                 <div>
                   <span className="text-muted-foreground">每次抓取</span>
-                  <p className="mt-1">{selectedSourceItem.fetch_limit} 条{selectedSourceItem.exhausted ? " · 已取尽" : ` · 已读取 ${selectedSourceItem.next_offset ?? 0} 条`}</p>
+                  <p className="mt-1">
+                    {selectedSourceItem.fetch_limit} 条
+                    {selectedSourceItem.exhausted ? " · 已取尽" : ` · 已读取 ${selectedSourceItem.next_offset ?? 0} 条`}
+                  </p>
                 </div>
                 <div>
                   <span className="text-muted-foreground">候选结果</span>
@@ -505,42 +588,74 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
             </div>
           )}
           {selectedSourceItem && (!selectedSourceItem.authorized_scope || !selectedSourceItem.verify_url) ? (
-            <div role="status" className="flex flex-wrap items-center justify-between gap-3 border-l-2 border-amber-500 bg-muted/30 p-3 text-sm">
-              <span>{!selectedSourceItem.authorized_scope ? "待配置代理使用授权范围。" : ""}
-                {!selectedSourceItem.verify_url ? "待配置验证地址。" : ""} 候选已保存，尚未执行验证。</span>
-              <Button size="sm" variant="outline" onClick={() => editSource(selectedSourceItem)}>补充配置</Button>
+            <div
+              role="status"
+              className="flex flex-wrap items-center justify-between gap-3 border-l-2 border-amber-500 bg-muted/30 p-3 text-sm"
+            >
+              <span>
+                {!selectedSourceItem.authorized_scope ? "待配置代理使用授权范围。" : ""}
+                {!selectedSourceItem.verify_url ? "待配置验证地址。" : ""} 候选已保存，尚未执行验证。
+              </span>
+              <Button size="sm" variant="outline" onClick={() => editSource(selectedSourceItem)}>
+                补充配置
+              </Button>
             </div>
           ) : null}
 
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <p className="font-medium">候选代理</p>
-              <p className="mt-1 text-muted-foreground text-xs">授权范围内验证通过的候选，可选择停用入池或入池并启用。</p>
+              <p className="mt-1 text-muted-foreground text-xs">
+                抓取后会自动验证；验证通过的候选不会自动入库，需手动选择后入池。
+              </p>
+              {autoVerification?.sourceID === selectedSource ? (
+                <p className="mt-1 text-amber-700 text-xs dark:text-amber-400" role="status">
+                  正在自动验证本批 {autoVerification.total} 条候选，完成后可在“验证通过”中筛选并手动入池。
+                </p>
+              ) : null}
             </div>
             <div className="flex flex-wrap items-center gap-2">
-            <select
-              className="h-9 w-full min-w-0 max-w-full rounded-md border bg-background px-3 text-sm sm:w-52"
-              aria-label="目标代理池"
-              value={targetPool}
-              disabled={busy}
-              onChange={(event) => setTargetPool(event.target.value)}
-            >
-              <option value="">选择批准目标代理池</option>
-              {pools.map((pool) => (
-                <option key={pool.id} value={pool.id}>
-                  {pool.config.name}
-                </option>
-              ))}
-            </select>
-            <Button size="sm" variant="outline" disabled={busy} onClick={onCreatePool}><PlusIcon data-icon="inline-start" />新建代理池</Button>
-            {targetPool ? <Button size="sm" variant="ghost" disabled={busy} onClick={() => onOpenPool(Number(targetPool))}>查看代理 IP</Button> : null}
+              <select
+                className="h-9 w-full min-w-0 max-w-full rounded-md border bg-background px-3 text-sm sm:w-52"
+                aria-label="目标代理池"
+                value={targetPool}
+                disabled={busy}
+                onChange={(event) => setTargetPool(event.target.value)}
+              >
+                <option value="">选择批准目标代理池</option>
+                {pools.map((pool) => (
+                  <option key={pool.id} value={pool.id}>
+                    {pool.config.name}
+                  </option>
+                ))}
+              </select>
+              <Button size="sm" variant="outline" disabled={busy} onClick={onCreatePool}>
+                <PlusIcon data-icon="inline-start" />
+                新建代理池
+              </Button>
+              {targetPool ? (
+                <Button size="sm" variant="ghost" disabled={busy} onClick={() => onOpenPool(Number(targetPool))}>
+                  查看代理 IP
+                </Button>
+              ) : null}
             </div>
           </div>
-          {pools.length === 0 ? <p className="text-sm text-amber-700 dark:text-amber-400">尚无目标代理池。可新建空的固定节点池，接收验证通过的候选。</p> : null}
+          {pools.length === 0 ? (
+            <p className="text-sm text-amber-700 dark:text-amber-400">
+              尚无目标代理池。可新建空的固定节点池，接收验证通过的候选。
+            </p>
+          ) : null}
           <div className="flex flex-wrap items-center gap-3 border-y py-3">
-            <select aria-label="候选验证状态" className="h-9 rounded-md border bg-background px-3 text-sm"
-              value={stateFilter} disabled={busy}
-              onChange={(event) => { setStateFilter(event.target.value); setPage(1); }}>
+            <select
+              aria-label="候选验证状态"
+              className="h-9 rounded-md border bg-background px-3 text-sm"
+              value={stateFilter}
+              disabled={busy}
+              onChange={(event) => {
+                setStateFilter(event.target.value);
+                setPage(1);
+              }}
+            >
               <option value="">全部（{summary.total}）</option>
               <option value="pending">待验证（{summary.pending}）</option>
               <option value="verified">验证通过（{summary.verified}）</option>
@@ -548,35 +663,85 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
               <option value="approved">已入池（{summary.approved}）</option>
               <option value="ignored">已忽略（{summary.ignored}）</option>
             </select>
-            <span className="text-muted-foreground text-xs">已选 {selectedIds.size} / {selectableTotal} 条{selectingAll ? " · 正在全选" : ""} · 当前页可入池 {eligibleOnPage} 条</span>
-            <Button size="sm" variant="outline" disabled={busy || selectingAll || !selectedIds.size || verifyBlocked}
-              onClick={() => void runBatch("verify")}><ShieldCheckIcon /> 批量验证</Button>
+            <span className="text-muted-foreground text-xs">
+              已选 {selectedIds.size} / {selectableTotal} 条{selectingAll ? " · 正在全选" : ""} · 当前页可入池{" "}
+              {eligibleOnPage} 条
+            </span>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={busy || selectingAll || !selectedIds.size || verifyBlocked}
+              onClick={() => void runBatch("verify")}
+            >
+              <ShieldCheckIcon /> 批量验证
+            </Button>
             <span title={batchAdmissionReason || "验证通过，保持停用入池"}>
-            <Button size="sm" variant="outline" disabled={busy || selectingAll || !!batchAdmissionReason}
-              onClick={() => void runBatch("approve", "candidate")}>停用入池</Button>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={busy || selectingAll || !!batchAdmissionReason}
+                onClick={() => void runBatch("approve", "candidate")}
+              >
+                停用入池
+              </Button>
             </span>
             <span title={batchAdmissionReason || "验证通过，入池并启用"}>
-            <Button size="sm" disabled={busy || selectingAll || !!batchAdmissionReason}
-              onClick={() => void runBatch("approve", "production")}>入池并启用</Button>
+              <Button
+                size="sm"
+                disabled={busy || selectingAll || !!batchAdmissionReason}
+                onClick={() => void runBatch("approve", "production")}
+              >
+                入池并启用
+              </Button>
             </span>
-            <Button size="sm" variant="destructive" disabled={busy || selectingAll || !selectedIds.size}
-              onClick={() => void runBatch("delete")}><Trash2Icon /> 批量删除</Button>
-            {selectedIds.size > 0 ? <Button size="sm" variant="ghost" disabled={busy} onClick={() => setSelectedIds(new Set())}>清空勾选</Button> : null}
-            {batchProgress ? <div role="status" className="flex items-center gap-2 text-sm">
-              <span>已完成 {batchProgress.done}/{batchProgress.total}{batchProgress.done < batchProgress.total ? " · 最多同时验证 10 条，单条网络请求最多 3 秒" : ""}</span>
-              <Button size="sm" variant="outline" onClick={() => { stopBatch.current = true; }}>停止后续操作</Button>
-            </div> : null}
+            <Button
+              size="sm"
+              variant="destructive"
+              disabled={busy || selectingAll || !selectedIds.size}
+              onClick={() => void runBatch("delete")}
+            >
+              <Trash2Icon /> 批量删除
+            </Button>
+            {selectedIds.size > 0 ? (
+              <Button size="sm" variant="ghost" disabled={busy} onClick={() => setSelectedIds(new Set())}>
+                清空勾选
+              </Button>
+            ) : null}
+            {batchProgress ? (
+              <div role="status" className="flex items-center gap-2 text-sm">
+                <span>
+                  已完成 {batchProgress.done}/{batchProgress.total}
+                  {batchProgress.done < batchProgress.total ? " · 最多同时验证 10 条，单条网络请求最多 3 秒" : ""}
+                </span>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    stopBatch.current = true;
+                  }}
+                >
+                  停止后续操作
+                </Button>
+              </div>
+            ) : null}
           </div>
-          {resultError ? <p role="alert" className="text-destructive text-sm">{resultError}</p> : null}
+          {resultError ? (
+            <p role="alert" className="text-destructive text-sm">
+              {resultError}
+            </p>
+          ) : null}
           <div className="overflow-x-auto border">
             <table className="w-full min-w-[900px] text-left text-sm">
               <thead className="border-b bg-muted/30 text-muted-foreground">
                 <tr>
                   <th className="w-10 p-3">
-                    <Checkbox aria-label="勾选当前查询全部未入池候选" title="全选当前查询及状态筛选下的所有未入池候选（含其他分页）"
+                    <Checkbox
+                      aria-label="勾选当前查询全部未入池候选"
+                      title="全选当前查询及状态筛选下的所有未入池候选（含其他分页）"
                       disabled={busy || selectingAll || selectableTotal === 0}
                       checked={allSelected ? true : selectedIds.size > 0 ? "indeterminate" : false}
-                      onCheckedChange={(checked) => void toggleAllResults(checked === true)} />
+                      onCheckedChange={(checked) => void toggleAllResults(checked === true)}
+                    />
                   </th>
                   <th className="p-3">地址</th>
                   <th className="p-3">来源</th>
@@ -591,18 +756,32 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
                 {results.map((result) => (
                   <tr key={result.id} className="border-b">
                     <td className="p-3">
-                      <Checkbox aria-label={`勾选候选 ${result.address}`} disabled={busy || selectingAll || result.state === "approved"}
-                        checked={selectedIds.has(result.id)} onCheckedChange={(checked) => setSelectedIds((current) => {
-                          const next = new Set(current);
-                          if (checked === true) next.add(result.id); else next.delete(result.id);
-                          return next;
-                        })} />
+                      <Checkbox
+                        aria-label={`勾选候选 ${result.address}`}
+                        disabled={busy || selectingAll || result.state === "approved"}
+                        checked={selectedIds.has(result.id)}
+                        onCheckedChange={(checked) =>
+                          setSelectedIds((current) => {
+                            const next = new Set(current);
+                            if (checked === true) next.add(result.id);
+                            else next.delete(result.id);
+                            return next;
+                          })
+                        }
+                      />
                     </td>
                     <td className="max-w-64 p-3 font-mono text-xs">
                       <span className="whitespace-nowrap">{result.address}</span>
-                      {result.last_error ? <p className="mt-1 break-words font-sans text-destructive">{proxyVerificationMessage(result.last_error)}</p> : null}
+                      {result.last_error ? (
+                        <p className="mt-1 break-words font-sans text-destructive">
+                          {proxyVerificationMessage(result.last_error)}
+                        </p>
+                      ) : null}
                     </td>
-                    <td className="max-w-40 truncate p-3 text-xs" title={sources.find((source) => source.id === result.source_id)?.name}>
+                    <td
+                      className="max-w-40 truncate p-3 text-xs"
+                      title={sources.find((source) => source.id === result.source_id)?.name}
+                    >
                       {sources.find((source) => source.id === result.source_id)?.name ?? "-"}
                     </td>
                     <td className="whitespace-nowrap p-3">
@@ -619,38 +798,52 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
                         {resultLabel(result)}
                       </span>
                     </td>
-                    <td className="whitespace-nowrap p-3 text-xs">{result.latency_ms != null ? `${result.latency_ms} ms` : "-"}</td>
+                    <td className="whitespace-nowrap p-3 text-xs">
+                      {result.latency_ms != null ? `${result.latency_ms} ms` : "-"}
+                    </td>
                     <td className="whitespace-nowrap p-3">{result.verified_ip || "-"}</td>
                     <td className="p-3">
                       <div className="flex justify-end gap-1">
                         <Button
                           size="icon"
                           variant="ghost"
-                          title={!result.authorized ? "请检查授权范围" : !selectedSourceItem?.verify_url ? "请先配置验证地址" : "验证代理"}
+                          title={
+                            !result.authorized
+                              ? "请检查授权范围"
+                              : !selectedSourceItem?.verify_url
+                                ? "请先配置验证地址"
+                                : "验证代理"
+                          }
                           aria-label={`验证候选 ${result.id}`}
-                          disabled={busy || verifyBlocked || !result.authorized || result.state === "approved" || result.state === "ignored"}
+                          disabled={
+                            busy ||
+                            verifyBlocked ||
+                            !result.authorized ||
+                            result.state === "approved" ||
+                            result.state === "ignored"
+                          }
                           onClick={() => void verifyResult(result)}
                         >
                           <ShieldCheckIcon />
                         </Button>
                         <span title={admissionReason(result) || "验证通过，保持停用入池"}>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={busy || !!admissionReason(result)}
-                          onClick={() => void approveResult(result, "candidate")}
-                        >
-                          停用入池
-                        </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={busy || !!admissionReason(result)}
+                            onClick={() => void approveResult(result, "candidate")}
+                          >
+                            停用入池
+                          </Button>
                         </span>
                         <span title={admissionReason(result) || "验证通过，入池并启用"}>
-                        <Button
-                          size="sm"
-                          disabled={busy || !!admissionReason(result)}
-                          onClick={() => void approveResult(result, "production")}
-                        >
-                          入池并启用
-                        </Button>
+                          <Button
+                            size="sm"
+                            disabled={busy || !!admissionReason(result)}
+                            onClick={() => void approveResult(result, "production")}
+                          >
+                            入池并启用
+                          </Button>
                         </span>
                         <Button
                           size="icon"
@@ -663,7 +856,9 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
                           <Trash2Icon className="text-muted-foreground" />
                         </Button>
                       </div>
-                      {admissionReason(result) ? <p className="mt-1 text-right text-muted-foreground text-xs">{admissionReason(result)}</p> : null}
+                      {admissionReason(result) ? (
+                        <p className="mt-1 text-right text-muted-foreground text-xs">{admissionReason(result)}</p>
+                      ) : null}
                     </td>
                   </tr>
                 ))}
@@ -674,8 +869,18 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
               <p className="p-10 text-center text-muted-foreground text-sm">暂无候选结果。</p>
             ) : null}
           </div>
-          {total > 0 ? <TablePagination page={page} pageSize={pageSize} total={total}
-            onPageChange={setPage} onPageSizeChange={(size) => { setPageSize(size); setPage(1); }} /> : null}
+          {total > 0 ? (
+            <TablePagination
+              page={page}
+              pageSize={pageSize}
+              total={total}
+              onPageChange={setPage}
+              onPageSizeChange={(size) => {
+                setPageSize(size);
+                setPage(1);
+              }}
+            />
+          ) : null}
         </div>
       </div>
 
@@ -688,7 +893,10 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
             if (event.target === event.currentTarget) setShowForm(false);
           }}
         >
-          <form onSubmit={saveSource} className="max-h-[90vh] w-full max-w-xl space-y-4 overflow-y-auto border bg-background p-5 shadow-xl">
+          <form
+            onSubmit={saveSource}
+            className="max-h-[90vh] w-full max-w-xl space-y-4 overflow-y-auto border bg-background p-5 shadow-xl"
+          >
             <div>
               <h3 className="font-semibold">{editing ? "编辑发现查询" : "添加发现查询"}</h3>
               <p className="mt-1 text-muted-foreground text-sm">查询结果只进入候选区，不会自动启用。</p>
@@ -738,31 +946,37 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
                 value={form.fetch_limit}
                 onChange={(event) => setForm({ ...form, fetch_limit: Number(event.target.value) })}
               />
-              <p className="text-muted-foreground text-xs">每次读取 100 到 1000 条；再次执行会继续读取下一批。</p>
+              <p className="text-muted-foreground text-xs">
+                默认每次读取 500 条，可调整为 100 到 1000 条；再次执行会继续读取下一批。
+              </p>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="discovery-scope">授权范围（可选）</Label>
+              <Label htmlFor="discovery-scope">授权范围（自动验证必填）</Label>
               <Input
                 id="discovery-scope"
                 placeholder="例如：203.0.113.0/24 或 example.com"
                 value={form.authorized_scope}
                 onChange={(event) => setForm({ ...form, authorized_scope: event.target.value })}
               />
-              <p className="text-muted-foreground text-xs">未设置时，查询结果不会通过授权校验。</p>
+              <p className="text-muted-foreground text-xs">仅验证你有权使用的代理；未设置时只保存候选，不会自动验证。</p>
               {hasGlobalScope(form.authorized_scope) ? (
-                <p className="text-amber-700 text-xs dark:text-amber-400">0.0.0.0 将保存为全部 IPv4 范围 0.0.0.0/0；IPv6 使用 ::/0。仅配置你有权使用的范围。</p>
+                <p className="text-amber-700 text-xs dark:text-amber-400">
+                  0.0.0.0 将保存为全部 IPv4 范围 0.0.0.0/0；IPv6 使用 ::/0。仅配置你有权使用的范围。
+                </p>
               ) : null}
             </div>
             <div className="space-y-2">
-              <Label htmlFor="discovery-verify-url">代理验证地址（可选）</Label>
+              <Label htmlFor="discovery-verify-url">代理验证地址</Label>
               <Input
                 id="discovery-verify-url"
                 type="url"
-                placeholder="https://your-authorized-check.example/ip"
+                placeholder={defaultDiscoveryVerifyURL}
                 value={form.verify_url}
                 onChange={(event) => setForm({ ...form, verify_url: event.target.value })}
               />
-              <p className="text-muted-foreground text-xs">验证地址须返回出口 IP：纯文本，或 JSON 的 ip／origin 字段。未设置时不能验证候选。</p>
+              <p className="text-muted-foreground text-xs">
+                默认使用 api.ipify.org；地址须返回出口 IP（纯文本或 JSON 的 ip／origin 字段）。
+              </p>
             </div>
             <div className="grid gap-4 sm:grid-cols-2">
               {form.provider === "fofa" ? (
