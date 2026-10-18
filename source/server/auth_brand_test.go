@@ -54,7 +54,7 @@ func TestAdminLoginIssuesCurrentIdentity(t *testing.T) {
 }
 
 func TestAuthTokenSourcePrecedence(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/api/tasks?token=sse-token", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/exploration/activity/stream?token=sse-token", nil)
 	if got := extractToken(req); got != "sse-token" {
 		t.Fatalf("SSE token=%q", got)
 	}
@@ -69,6 +69,28 @@ func TestAuthTokenSourcePrecedence(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer header-token")
 	if got := extractToken(req); got != "header-token" {
 		t.Fatalf("header must take precedence: %q", got)
+	}
+}
+
+func TestQueryTokenLimitedToReadOnlyStreams(t *testing.T) {
+	for _, path := range []string{
+		"/api/logs/stream", "/api/exploration/activity/stream", "/api/side-questions/42/events",
+	} {
+		req := httptest.NewRequest(http.MethodGet, path+"?token=sse-token", nil)
+		if got := extractToken(req); got != "sse-token" {
+			t.Errorf("%s: token = %q", path, got)
+		}
+	}
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, "/api/tasks"},
+		{http.MethodPost, "/api/tasks"},
+		{http.MethodPost, "/api/logs/stream"},
+		{http.MethodGet, "/api/side-questions/42/events/extra"},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path+"?token=sse-token", nil)
+		if got := extractToken(req); got != "" {
+			t.Errorf("%s %s: unexpected token %q", tc.method, tc.path, got)
+		}
 	}
 }
 

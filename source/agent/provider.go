@@ -45,8 +45,7 @@ type Config struct {
 	// ContextWindowK is the model's context window in K tokens (user-configured),
 	// used to size compaction thresholds. 0 = default; see CompactionWindow.
 	ContextWindowK int
-	// Only an explicitly confirmed profile supplies a model-capacity limit.
-	// Otherwise the request guard uses a separate local policy ceiling.
+	// Preserved profile metadata; context compaction uses ContextWindowK.
 	ContextWindowConfirmed bool
 	// ThinkingType 独立控制思考「开关」字段(thinking.type):
 	//   "" = 不发送(默认,兼容不支持该字段的模型); "disabled" = 显式关闭;
@@ -103,14 +102,26 @@ type RetryConfig struct {
 	StreamInterval time.Duration
 }
 
-const maxWindowK = 1000 // cap at 1M tokens (user request)
+const (
+	defaultWindowK = 200
+	minWindowK     = 32
+	maxWindowK     = 1000
+)
 
-// CompactionWindow returns the effective request budget in tokens for history
-// compaction. An unknown or unconfirmed capacity must not let the SDK postpone
-// compaction past the local request guard's 64K ceiling.
+// CompactionWindow follows the upstream SDK window policy: default 200K,
+// otherwise the configured size clamped to [32K, 1M].
 func (c Config) CompactionWindow() int {
-	limit, _ := c.requestBudget()
-	return limit
+	k := c.ContextWindowK
+	if k <= 0 {
+		k = defaultWindowK
+	}
+	if k < minWindowK {
+		k = minWindowK
+	}
+	if k > maxWindowK {
+		k = maxWindowK
+	}
+	return k * 1000
 }
 
 // compactionConfig builds the agent-core compaction config for a context window
@@ -118,7 +129,7 @@ func (c Config) CompactionWindow() int {
 // is set on Options.Compaction.
 func compactionConfig(windowTokens int) *compaction.Config {
 	if windowTokens <= 0 {
-		windowTokens = unknownContextBudget
+		windowTokens = defaultWindowK * 1000
 	}
 	return &compaction.Config{ContextWindow: windowTokens}
 }
@@ -269,9 +280,9 @@ func (c Config) NewProvider() (llm.Provider, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &budgetProvider{
+	return &reasoningCompatProvider{
 		Provider: &validatedProvider{Provider: provider, format: c.Provider()},
-		config:   c,
+		enabled:  c.Format == llm.FormatOpenAI && c.ThinkingType == "" && c.ReasoningEffort == "",
 	}, nil
 }
 
@@ -283,6 +294,11 @@ var transientQuotaLimit = regexp.MustCompile(`(?i)(?:\b(?:rpm|tpm|rpd|qps)\b|quo
 
 func IsQuotaExhaustedMessage(message string) bool {
 	message = strings.ToLower(message)
+	// A gateway may report an unavailable subscription for one model group as
+	// 403. Only this explicit code is eligible for task-chain failover.
+	if strings.Contains(message, "status 403") && subscriptionNotFound.MatchString(message) {
+		return true
+	}
 	// Authentication/authorization and provider-side 5xx failures never rotate,
 	// even when a gateway happens to echo a quota-looking phrase in the body.
 	if nonFailoverHTTPStatus.MatchString(message) {
@@ -314,6 +330,8 @@ func IsQuotaExhaustedMessage(message string) bool {
 		!strings.Contains(message, "too many requests")
 }
 
+var subscriptionNotFound = regexp.MustCompile(`"code"\s*:\s*"subscription_not_found"`)
+
 // quotaAwareTransport preserves Norma's normal retry behavior except for a 429
 // whose body explicitly says the account quota/balance is exhausted. Norma's
 // retry loop treats every 429 as transient; normalizing only that response to
@@ -328,6 +346,13 @@ type quotaAwareTransport struct {
 }
 
 func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if requestNeedsThinkingDisabled(req.Context()) {
+		var err error
+		req, err = withThinkingDisabled(req)
+		if err != nil {
+			return nil, err
+		}
+	}
 	// Custom session-id header: name is user-configured, value is THIS run's
 	// session id (norma stashes it on the context via transcript.WithSessionID).
 	// Stable across a session's turns and distinct across sessions — exactly what

@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"yunkun/console/db"
 	actool "github.com/Autumn-27/norma/tool"
+	"yunkun/console/db"
 )
 
 // assetInterceptCandidates 提取一条待插入资产输入项的 域名/IP/URL 候选串，用于资产拦截匹配。
@@ -583,6 +583,72 @@ func (t *ToolSet) listAssets() actool.CoreTool {
 	)
 }
 
+// getTargetProfile exposes a bounded, on-demand view of the task profile.
+// Profile entries are observations, not authorization edges; this tool never
+// calls AddAgentScope and never returns unbounded source text.
+func (t *ToolSet) getTargetProfile() actool.CoreTool {
+	return readTool(
+		"get_target_profile",
+		"按需读取本任务的目标画像观察记录。返回有限摘要和 record_id，包含类别、目标、直接观察/推断、来源摘要、置信度与时间；不会扩大任务授权范围。默认最多 10 条，可用 before 取更旧记录。",
+		obj(map[string]any{
+			"before": intp("游标：传上一页最后一条 record_id；省略或 0=最新"),
+			"limit":  intp("返回数量，默认 10，最大 10"),
+		}),
+		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+			if t.ragDB == nil {
+				return actool.Errorf("get_target_profile 未启用: 数据库未初始化"), nil
+			}
+			taskID := t.taskID
+			if taskID <= 0 {
+				return actool.Errorf("get_target_profile 需要任务上下文"), nil
+			}
+			var args struct {
+				Before int64 `json:"before"`
+				Limit  int   `json:"limit"`
+			}
+			_ = json.Unmarshal(in, &args)
+			if args.Before < 0 {
+				return actool.Errorf("before 不能为负数"), nil
+			}
+			if args.Limit <= 0 || args.Limit > 10 {
+				args.Limit = 10
+			}
+			entries, err := t.ragDB.ListTaskProfileEntries(taskID, args.Before, args.Limit)
+			if err != nil {
+				return actool.Errorf("读取目标画像失败: " + err.Error()), nil
+			}
+			out := make([]map[string]any, 0, len(entries))
+			for _, entry := range entries {
+				item := map[string]any{
+					"record_id": entry.ID, "kind": entry.Kind, "label": entry.Label,
+					"evidence_kind": entry.EvidenceKind, "source_summary": entry.SourceSummary,
+					"confidence": entry.Confidence, "observed_at": entry.ObservedAt,
+				}
+				if entry.ScopeID != nil {
+					item["scope_id"] = *entry.ScopeID
+				}
+				if entry.SourceNodeID != nil {
+					item["source_node_id"] = *entry.SourceNodeID
+				}
+				if entry.SourceQuery != "" {
+					item["source_query"] = entry.SourceQuery
+				}
+				if entry.SameKeyCount > 1 {
+					item["same_key_count"] = entry.SameKeyCount
+				}
+				out = append(out, item)
+			}
+			nextBefore := int64(0)
+			if len(entries) == args.Limit {
+				nextBefore = entries[len(entries)-1].ID
+			}
+			return jsonResult(map[string]any{
+				"entries": out, "count": len(out), "next_before": nextBefore,
+			})
+		},
+	)
+}
+
 // listCompanies lets an agent enumerate companies (企业) with their scope + asset count.
 func (t *ToolSet) listCompanies() actool.CoreTool {
 	return readTool(
@@ -649,6 +715,10 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		// list_findings 保留：报漏洞前先查本任务已确认漏洞，避免重复上报同一漏洞。
 		t.listFindings(),
 		t.addFinding(), t.recordFact(),
+		t.getTargetProfile(),
+		t.analyzeWebSurface(),
+		t.assetIntelSearch(),
+		t.threatBookLookup(),
 		// asset management (handlers guard nil store internally)。
 		// add_company_scope 不给 worker：定义企业资产范围属规划/主控/Auto 的职责，worker 只执行探索。
 		t.insertAssets(), t.listAssets(),
@@ -681,6 +751,7 @@ func (t *ToolSet) MainAgentTools() []actool.CoreTool {
 		// asset management (handlers guard nil store internally)
 		t.insertAssets(), t.addCompanyScope(), t.listAssets(),
 		t.addFinding(), t.recordFact(),
+		t.getTargetProfile(),
 		t.addTaskScope(),
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),

@@ -1,0 +1,25 @@
+name: verify
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: go test ./config ./cmd/yunkun ./proxypool
+      - run: npm ci
+        working-directory: web
+      - run: npm run build:static
+        working-directory: web

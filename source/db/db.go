@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib" // pgx database/sql driver ("pgx")
 	"yunkun/console/config"
@@ -124,7 +125,7 @@ func ensureDatabase(dsn string) error {
 	var exists bool
 	_ = admin.QueryRow(`SELECT true FROM pg_database WHERE datname=$1`, dbName).Scan(&exists)
 	if !exists {
-		if _, err := admin.Exec(`CREATE DATABASE "` + dbName + `"`); err != nil {
+		if _, err := admin.Exec(createDatabaseSQL(dbName)); err != nil {
 			return fmt.Errorf("create database %q: %w", dbName, err)
 		}
 	}
@@ -132,6 +133,10 @@ func ensureDatabase(dsn string) error {
 }
 
 // Open connects, applies the schema (idempotent), and seeds builtin rows.
+func createDatabaseSQL(name string) string {
+	return "CREATE DATABASE " + pgx.Identifier{name}.Sanitize()
+}
+
 func Open(dsn string) (*DB, error) {
 	if err := ensureDatabase(dsn); err != nil {
 		return nil, err
@@ -326,7 +331,8 @@ ON CONFLICT DO NOTHING`, r.kind, r.pattern, r.note); err != nil {
 // declares `mcps: ScopeSentry`, which only takes effect once it's made visible and
 // that MCP is enabled/configured.
 var builtinSkillVisibility = map[string][]string{
-	"api-recon": {"auto", "pentest", "worker"},
+	"api-recon":                {"auto", "pentest", "worker"},
+	"yunkun-security-workflow": {"auto", "planner", "pentest", "worker", "reporter"},
 }
 
 // seedBuiltinSkillVisibility binds the shipped built-in skills to their default

@@ -23,10 +23,10 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"yunkun/console/agent"
-	"yunkun/console/db"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/skill"
+	"yunkun/console/agent"
+	"yunkun/console/db"
 )
 
 // validSkillName checks the agentskills.io name constraints, widened so a skill can
@@ -1006,6 +1006,9 @@ func (s *Server) fsListSkills(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		dirName := e.Name()
+		if !validSkillName(dirName) {
+			continue
+		}
 		node := skillFileNode{Name: dirName, Agents: []string{}}
 		if st, ok := statBySkill[dirName]; ok {
 			node.Calls, node.Tasks, node.Agents, node.LastUsed = st.Calls, st.Tasks, st.Agents, st.LastUsed
@@ -1094,12 +1097,21 @@ func (s *Server) fsCreateSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	skillPath := filepath.Join(s.skillDir, body.Name)
-	if _, err := os.Stat(skillPath); err == nil {
-		writeErr(w, 409, "skill already exists")
+	if _, err := skillFilePath(s.skillDir, body.Name, "SKILL.md"); err != nil {
+		writeErr(w, 400, "非法 skill 路径")
 		return
 	}
-	if err := os.MkdirAll(skillPath, 0o755); err != nil {
+	if err := os.MkdirAll(s.skillDir, 0o755); err != nil {
 		writeErr(w, 500, err.Error())
+		return
+	}
+	// Mkdir atomically claims the name; never write into or remove an existing skill.
+	if err := os.Mkdir(skillPath, 0o755); err != nil {
+		if os.IsExist(err) {
+			writeErr(w, 409, "skill already exists")
+		} else {
+			writeErr(w, 500, err.Error())
+		}
 		return
 	}
 	// Build a spec-compliant SKILL.md (agentskills.io format):
@@ -1158,7 +1170,11 @@ func (s *Server) fsUpdateSkillMeta(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	skillMD := filepath.Join(s.skillDir, name, "SKILL.md")
+	skillMD, err := skillFilePath(s.skillDir, name, "SKILL.md")
+	if err != nil {
+		writeErr(w, 400, "非法 skill 路径")
+		return
+	}
 	raw, err := os.ReadFile(skillMD)
 	if err != nil {
 		writeErr(w, 404, "skill not found")
@@ -1364,8 +1380,15 @@ func (s *Server) fsUploadSkill(w http.ResponseWriter, r *http.Request) {
 
 	skillPath := filepath.Join(s.skillDir, name)
 	overwrite := r.URL.Query().Get("overwrite") == "true"
-	if _, err := os.Stat(skillPath); err == nil && !overwrite {
+	if _, err := skillFilePath(s.skillDir, name, "SKILL.md"); err != nil {
+		writeErr(w, 400, "非法 skill 路径")
+		return
+	}
+	if _, err := os.Lstat(skillPath); err == nil && !overwrite {
 		writeErr(w, 409, "skill 已存在："+name+"（如需覆盖请确认后重试）")
+		return
+	} else if err != nil && !os.IsNotExist(err) {
+		writeErr(w, 500, err.Error())
 		return
 	}
 
@@ -1451,12 +1474,44 @@ func (s *Server) fsUploadSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Preserve the old skill until the new one is fully extracted. A failed
+	// rename must not destroy an already installed skill.
+	backup := ""
 	if overwrite {
-		_ = os.RemoveAll(skillPath)
+		if _, err := os.Lstat(skillPath); err == nil {
+			reserved, err := os.MkdirTemp(s.skillDir, ".skill-backup-*")
+			if err != nil {
+				writeErr(w, 500, "准备备份失败："+err.Error())
+				return
+			}
+			if err := os.Remove(reserved); err != nil {
+				writeErr(w, 500, "准备备份失败："+err.Error())
+				return
+			}
+			if err := os.Rename(skillPath, reserved); err != nil {
+				writeErr(w, 500, "备份旧 skill 失败："+err.Error())
+				return
+			}
+			backup = reserved
+		} else if !os.IsNotExist(err) {
+			writeErr(w, 500, err.Error())
+			return
+		}
 	}
 	if err := os.Rename(tmp, skillPath); err != nil {
+		if backup != "" {
+			if restoreErr := os.Rename(backup, skillPath); restoreErr != nil {
+				writeErr(w, 500, "安装失败且旧 skill 恢复失败；备份位于 "+backup+"："+restoreErr.Error())
+				return
+			}
+		}
 		writeErr(w, 500, "安装失败："+err.Error())
 		return
+	}
+	if backup != "" {
+		if err := os.RemoveAll(backup); err != nil {
+			log.Printf("[skills] 清理旧 skill 备份 %s 失败: %v", backup, err)
+		}
 	}
 	writeJSON(w, 201, map[string]any{"name": name, "files": entries})
 }
@@ -1480,6 +1535,10 @@ func (s *Server) fsDeleteSkill(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if !validSkillName(name) {
 		writeErr(w, 400, "invalid skill name")
+		return
+	}
+	if _, err := skillFilePath(s.skillDir, name, "SKILL.md"); err != nil {
+		writeErr(w, 400, "非法 skill 路径")
 		return
 	}
 	if err := pg.DeleteSkillVisibility(name); err != nil {
@@ -1559,6 +1618,28 @@ func skillRelPath(file string) (string, string) {
 	return clean, ""
 }
 
+// Reject links in every existing component, including the skill directory.
+// A syntactically safe relative path alone does not prevent following an
+// on-disk symlink planted by a skill or another local process.
+func skillFilePath(skillDir, name, file string) (string, error) {
+	base := filepath.Join(skillDir, name)
+	current := skillDir
+	for _, part := range append([]string{name}, strings.Split(file, "/")...) {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if os.IsNotExist(err) {
+			continue // new files and directories are allowed
+		}
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("skill path contains a symbolic link")
+		}
+	}
+	return filepath.Join(base, filepath.FromSlash(file)), nil
+}
+
 // walkSkillFiles returns all files under root (relative to root), sorted,
 // including files in subdirectories (scripts/, references/, assets/, etc.).
 // walkSkillFiles returns all entries under root relative to root.
@@ -1590,7 +1671,12 @@ func (s *Server) fsListFiles(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "invalid skill name")
 		return
 	}
-	dirPath := filepath.Join(s.skillDir, name)
+	dirPath, err := skillFilePath(s.skillDir, name, "SKILL.md")
+	if err != nil {
+		writeErr(w, 400, "非法 skill 路径")
+		return
+	}
+	dirPath = filepath.Dir(dirPath)
 	if _, err := os.Stat(dirPath); os.IsNotExist(err) {
 		writeErr(w, 404, "skill not found")
 		return
@@ -1617,13 +1703,28 @@ func (s *Server) fsReadFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errMsg)
 		return
 	}
-	data, err := os.ReadFile(filepath.Join(s.skillDir, name, file))
+	fullPath, err := skillFilePath(s.skillDir, name, file)
+	if err != nil {
+		writeErr(w, 400, "非法 skill 路径")
+		return
+	}
+	f, err := os.Open(fullPath)
 	if os.IsNotExist(err) {
 		writeErr(w, 404, "file not found")
 		return
 	}
 	if err != nil {
 		writeErr(w, 500, err.Error())
+		return
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxSkillFileBytes+1))
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if len(data) > maxSkillFileBytes {
+		writeErr(w, 413, "skill 文件过大")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"content": string(data), "file": file})
@@ -1643,8 +1744,13 @@ func (s *Server) fsWriteFile(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Content string `json:"content"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxSkillFileBytes+1024)
 	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, err.Error())
+		return
+	}
+	if len(body.Content) > maxSkillFileBytes {
+		writeErr(w, 413, "skill 文件过大")
 		return
 	}
 	skillPath := filepath.Join(s.skillDir, name)
@@ -1652,7 +1758,11 @@ func (s *Server) fsWriteFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "skill not found")
 		return
 	}
-	fullPath := filepath.Join(skillPath, file)
+	fullPath, err := skillFilePath(s.skillDir, name, file)
+	if err != nil {
+		writeErr(w, 400, "非法 skill 路径")
+		return
+	}
 	// create parent subdirectory if needed (e.g. scripts/, references/, assets/)
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
 		writeErr(w, 500, err.Error())
@@ -1688,7 +1798,12 @@ func (s *Server) fsCreateDir(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "skill not found")
 		return
 	}
-	if err := os.MkdirAll(filepath.Join(skillPath, dir), 0o755); err != nil {
+	fullPath, err := skillFilePath(s.skillDir, name, dir)
+	if err != nil {
+		writeErr(w, 400, "非法 skill 路径")
+		return
+	}
+	if err := os.MkdirAll(fullPath, 0o755); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -1706,7 +1821,11 @@ func (s *Server) fsDeletePath(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errMsg)
 		return
 	}
-	fullPath := filepath.Join(s.skillDir, name, file)
+	fullPath, err := skillFilePath(s.skillDir, name, file)
+	if err != nil {
+		writeErr(w, 400, "非法 skill 路径")
+		return
+	}
 	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
 		writeErr(w, 404, "not found")
 		return

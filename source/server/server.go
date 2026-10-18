@@ -19,16 +19,17 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Autumn-27/norma/llm"
+	actool "github.com/Autumn-27/norma/tool"
+	"github.com/Autumn-27/norma/transcript"
 	"yunkun/console/agent"
+	"yunkun/console/config"
 	"yunkun/console/db"
 	"yunkun/console/intercept"
 	"yunkun/console/llmpool"
 	"yunkun/console/llmrec"
 	"yunkun/console/report"
 	"yunkun/console/traffic"
-	"github.com/Autumn-27/norma/llm"
-	actool "github.com/Autumn-27/norma/tool"
-	"github.com/Autumn-27/norma/transcript"
 )
 
 // BuildVersion is the backend application version, injected from cmd/yunkun at
@@ -43,11 +44,12 @@ var resumeTasksOnStartup = true
 // Server exposes the backend over a JSON HTTP API for the shadcn/ui
 // frontend.
 type Server struct {
-	proxyPools     *proxyPoolService
-	proxyDiscovery *proxyDiscoveryService
-	m              *Manager
-	engine         *Engine
-	ctx            context.Context
+	proxyPools         *proxyPoolService
+	proxyDiscovery     *proxyDiscoveryService
+	proxyDiscoveryInit sync.Once
+	m                  *Manager
+	engine             *Engine
+	ctx                context.Context
 
 	skillDir string // root directory for skill subdirectories
 	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
@@ -161,6 +163,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	if err := s.initProxyPools(keyDir); err != nil {
 		log.Printf("[proxy-pools] initialization failed; pool tasks disabled")
 	}
+	s.initProxyDiscovery()
 	if len(gatewayAddr) > 0 {
 		if err := s.SetProxyGatewayAddress(gatewayAddr[0]); err != nil {
 			log.Printf("[proxy-pools] gateway address unavailable; pool tasks disabled")
@@ -717,8 +720,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/logs/history", s.getLogsHistory)
 	mux.HandleFunc("GET /api/logs/stream", s.streamLogs)
 
-	// Release discovery is read-only; binary replacement stays fail-closed.
-	mux.HandleFunc("GET /api/update/check", updateCheck)
+	// Version checks use a fixed, trusted release feed. Applying a release
+	// remains disabled until the offline-package restart flow is wired.
+	mux.HandleFunc("GET /api/update/check", s.updateCheck)
 	mux.HandleFunc("POST /api/update/apply", updateUnavailable)
 	mux.HandleFunc("POST /api/update/rollback", updateUnavailable)
 	mux.HandleFunc("GET /api/update/stream", updateUnavailable)
@@ -761,6 +765,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/tasks/{id}/assets", s.attachTaskAssets)
 	mux.HandleFunc("DELETE /api/tasks/{id}/assets/{assetID}", s.detachTaskAsset)
 	mux.HandleFunc("GET /api/tasks/{id}/intent-assets", s.taskIntentAssets)
+	mux.HandleFunc("GET /api/tasks/{id}/target-profile", s.taskProfileList)
+	mux.HandleFunc("POST /api/tasks/{id}/target-profile", s.taskProfileAdd)
 
 	// 工作空间文件管理器（针对 workDir）
 	mux.HandleFunc("GET /api/workspace/list", s.wsList)
@@ -814,8 +820,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/exploration/findings/asset-tree", s.findingAssetTree)
 	mux.HandleFunc("GET /api/exploration/findings/stats", s.findingStats)
 	mux.HandleFunc("GET /api/exploration/findings/export", s.findingsExport)
+	mux.HandleFunc("GET /api/confidential-access-events", s.listConfidentialAccess)
 	s.registerFindingTraffic(mux)
 	mux.HandleFunc("GET /api/exploration/findings/{id}", s.getFinding)
+	mux.HandleFunc("GET /api/exploration/findings/{id}/quality", s.getFindingQuality)
+	mux.HandleFunc("PUT /api/exploration/findings/{id}/quality", s.updateFindingQuality)
 	mux.HandleFunc("GET /api/exploration/findings/{id}/lineage", s.findingLineage)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/deepen", s.deepenFinding)
 	mux.HandleFunc("GET /api/exploration/findings/{id}/retests", s.listFindingRetests)
@@ -2208,6 +2217,11 @@ func (s *Server) getFinding(w http.ResponseWriter, r *http.Request) {
 	}
 	assets := s.resolveAssetIDs(f.AssetIDs)
 	dto := findingFromDB(f, assets)
+	dto.Quality, err = s.m.pg.GetFindingQuality(f.ID)
+	if err != nil {
+		writeErr(w, http.StatusServiceUnavailable, "无法读取漏洞质量状态")
+		return
+	}
 	if contextTaskID := strings.TrimSpace(r.URL.Query().Get("context_task")); contextTaskID != "" {
 		contextTask := s.m.ResolveTask(contextTaskID)
 		if contextTask == nil {
@@ -2221,6 +2235,9 @@ func (s *Server) getFinding(w http.ResponseWriter, r *http.Request) {
 		}
 		dto.SourceTaskID = sourceTaskID
 		dto.Inherited = inherited
+	}
+	if !s.auditConfidentialAccess(w, r, "view", "finding_report", id, "detail") {
+		return
 	}
 	writeJSON(w, 200, dto)
 }
@@ -2236,6 +2253,12 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	scope := q.Get("scope")
 	format := q.Get("format")
+	switch format {
+	case "md-single", "md-zip", "csv", "json":
+	default:
+		writeErr(w, 400, "bad format: "+format)
+		return
+	}
 
 	var ids []int64
 	var filter db.FindingFilter
@@ -2271,6 +2294,20 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	if format == "md-single" || format == "md-zip" || format == "json" {
+		blockers, qualityErr := s.m.pg.FormalFindingExportBlockers(fs)
+		if qualityErr != nil {
+			writeErr(w, http.StatusServiceUnavailable, "无法核验漏洞质量状态")
+			return
+		}
+		if len(blockers) > 0 {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":    "存在未通过质量门禁的漏洞，不能生成正式交付报告",
+				"blockers": blockers,
+			})
+			return
+		}
+	}
 
 	stage, err := os.MkdirTemp("", "yunkun-finding-export-")
 	if err != nil {
@@ -2287,6 +2324,10 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 	setDownload := func(contentType, filename string) {
 		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	}
+	if !s.auditConfidentialAccess(w, r, "export", "finding_report", 0,
+		confidentialExportDetail(format, scope, len(fs)), exportFindingIDs(fs)) {
+		return
 	}
 
 	switch format {
@@ -4025,6 +4066,18 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "读取报告证据失败")
 		return
 	}
+	blockers, err := s.taskReportQualityBlockers(findings, references)
+	if err != nil {
+		writeErr(w, http.StatusServiceUnavailable, "无法核验漏洞质量状态")
+		return
+	}
+	if len(blockers) > 0 {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":    "存在未通过质量门禁的漏洞，不能生成正式任务报告",
+			"blockers": blockers,
+		})
+		return
+	}
 	snapshots := map[int64]db.TrafficEvidenceSnapshot{}
 	for _, ref := range references {
 		for _, item := range ref.Traffic {
@@ -4047,9 +4100,69 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 		Title: t.Description, Goal: t.Goal, GeneratedAt: time.Now(),
 		AssetCounts: counts, Findings: findings, References: references, Requests: requests,
 	})
+	if !s.auditConfidentialAccess(w, r, "view", "finding_report", 0,
+		fmt.Sprintf("task_report:%d", taskID)) {
+		return
+	}
 	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 	w.WriteHeader(200)
 	_, _ = w.Write([]byte(md))
+}
+
+// taskReportQualityBlockers keeps the task report on the same formal-delivery
+// path as the findings export. Exploration nodes are not enough on their own:
+// every finding must have a persisted record, an approved quality review, and
+// a report whose evidence version still matches the bound evidence.
+func (s *Server) taskReportQualityBlockers(
+	findings []*db.Node,
+	references map[int64]db.TaskReportReference,
+) ([]string, error) {
+	nodeIDs := make([]int64, 0, len(findings))
+	for _, finding := range findings {
+		if finding != nil {
+			nodeIDs = append(nodeIDs, finding.ID)
+		}
+	}
+	ids := make([]int64, 0, len(references))
+	for _, ref := range references {
+		ids = append(ids, ref.FindingID)
+	}
+	quality, err := s.m.pg.ListFindingQuality(ids)
+	if err != nil {
+		return nil, err
+	}
+	blockers := make([]string, 0)
+	seen := make(map[string]struct{})
+	add := func(value string) {
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		blockers = append(blockers, value)
+	}
+	for _, nodeID := range nodeIDs {
+		ref, ok := references[nodeID]
+		if !ok {
+			add(fmt.Sprintf("node#%d:UNREGISTERED", nodeID))
+			continue
+		}
+		for _, blocker := range db.FindingDeliveryMetadataBlockers(ref.FindingID, ref.Severity, ref.Status) {
+			add(blocker)
+		}
+		q := quality[ref.FindingID]
+		if q == nil {
+			add(fmt.Sprintf("#%d:UNREVIEWED", ref.FindingID))
+		} else if q.QualityStatus != db.FindingQualityPass {
+			add(fmt.Sprintf("#%d:%s", ref.FindingID, q.QualityStatus))
+		}
+		if strings.TrimSpace(ref.Report) == "" {
+			add(fmt.Sprintf("#%d:REPORT_MISSING", ref.FindingID))
+		}
+		if ref.ReportEvidenceVersion != ref.EvidenceVersion {
+			add(fmt.Sprintf("#%d:REPORT_EVIDENCE_STALE", ref.FindingID))
+		}
+	}
+	return blockers, nil
 }
 
 func (s *Server) getAudit(w http.ResponseWriter, r *http.Request) {
@@ -4069,12 +4182,25 @@ func (s *Server) gc(w http.ResponseWriter, r *http.Request) {
 // --- utils ---
 
 func cors(next http.Handler) http.Handler {
+	allowed := make(map[string]struct{})
+	for _, origin := range config.CORSOrigins() {
+		allowed[origin] = struct{}{}
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		origin := strings.TrimSpace(r.Header.Get("Origin"))
+		_, crossOriginAllowed := allowed[origin]
+		if crossOriginAllowed {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		}
 		if r.Method == http.MethodOptions {
-			w.WriteHeader(204)
+			if origin != "" && !crossOriginAllowed {
+				http.Error(w, "origin not allowed", http.StatusForbidden)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		next.ServeHTTP(w, r)

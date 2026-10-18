@@ -137,6 +137,24 @@ func TestTerminalTextNonAbortReasons(t *testing.T) {
 	}
 }
 
+func TestTerminalTextIdentifiesDeterministicModelErrors(t *testing.T) {
+	for _, tc := range []struct {
+		err  string
+		want string
+	}{
+		{`openai: status 400: reasoning_content in the thinking mode must be passed back`, "思考字段不兼容"},
+		{`openai-responses: status 403: {"code":"SUBSCRIPTION_NOT_FOUND"}`, "没有有效订阅"},
+		{`context length budget exceeded: limit=64000`, "本地上下文预算"},
+	} {
+		summary, detail := terminalText(context.Background(), &harness.Terminal{
+			Reason: harness.ReasonModelError, Err: errors.New(tc.err),
+		}, &runTrace{})
+		if !strings.Contains(summary, tc.want) || !strings.Contains(detail, tc.want) {
+			t.Errorf("error %q classified as %q / %q", tc.err, summary, detail)
+		}
+	}
+}
+
 func TestAbortCausesAreWellFormed(t *testing.T) {
 	all := []*AbortCause{
 		AbortPausedByUser, AbortPausedByOrchestrator, AbortTaskDeleted, AbortPausedOnReload,

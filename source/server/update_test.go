@@ -1,86 +1,155 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"net/http"
-	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
+
+	"yunkun/console/selfupdate"
 )
 
-func TestOfflineVersionComparison(t *testing.T) {
-	for _, tc := range []struct {
-		current, latest string
-		want            int
-		valid           bool
-	}{
-		{"v1.0.1-offline", "v1.0.2-offline", -1, true},
-		{"1.0.1-offline", "v1.0.2-offline", -1, true},
-		{"v1.9.9-offline", "v1.10.0-offline", -1, true},
-		{"v2.0.0-offline", "v1.10.0-offline", 1, true},
-		{"v1.0.1-offline", "v1.0.1-offline", 0, true},
-		{"dev", "v1.0.1-offline", 0, false},
-		{"v1.0.0", "v1.0.1-offline", 0, false},
-		{"v1.0.1-offline", "v1.0.2-offline-beta", 0, false},
-	} {
-		got, ok := compareOfflineVersions(tc.current, tc.latest)
-		if got != tc.want || ok != tc.valid {
-			t.Errorf("%q vs %q = %d, %v", tc.current, tc.latest, got, ok)
-		}
-	}
+// releaseCache 是保护 GitHub 配额的那一层：未认证的 API 只有 60 次/小时/IP，
+// 而顶栏的"有新版本"提示每次整页加载都会查一次。缓存一旦失效，用户多开几个
+// 标签页就会把配额耗光，之后真想更新反而查不动。
+
+func newTestCache(fetch func(context.Context, *http.Client) (*selfupdate.Release, error)) *releaseCache {
+	return &releaseCache{fetch: fetch}
 }
 
-func TestUpdateCheckTrustAndCache(t *testing.T) {
+func TestReleaseCacheServesFromCache(t *testing.T) {
 	calls := 0
-	feed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	c := newTestCache(func(context.Context, *http.Client) (*selfupdate.Release, error) {
 		calls++
-		w.Write([]byte(`{"tag_name":"v1.0.2-offline","assets":[{"name":"yunkun-v1.0.2-offline-windows-x64.zip","browser_download_url":"https://github.com/Haryy985/yunkun-console-preview/releases/download/v1.0.2-offline/yunkun-v1.0.2-offline-windows-x64.zip","digest":"sha256:` + strings.Repeat("a", 64) + `"}]}`))
-	}))
-	defer feed.Close()
-	checker := &updateChecker{client: feed.Client(), apiURL: feed.URL}
-	req := httptest.NewRequest(http.MethodGet, "/api/update/check", nil)
-	got := checker.check(req, "v1.0.1-offline")
-	if got.Status != "available" || got.PackageSHA256 != strings.Repeat("a", 64) {
-		t.Fatalf("valid release = %+v", got)
+		return &selfupdate.Release{TagName: "v0.3.8"}, nil
+	})
+
+	for range 5 {
+		rel, err := c.get(t.Context(), nil, false)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if rel.TagName != "v0.3.8" {
+			t.Fatalf("TagName = %q", rel.TagName)
+		}
 	}
-	checker.check(req, "v1.0.1-offline")
 	if calls != 1 {
-		t.Fatalf("cache missed: %d requests", calls)
-	}
-	checker.check(httptest.NewRequest(http.MethodGet, "/api/update/check?refresh=1", nil), "v1.0.1-offline")
-	if calls != 2 {
-		t.Fatalf("manual refresh did not fetch release: %d requests", calls)
-	}
-	if checker.check(req, "dev").Status != "unsupported" {
-		t.Fatal("dev builds must not offer an update")
-	}
-	checker.expires = time.Time{}
-	got = checker.check(req, "v1.0.2-offline")
-	if got.Status != "current" || calls != 3 {
-		t.Fatalf("up-to-date result = %+v, calls = %d", got, calls)
+		t.Errorf("5 次查询只应回源 1 次，实际 %d 次", calls)
 	}
 }
 
-func TestUpdateCheckUntrustedOrOffline(t *testing.T) {
-	for _, payload := range []string{
-		`{"tag_name":"v1.0.2-offline","prerelease":true}`,
-		`{"tag_name":"v1.0.2-offline","assets":[{"name":"yunkun-v1.0.2-offline-windows-x64.zip","browser_download_url":"https://evil.example/file.zip","digest":"sha256:` + strings.Repeat("a", 64) + `"}]}`,
-		`{"tag_name":"v1.0.2-offline","assets":[{"name":"yunkun-v1.0.2-offline-windows-x64.zip","browser_download_url":"https://github.com/Haryy985/yunkun-console-preview/releases/download/v1.0.2-offline/yunkun-v1.0.2-offline-windows-x64.zip","digest":""}]}`,
-	} {
-		feed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte(payload)) }))
-		checker := &updateChecker{client: feed.Client(), apiURL: feed.URL}
-		if got := checker.check(httptest.NewRequest("GET", "/", nil), "v1.0.1-offline"); got.Status != "unavailable" || got.PackageURL != "" {
-			t.Fatalf("untrusted release = %+v", got)
-		}
-		feed.Close()
+func TestReleaseCacheForceBypasses(t *testing.T) {
+	calls := 0
+	c := newTestCache(func(context.Context, *http.Client) (*selfupdate.Release, error) {
+		calls++
+		return &selfupdate.Release{TagName: "v0.3.8"}, nil
+	})
+
+	if _, err := c.get(t.Context(), nil, false); err != nil {
+		t.Fatal(err)
 	}
-	checker := &updateChecker{client: &http.Client{Timeout: 100 * time.Millisecond}, apiURL: "http://127.0.0.1:1"}
-	if got := checker.check(httptest.NewRequest("GET", "/", nil), "v1.0.1-offline"); got.Status != "unavailable" {
-		t.Fatalf("offline check = %+v", got)
+	// 用户点「检查更新」必须拿到实时结果，否则刚发布的版本要等缓存过期才看得见。
+	if _, err := c.get(t.Context(), nil, true); err != nil {
+		t.Fatal(err)
 	}
-	recorder := httptest.NewRecorder()
-	updateUnavailable(recorder, httptest.NewRequest("POST", "/api/update/apply", nil))
-	if recorder.Code != http.StatusServiceUnavailable {
-		t.Fatalf("automatic update must stay disabled: %d", recorder.Code)
+	if calls != 2 {
+		t.Errorf("force 应绕过缓存，期望回源 2 次，实际 %d 次", calls)
+	}
+}
+
+func TestReleaseCacheExpiresAfterTTL(t *testing.T) {
+	calls := 0
+	c := newTestCache(func(context.Context, *http.Client) (*selfupdate.Release, error) {
+		calls++
+		return &selfupdate.Release{TagName: "v0.3.8"}, nil
+	})
+
+	if _, err := c.get(t.Context(), nil, false); err != nil {
+		t.Fatal(err)
+	}
+	// 把落库时间往前拨到刚过期，模拟 TTL 到点。
+	c.at = time.Now().Add(-releaseTTL - time.Second)
+	if _, err := c.get(t.Context(), nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Errorf("TTL 过期后应重新回源，期望 2 次，实际 %d 次", calls)
+	}
+}
+
+func TestReleaseCacheUsesShorterTTLForErrors(t *testing.T) {
+	calls := 0
+	c := newTestCache(func(context.Context, *http.Client) (*selfupdate.Release, error) {
+		calls++
+		return nil, errors.New("github 不可达")
+	})
+
+	if _, err := c.get(t.Context(), nil, false); err == nil {
+		t.Fatal("期望返回错误")
+	}
+	// 失败结果也要缓存一会儿，否则 GitHub 不可达时每次页面加载都白等一次超时。
+	if _, err := c.get(t.Context(), nil, false); err == nil {
+		t.Fatal("期望返回错误")
+	}
+	if calls != 1 {
+		t.Errorf("错误应短时缓存，期望回源 1 次，实际 %d 次", calls)
+	}
+
+	// 但错误的 TTL 必须明显短于成功的，网络恢复后要能很快自愈。
+	if releaseErrTTL >= releaseTTL {
+		t.Fatalf("错误 TTL(%v) 必须短于成功 TTL(%v)", releaseErrTTL, releaseTTL)
+	}
+	c.at = time.Now().Add(-releaseErrTTL - time.Second)
+	if _, err := c.get(t.Context(), nil, false); err == nil {
+		t.Fatal("期望返回错误")
+	}
+	if calls != 2 {
+		t.Errorf("错误 TTL 过期后应重试，期望 2 次，实际 %d 次", calls)
+	}
+}
+
+func TestReleaseCacheDoesNotPoisonOnCallerCancel(t *testing.T) {
+	good := &selfupdate.Release{TagName: "v0.3.8"}
+	c := newTestCache(func(ctx context.Context, _ *http.Client) (*selfupdate.Release, error) {
+		return good, nil
+	})
+	if _, err := c.get(t.Context(), nil, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// 访客关掉标签页会取消请求。那不代表 GitHub 有问题，绝不能把"已取消"
+	// 写进缓存——否则接下来 30 分钟内每个访客都会收到一条莫名其妙的错误。
+	c.fetch = func(ctx context.Context, _ *http.Client) (*selfupdate.Release, error) {
+		return nil, ctx.Err()
+	}
+	c.at = time.Now().Add(-releaseTTL - time.Second) // 让缓存过期，逼它回源
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.get(ctx, nil, false); err == nil {
+		t.Fatal("调用方已取消时应把错误透传给它")
+	}
+
+	// 关键不变量：被取消的那一次不留下任何痕迹——缓存里既没有"已取消"这个错误，
+	// 也还保着上一次的好结果。
+	if c.err != nil {
+		t.Fatalf("取消错误不应写进缓存，得到 %v", c.err)
+	}
+	if c.rel == nil || c.rel.TagName != "v0.3.8" {
+		t.Fatalf("缓存应保留上一次的好结果，得到 %+v", c.rel)
+	}
+
+	// 那次取消没换来任何新数据，所以下一个访客理应重新回源——而且能正常拿到结果，
+	// 不会被上一次的取消连累。
+	c.fetch = func(context.Context, *http.Client) (*selfupdate.Release, error) {
+		return good, nil
+	}
+	rel, err := c.get(t.Context(), nil, false)
+	if err != nil {
+		t.Fatalf("取消之后的正常请求不应报错: %v", err)
+	}
+	if rel == nil || rel.TagName != "v0.3.8" {
+		t.Fatalf("应拿到正常结果，得到 %+v", rel)
 	}
 }

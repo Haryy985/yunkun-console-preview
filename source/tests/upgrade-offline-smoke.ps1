@@ -19,6 +19,7 @@ try {
     '18' | Set-Content -LiteralPath (Join-Path $old '.yunkun-local\postgres-data\PG_VERSION')
     'test-user-data' | Set-Content -LiteralPath (Join-Path $old '.yunkun-local\postgres-data\record')
     [IO.File]::WriteAllText((Join-Path $old 'bin\jwt.key'), '0123456789abcdef0123456789abcdef')
+    [IO.File]::WriteAllText((Join-Path $old 'bin\proxy-pool.key'), 'abcdef0123456789abcdef0123456789')
     'my skill' | Set-Content -LiteralPath (Join-Path $old 'skills\custom\SKILL.md')
     'user override' | Set-Content -LiteralPath (Join-Path $old 'skills\default\SKILL.md')
     'bundled skill' | Set-Content -LiteralPath (Join-Path $new 'skills\default\SKILL.md')
@@ -36,6 +37,9 @@ try {
         (Join-Path $backup 'bin\jwt.key'),
         (Join-Path $new 'bin\jwt.key'),
         (Join-Path $old 'bin\jwt.key'),
+        (Join-Path $new 'bin\proxy-pool.key'),
+        (Join-Path $backup 'bin\proxy-pool.key'),
+        (Join-Path $new '.yunkun-local\upgrade-bundled-skills\default\SKILL.md'),
         (Join-Path $new 'skills\custom\SKILL.md'),
         (Join-Path $new 'skills\default\SKILL.md')
     )) {
@@ -45,6 +49,13 @@ try {
     if ($config.skill_dir -ne (Join-Path $new 'skills')) { throw 'Skill path was not updated.' }
     if ((Get-Content -LiteralPath (Join-Path $new 'skills\default\SKILL.md') -Raw).Trim() -ne 'user override') {
         throw 'User Skill changes were overwritten by the new package.'
+    }
+    if ((Get-Content -LiteralPath (Join-Path $new '.yunkun-local\upgrade-bundled-skills\default\SKILL.md') -Raw).Trim() -ne 'bundled skill') {
+        throw 'New Skill defaults were not retained for comparison.'
+    }
+    if ((Get-FileHash -LiteralPath (Join-Path $new 'bin\proxy-pool.key')).Hash -ne
+        (Get-FileHash -LiteralPath (Join-Path $old 'bin\proxy-pool.key')).Hash) {
+        throw 'Proxy encryption key changed during migration.'
     }
     foreach ($path in @((Join-Path $backup 'bin\jwt.key'), (Join-Path $new 'bin\jwt.key'))) {
         if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne

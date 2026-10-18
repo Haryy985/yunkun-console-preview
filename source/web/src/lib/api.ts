@@ -3,23 +3,23 @@
 // a few fields the backend serializes differently (e.g. created_at as a unix int)
 // are passed through and formatted at the call site.
 
-import type { ChatMention } from "@/lib/chat-mentions";
 import { auth } from "@/lib/auth";
-import type {
-  ProxyPool,
-  ProxyPoolConfig,
-  ProxySecrets,
-  ProxyQuota,
-  ProxyNode,
-  ProxyNodeSummary,
-  ProxyEvent,
-  TaskNetwork,
-  ProxyGlobalSettings,
-  ProxyDiscoverySource,
-  ProxyDiscoveryResult,
-} from "@/lib/proxy-pool-types";
+import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
+import type {
+  ProxyDiscoveryResult,
+  ProxyDiscoverySource,
+  ProxyEvent,
+  ProxyGlobalSettings,
+  ProxyNode,
+  ProxyNodeSummary,
+  ProxyPool,
+  ProxyPoolConfig,
+  ProxyQuota,
+  ProxySecrets,
+  TaskNetwork,
+} from "@/lib/proxy-pool-types";
 import type {
   ActiveFindingRetest,
   Activity,
@@ -94,8 +94,8 @@ import type {
   RAGEvalSet,
   RAGIngestionJob,
   RAGKnowledgeBase,
-  RAGSearchResult,
   RAGRetrievalLog,
+  RAGSearchResult,
   RAGUploadResult,
   SessionTokenUsage,
   Settings,
@@ -115,6 +115,8 @@ import type {
   TaskGoal,
   TaskLLMResolutions,
   TaskNode,
+  TaskProfileEntry,
+  TaskProfileInput,
   TaskScopeRow,
   TaskTemplate,
   TokenTotal,
@@ -126,6 +128,8 @@ import type {
   TrafficEvidenceRole,
   TrafficHost,
   TrafficResp,
+  UpdateCheck,
+  UpdateProgress,
   UsageStats,
   WorkspaceFile,
   WorkspaceListing,
@@ -175,7 +179,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
 
 // sseUrl builds a URL for Server-Sent Events streams.
 //
-// Production (embedded static export): the Go backend serves the web UI *and* the
+// Production (static export / Docker): the Go backend serves the web UI *and* the
 // SSE streams on the same port, so we default to a same-origin (relative) URL.
 // This is what makes reverse-proxy deploys work: a page loaded from
 // https://<domain>/ connects to https://<domain>/api/..., which the proxy forwards
@@ -263,7 +267,9 @@ export const api = {
   proxySettings: () => get<ProxyGlobalSettings>("/proxy-settings"),
   updateProxySettings: (input: Partial<ProxyGlobalSettings>) => patch<ProxyGlobalSettings>("/proxy-settings", input),
   saveProxyPool: (config: ProxyPoolConfig, secrets?: ProxySecrets, id?: number) =>
-    id ? put<{ id: number }>(`/proxy-pools/${id}`, { config, secrets }) : post<{ id: number }>("/proxy-pools", { config, secrets }),
+    id
+      ? put<{ id: number }>(`/proxy-pools/${id}`, { config, secrets })
+      : post<{ id: number }>("/proxy-pools", { config, secrets }),
   deleteProxyPool: (id: number) => http<{ ok: boolean }>(`/proxy-pools/${id}`, { method: "DELETE" }),
   proxyNodes: (id: number) => get<{ nodes: ProxyNode[]; summary: ProxyNodeSummary }>(`/proxy-pools/${id}/nodes`),
   updateProxyNode: (pool: number, node: number, input: { enabled?: boolean; notes?: string }) =>
@@ -277,45 +283,66 @@ export const api = {
   verifyProxyNode: (pool: number, node: number) => post<{ ip: string }>(`/proxy-pools/${pool}/nodes/${node}/verify`),
   proxyEvents: (id: number) => get<{ events: ProxyEvent[] }>(`/proxy-pools/${id}/events`),
   proxyDiscoverySources: () => get<{ sources: ProxyDiscoverySource[] }>("/proxy-discovery/sources"),
-  saveProxyDiscoverySource: (input: Partial<ProxyDiscoverySource> & { credentials?: Record<string, string> }, id?: number) =>
-    id ? put<{ id: number }>(`/proxy-discovery/sources/${id}`, input) : post<{ id: number }>("/proxy-discovery/sources", input),
+  saveProxyDiscoverySource: (
+    input: Partial<ProxyDiscoverySource> & { credentials?: Record<string, string> },
+    id?: number,
+  ) =>
+    id
+      ? put<{ id: number }>(`/proxy-discovery/sources/${id}`, input)
+      : post<{ id: number }>("/proxy-discovery/sources", input),
   deleteProxyDiscoverySource: (id: number) =>
     http<{ ok: boolean }>(`/proxy-discovery/sources/${id}`, { method: "DELETE" }),
   proxyDiscoveryResults: (sourceID?: number, page = 1, pageSize = 20, state = "") =>
-    get<{ results: ProxyDiscoveryResult[]; total: number; page: number; page_size: number;
-      summary: { total: number; unapproved: number; verified: number; approved: number;
-        pending: number; invalid: number; ignored: number } }>(
+    get<{
+      results: ProxyDiscoveryResult[];
+      total: number;
+      page: number;
+      page_size: number;
+      summary: {
+        total: number;
+        unapproved: number;
+        verified: number;
+        approved: number;
+        pending: number;
+        invalid: number;
+        ignored: number;
+      };
+    }>(
       `/proxy-discovery/results?page=${page}&page_size=${pageSize}${sourceID ? `&source_id=${sourceID}` : ""}&state=${encodeURIComponent(state)}`,
     ),
-  runProxyDiscovery: (id: number) => post<{ fetched: number }>(`/proxy-discovery/sources/${id}/run`),
+  proxyDiscoveryResultIDs: (sourceID?: number, state = "") =>
+    get<{ ids: number[]; total: number }>(
+      `/proxy-discovery/results/ids?${sourceID ? `source_id=${sourceID}&` : ""}state=${encodeURIComponent(state)}`,
+    ),
+  runProxyDiscovery: (id: number) =>
+    post<{ fetched: number; candidates: number; exhausted: boolean }>(`/proxy-discovery/sources/${id}/run`),
   verifyProxyDiscoveryResult: (id: number) => post<{ ok: boolean }>(`/proxy-discovery/results/${id}/verify`),
   approveProxyDiscoveryResult: (id: number, poolID: number, target: "candidate" | "production") =>
     post<{ node_id: number }>(`/proxy-discovery/results/${id}/approve`, { pool_id: poolID, target }),
   ignoreProxyDiscoveryResult: (id: number) => post<{ ok: boolean }>(`/proxy-discovery/results/${id}/ignore`),
-  deleteProxyDiscoveryResult: (id: number) =>
-    del<{ ok: boolean }>(`/proxy-discovery/results/${id}`),
-  batchProxyDiscoveryResults: (ids: number[], action: "verify" | "delete" | "approve", poolID?: number, target?: "candidate" | "production") =>
-    post<{ items: { id: number; ok: boolean; status: number; error?: string }[] }>(
-      "/proxy-discovery/results/batch", { ids, action, pool_id: poolID, target },
-    ),
+  deleteProxyDiscoveryResult: (id: number) => del<{ ok: boolean }>(`/proxy-discovery/results/${id}`),
+  batchProxyDiscoveryResults: (
+    ids: number[],
+    action: "verify" | "delete" | "approve",
+    poolID?: number,
+    target?: "candidate" | "production",
+  ) =>
+    post<{ items: { id: number; ok: boolean; status: number; error?: string }[] }>("/proxy-discovery/results/batch", {
+      ids,
+      action,
+      pool_id: poolID,
+      target,
+    }),
   taskNetwork: (id: string) => get<TaskNetwork>(`/tasks/${encodeURIComponent(id)}/network`),
   reassignTaskProxyLease: (id: string) => post<{ ok: boolean }>(`/tasks/${encodeURIComponent(id)}/network/lease`),
   // 后端应用版本号（release 时由 ldflags 注入，默认 "dev"）。
   health: () => get<{ ok: boolean; service: string; version: string }>("/health"),
-  checkUpdate: (refresh = false) => get<{
-    status: "available" | "current" | "unavailable" | "unsupported";
-    current_version: string;
-    latest_version?: string;
-    release_url?: string;
-    package_url?: string;
-    package_sha256?: string;
-    checked_at?: string;
-  }>(refresh ? "/update/check?refresh=1" : "/update/check"),
 
   // ---- auth ----
   authStatus: () => get<{ initialized: boolean }>("/auth/status"),
   authMe: () => get<{ id: number; username: string; role: "admin" | "operator" | "viewer" }>("/auth/me"),
-  authUsers: () => get<{ id: number; username: string; role: "operator" | "viewer"; disabled: boolean }[]>("/auth/users"),
+  authUsers: () =>
+    get<{ id: number; username: string; role: "operator" | "viewer"; disabled: boolean }[]>("/auth/users"),
   createAuthUser: (username: string, password: string, role: "operator" | "viewer") =>
     post<{ id: number }>("/auth/users", { username, password, role }),
   updateAuthUser: (id: number, role: "operator" | "viewer", disabled: boolean, password = "") =>
@@ -350,7 +377,7 @@ export const api = {
     post<Task>("/tasks", {
       proxy_pool_id: input.proxyPoolId,
       proxy_node_id: input.proxyNodeId,
-      network_mode: input.proxyPoolId ? input.networkMode ?? "configured" : undefined,
+      network_mode: input.proxyPoolId ? (input.networkMode ?? "configured") : undefined,
       name: input.name ?? "",
       category_id: input.categoryId ?? null,
       description: input.description,
@@ -515,6 +542,9 @@ export const api = {
 
   // 本任务测试范围列表（含继承自来源任务的范围）。
   taskScope: (id: string) => get<{ scope: TaskScopeRow[] }>(`/tasks/${id}/scope`),
+  taskProfile: (id: string, before = 0, limit = 25) =>
+    get<{ entries: TaskProfileEntry[] }>(`/tasks/${id}/target-profile?before=${before}&limit=${limit}`),
+  addTaskProfile: (id: string, input: TaskProfileInput) => post<TaskProfileEntry>(`/tasks/${id}/target-profile`, input),
   // 手动新增一条测试范围（kind=company/root_domain/subdomain/ip/cidr）。
   addTaskScope: (id: string, kind: string, value: string, reason?: string) =>
     post<TaskScopeRow>(`/tasks/${id}/scope`, { kind, value, reason }),
@@ -693,6 +723,12 @@ export const api = {
     get<Finding>(
       `/exploration/findings/${id}${contextTaskId ? `?context_task=${encodeURIComponent(contextTaskId)}` : ""}`,
     ),
+  findingQuality: (id: string) => get<import("@/lib/types").FindingQuality>(`/exploration/findings/${id}/quality`),
+  updateFindingQuality: (id: string, input: Partial<import("@/lib/types").FindingQuality>) =>
+    http<import("@/lib/types").FindingQuality>(`/exploration/findings/${id}/quality`, {
+      method: "PUT",
+      body: JSON.stringify(input),
+    }),
   findingTraffic: (id: string, contextTask?: string) =>
     get<FindingTraffic>(
       `/exploration/findings/${id}/traffic${contextTask ? `?context_task=${encodeURIComponent(contextTask)}` : ""}`,
@@ -968,7 +1004,11 @@ export const api = {
     const r = await fetch(`/api/report${tq(task)}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
-    if (!r.ok) throw new Error(`report: ${r.status}`);
+    if (!r.ok) {
+      const payload = (await r.json().catch(() => null)) as { error?: string; blockers?: string[] } | null;
+      const blockers = payload?.blockers?.length ? `：${payload.blockers.join("、")}` : "";
+      throw new Error(`${payload?.error ?? `report: ${r.status}`}${blockers}`);
+    }
     return r.text();
   },
   chatMentions: (kind: string, query: string, signal?: AbortSignal, cursor = "") =>
@@ -1339,8 +1379,8 @@ export const api = {
       `/rag/knowledge-bases/${knowledgeBaseId}/documents${includeDeleted ? "?include_deleted=true" : ""}`,
     ).then((r) => arr(r.documents)),
   ragProposals: (knowledgeBaseId: number) =>
-    get<{ proposals: RAGChangeProposal[] }>(`/rag/knowledge-bases/${knowledgeBaseId}/proposals`).then(
-      (r) => arr(r.proposals),
+    get<{ proposals: RAGChangeProposal[] }>(`/rag/knowledge-bases/${knowledgeBaseId}/proposals`).then((r) =>
+      arr(r.proposals),
     ),
   ragReviewProposal: (id: number, decision: "approve" | "reject", reason: string) =>
     post<RAGChangeProposal>(`/rag/proposals/${id}/review`, { decision, reason }),
@@ -1397,13 +1437,15 @@ export const api = {
       (r) => arr(r.logs),
     ),
   taskRAGRetrievalLogs: (id: string, limit = 20) =>
-    get<{ logs: RAGRetrievalLog[] }>(`/tasks/${encodeURIComponent(id)}/rag/retrieval-logs?limit=${limit}`).then(
-      (r) => arr(r.logs),
+    get<{ logs: RAGRetrievalLog[] }>(`/tasks/${encodeURIComponent(id)}/rag/retrieval-logs?limit=${limit}`).then((r) =>
+      arr(r.logs),
     ),
   taskRuntimeMetrics: (id: string) =>
-    get<{ latest_llm: Task["latest_llm"] | null; rag_stats: NonNullable<Task["rag_stats"]>; prompt_inclusions: import("@/lib/types").RAGPromptInclusion[] }>(
-      `/tasks/${encodeURIComponent(id)}/runtime-metrics`,
-    ),
+    get<{
+      latest_llm: Task["latest_llm"] | null;
+      rag_stats: NonNullable<Task["rag_stats"]>;
+      prompt_inclusions: import("@/lib/types").RAGPromptInclusion[];
+    }>(`/tasks/${encodeURIComponent(id)}/runtime-metrics`),
   ragEvalSets: (knowledgeBaseId: number) =>
     get<{ sets: RAGEvalSet[] }>(`/rag/knowledge-bases/${knowledgeBaseId}/eval-sets`).then((r) => arr(r.sets)),
   ragCreateEvalSet: (knowledgeBaseId: number, input: { name: string; description?: string }) =>
@@ -1520,7 +1562,14 @@ export const api = {
   },
 
   // ---- LLM records ----
-  llmRecords: (params?: { model?: string; session?: string; task?: string; requestId?: string; page?: number; size?: number }) => {
+  llmRecords: (params?: {
+    model?: string;
+    session?: string;
+    task?: string;
+    requestId?: string;
+    page?: number;
+    size?: number;
+  }) => {
     const sp = new URLSearchParams();
     if (params?.model) sp.set("model", params.model);
     if (params?.session) sp.set("session", params.session);
@@ -1538,4 +1587,9 @@ export const api = {
   tokensByModel: (task: string) =>
     get<{ models: ModelTokenStat[] }>(`/llm/records/by-model?task=${encodeURIComponent(task)}`),
 
+  // Update checks use the fixed Yunkun GitHub release feed. Applying a release
+  // stays disabled until the offline-package restart flow is supported.
+  checkUpdate: (force = false) => get<UpdateCheck>(`/update/check${force ? "?force=true" : ""}`),
+  applyUpdate: () => post<UpdateProgress>("/update/apply", {}),
+  rollbackUpdate: () => post<UpdateProgress>("/update/rollback", {}),
 };

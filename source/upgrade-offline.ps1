@@ -85,6 +85,16 @@ try {
          (Get-Item -LiteralPath $oldJWTKey).Length -lt 32)) {
         throw 'Old JWT signing key is invalid. Preserve the old installation for inspection.'
     }
+    $oldProxyKey = Join-Path $old 'bin\proxy-pool.key'
+    $newProxyKey = Join-Path $new 'bin\proxy-pool.key'
+    if (Test-Path -LiteralPath $newProxyKey) {
+        throw 'New release already contains a proxy encryption key. Refusing to overwrite private credentials.'
+    }
+    if ((Test-Path -LiteralPath $oldProxyKey) -and
+        (-not (Test-Path -LiteralPath $oldProxyKey -PathType Leaf) -or
+         (Get-Item -LiteralPath $oldProxyKey).Length -ne 32)) {
+        throw 'Old proxy encryption key is invalid. Preserve the old installation for inspection.'
+    }
     $parent = Split-Path -Parent $backup
     $null = Resolve-ExistingDirectory $parent
     $private = Join-Path $old '.yunkun-local'
@@ -134,13 +144,25 @@ try {
             throw 'JWT signing key migration verification failed.'
         }
     }
+    if (Test-Path -LiteralPath $oldProxyKey -PathType Leaf) {
+        Copy-Item -LiteralPath $oldProxyKey -Destination $newProxyKey -ErrorAction Stop
+        if ((Get-FileHash -LiteralPath $oldProxyKey -Algorithm SHA256).Hash -ne
+            (Get-FileHash -LiteralPath $newProxyKey -Algorithm SHA256).Hash) {
+            throw 'Proxy encryption key migration verification failed.'
+        }
+    }
 
     $oldSkills = Join-Path $old 'skills'
     $newSkills = Join-Path $new 'skills'
     if (Test-Path -LiteralPath $oldSkills -PathType Container) {
         New-Item -ItemType Directory -Path $newSkills -Force | Out-Null
+        $bundledSkills = Join-Path $newPrivate 'upgrade-bundled-skills'
+        New-Item -ItemType Directory -Path $bundledSkills | Out-Null
+        Copy-Contents $newSkills $bundledSkills
+        Assert-SameFiles $newSkills $bundledSkills
         Copy-Contents $oldSkills $newSkills
         Assert-SameFiles $oldSkills $newSkills
+        Write-Host 'User Skills retained. New bundled defaults were saved in .yunkun-local\upgrade-bundled-skills for comparison.'
     }
     $newConfig = Join-Path $new '.yunkun-local\config.json'
     $config = Get-Content -LiteralPath $newConfig -Raw | ConvertFrom-Json

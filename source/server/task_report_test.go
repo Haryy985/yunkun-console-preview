@@ -7,7 +7,40 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"yunkun/console/db"
 )
+
+func approveFormalReportFixture(t *testing.T, s *Server, finding *db.RecordedFinding, reportBody string) {
+	t.Helper()
+	if _, err := s.m.pg.SetFindingSeverity(finding.FindingID, db.SeverityHigh); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.m.pg.SetFindingStatus(finding.FindingID, db.FindingConfirmed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.m.pg.Exec(`UPDATE findings
+SET report=$2, report_evidence_version=evidence_version WHERE id=$1`, finding.FindingID, reportBody); err != nil {
+		t.Fatal(err)
+	}
+	quality, err := s.m.pg.GetFindingQuality(finding.FindingID)
+	if err != nil || quality == nil {
+		t.Fatalf("finding quality: %+v, %v", quality, err)
+	}
+	quality.QualityStatus = db.FindingQualityPass
+	quality.VulnerabilityType = "access-control"
+	quality.VerificationType = "controlled identity comparison"
+	quality.BaselineEvidence = "fixture-baseline"
+	quality.ProofEvidence = "fixture-proof"
+	quality.VerificationEvidence = "fixture-retest"
+	quality.ReproductionCount = 3
+	quality.SuccessCount = 3
+	quality.EvidenceIntegrity = "verified"
+	quality.Reviewer = "yunkun"
+	if err := s.m.pg.SetFindingQuality(t.Context(), *quality); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestReportsIncludeCapturedHTTPRequest(t *testing.T) {
 	s, finding, request := trafficEvidenceServer(t)
@@ -24,6 +57,7 @@ func TestReportsIncludeCapturedHTTPRequest(t *testing.T) {
 	if bind.Code != 200 {
 		t.Fatal(bind.Code, bind.Body)
 	}
+	approveFormalReportFixture(t, s, finding, "Approved report fixture")
 	row, err := s.m.pg.GetFinding(finding.FindingID)
 	if err != nil || row.TaskID == nil {
 		t.Fatal(err)
@@ -79,9 +113,7 @@ func TestTaskReportIncludesPersistedFindingAndTrafficReferences(t *testing.T) {
 	if response := request("POST", path, `{"traffic_refs":[{"traffic_id":"report-proof","role":"proof"}]}`); response.Code != 200 {
 		t.Fatalf("bind traffic: %d %s", response.Code, response.Body.String())
 	}
-	if _, err := s.m.pg.SetFindingReportByNodeID(finding.NodeID, "Detailed local finding"); err != nil {
-		t.Fatal(err)
-	}
+	approveFormalReportFixture(t, s, finding, "Detailed local finding")
 	row, err := s.m.pg.GetFinding(finding.FindingID)
 	if err != nil || row == nil || row.TaskID == nil {
 		t.Fatalf("finding: %+v, %v", row, err)
@@ -101,7 +133,7 @@ func TestTaskReportIncludesPersistedFindingAndTrafficReferences(t *testing.T) {
 	}
 }
 
-func TestTaskReportIncludesFindingsBeyondFirstThousand(t *testing.T) {
+func TestTaskReportBlocksUnregisteredFindingsBeyondFirstThousand(t *testing.T) {
 	s, finding, request := trafficEvidenceServer(t)
 	row, err := s.m.pg.GetFinding(finding.FindingID)
 	if err != nil || row == nil || row.TaskID == nil {
@@ -119,17 +151,10 @@ FROM generate_series(1, 1001) AS i`, task.ExpID)
 		t.Fatal(err)
 	}
 	response := request("GET", fmt.Sprintf("/api/report?task=%d", *row.TaskID), "")
-	if response.Code != 200 {
-		t.Fatalf("export: %d %s", response.Code, response.Body.String())
+	if response.Code != 409 {
+		t.Fatalf("unregistered findings should block formal report: %d %s", response.Code, response.Body.String())
 	}
-	for _, want := range []string{
-		"确认发现：**1002**",
-		"Pagination finding 1",
-		"Pagination finding 1001",
-		fmt.Sprintf("节点 #%d", finding.NodeID),
-	} {
-		if !strings.Contains(response.Body.String(), want) {
-			t.Fatalf("report missing %q", want)
-		}
+	if !strings.Contains(response.Body.String(), "UNREGISTERED") {
+		t.Fatalf("response should explain the quality blocker: %s", response.Body.String())
 	}
 }

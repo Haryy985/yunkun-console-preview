@@ -1000,9 +1000,11 @@ export default function FindingsPage() {
                 <Trash2Icon /> {batchDeleting ? `删除中 ${deleteProgress}/${deleteCandidates.length}` : "批量删除"}
               </Button>
             )}
-            <Button size="sm" variant="outline" onClick={openExport}>
-              <DownloadIcon /> 导出
-            </Button>
+            {user.role === "admin" && (
+              <Button size="sm" variant="outline" onClick={openExport}>
+                <DownloadIcon /> 导出
+              </Button>
+            )}
           </div>
         </div>
 
@@ -1300,10 +1302,10 @@ export default function FindingsPage() {
               <span className="text-xs text-muted-foreground">导出格式</span>
               <RadioGroup value={exportFormat} onValueChange={(v) => setExportFormat(v as typeof exportFormat)}>
                 <label htmlFor="export-format-md-single" className="flex items-center gap-2 text-sm">
-                  <RadioGroupItem id="export-format-md-single" value="md-single" /> Markdown 汇总报告（单个 .md 文件）
+                  <RadioGroupItem id="export-format-md-single" value="md-single" /> Markdown 汇总报告（保密原文）
                 </label>
                 <label htmlFor="export-format-md-zip" className="flex items-center gap-2 text-sm">
-                  <RadioGroupItem id="export-format-md-zip" value="md-zip" /> Markdown 分文件（一漏洞一 .md,打包 .zip）
+                  <RadioGroupItem id="export-format-md-zip" value="md-zip" /> Markdown 证据包（保密原文 .zip）
                 </label>
                 <label htmlFor="export-format-csv" className="flex items-center gap-2 text-sm">
                   <RadioGroupItem id="export-format-csv" value="csv" /> CSV 表格（.csv）
@@ -1312,6 +1314,9 @@ export default function FindingsPage() {
                   <RadioGroupItem id="export-format-json" value="json" /> JSON（.json）
                 </label>
               </RadioGroup>
+              <p className="text-xs text-amber-700 dark:text-amber-300">
+                报告和证据包可能包含完整 Cookie、Token 及请求正文，请仅交给授权接收人。
+              </p>
             </div>
           </div>
 

@@ -1,0 +1,1 @@
+Reference material adapted from the deployment owner's Clown SRC 6K Skill 2.1. Consult only relevant sections. Native runtime behavior and task authorization take precedence. Original hooks, coordinator settings and provider accounts are not included.

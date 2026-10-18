@@ -4,7 +4,7 @@
   "_comment_database": "PostgreSQL 连接。优先级：YUNKUN_PG_DSN > 本文件 database。两种写法二选一。",
   "database": {
     "host": "127.0.0.1",
-    "port": 5432,
+    "port": 5433,
     "user": "yunkun",
     "password": "",
     "dbname": "yunkun",
@@ -18,6 +18,9 @@
     }
   },
 
-  "_comment_skill_dir": "skill 根目录（每个子目录一个 skill，含 SKILL.md）。优先级：YUNKUN_SKILL_DIR > 本字段 > 可执行文件旁的 skills。留空使用跨平台默认路径。",
-  "skill_dir": ""
+  "_comment_skill_dir": "skill 根目录（每个子目录一个 skill，含 SKILL.md）。优先级：YUNKUN_SKILL_DIR > 本字段 > 默认。",
+  "skill_dir": "/opt/yunkun/skills",
+
+  "_comment_cors_origins": "跨域浏览器客户端白名单。留空或删除表示仅允许同源访问；环境变量 YUNKUN_CORS_ORIGINS（逗号分隔）优先。",
+  "cors_origins": []
 }

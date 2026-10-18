@@ -56,4 +56,9 @@ func TestRequestPacketDoesNotInventOrTruncate(t *testing.T) {
 	if !strings.Contains(requestPacketMarkdown(RequestPacket{}), "未保存 HTTP 请求包") {
 		t.Fatal("missing evidence was not labeled")
 	}
+	snapshot.ReqHead = "POST / HTTP/1.1\r\nHost: example.local\r\nCookie: sid=captured-test-value"
+	packet, err = ReadRequestPacket(store, snapshot)
+	if err != nil || !strings.Contains(packet.Text, "Cookie: sid=captured-test-value") {
+		t.Fatalf("captured cookie changed: %+v %v", packet, err)
+	}
 }

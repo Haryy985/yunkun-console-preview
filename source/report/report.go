@@ -57,7 +57,7 @@ func Markdown(in Input) string {
 
 	// summary
 	fmt.Fprintf(&b, "## 摘要\n\n")
-	fmt.Fprintf(&b, "- 确认发现：**%d** 个\n", len(in.Findings))
+	fmt.Fprintf(&b, "- 漏洞记录（以人工复核为准）：**%d** 个\n", len(in.Findings))
 	fmt.Fprintf(&b, "- 资产：")
 	var types []string
 	for t := range in.AssetCounts {
@@ -86,7 +86,7 @@ func Markdown(in Input) string {
 			fmt.Fprintf(&b, "### %d. [%s] %s\n\n", i+1, strings.ToUpper(nz(f.Severity, "info")), nz(f.Name, nz(f.VulnClass, "未分类")))
 			fmt.Fprintf(&b, "%s\n\n", nz(f.Summary, ""))
 			if f.PoC != "" {
-				fmt.Fprintf(&b, "**PoC / 证据：**\n\n```\n%s\n```\n\n", f.PoC)
+				b.WriteString(findingEvidenceMarkdown(f.PoC))
 			}
 			if ref, ok := in.References[f.NodeID]; ok {
 				fmt.Fprintf(&b, "**Finding 记录：** #%d（节点 #%d）\n\n", ref.FindingID, f.NodeID)
@@ -94,7 +94,7 @@ func Markdown(in Input) string {
 					if ref.EvidenceVersion != ref.ReportEvidenceVersion {
 						b.WriteString("**注意：详细报告引用的证据版本已变化，需要复核。**\n\n")
 					}
-					fmt.Fprintf(&b, "%s\n\n", ref.Report)
+					fmt.Fprintf(&b, "%s\n\n", reportBodyForExport(ref.Report))
 				}
 				if len(ref.Traffic) > 0 {
 					b.WriteString("**流量证据引用与 HTTP 请求包：**\n\n")

@@ -28,6 +28,9 @@ type Database struct {
 type Config struct {
 	Database Database `json:"database"`
 	SkillDir string   `json:"skill_dir"`
+	// CORSOrigins is an explicit allowlist for browser clients hosted on
+	// another origin. Empty means same-origin only.
+	CORSOrigins []string `json:"cors_origins"`
 }
 
 // BaseDir is the directory that anchors all runtime artifacts (config.json and
@@ -74,6 +77,24 @@ func isGoRunDir(dir string) bool {
 // Env reads a runtime setting and trims surrounding whitespace.
 func Env(name string) string {
 	return strings.TrimSpace(os.Getenv(name))
+}
+
+// CORSOrigins returns the explicitly allowed browser origins. The environment
+// variable is a comma-separated list and takes precedence over config.json.
+// An empty result deliberately disables cross-origin browser access.
+func CORSOrigins() []string {
+	raw := Env("YUNKUN_CORS_ORIGINS")
+	if raw == "" {
+		raw = strings.Join(Load().CORSOrigins, ",")
+	}
+	var out []string
+	for _, item := range strings.Split(raw, ",") {
+		origin := strings.TrimSpace(item)
+		if origin != "" {
+			out = append(out, origin)
+		}
+	}
+	return out
 }
 
 // Path returns the config file path. Resolution order:

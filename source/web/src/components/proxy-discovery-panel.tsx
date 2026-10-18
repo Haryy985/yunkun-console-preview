@@ -58,6 +58,8 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
   const [revision, setRevision] = React.useState(0);
   const [stateFilter, setStateFilter] = React.useState("");
   const [selectedIds, setSelectedIds] = React.useState<Set<number>>(() => new Set());
+  const [selectingAll, setSelectingAll] = React.useState(false);
+  const selectionRequest = React.useRef(0);
   const [summary, setSummary] = React.useState({ total: 0, pending: 0, verified: 0, invalid: 0, approved: 0, ignored: 0 });
   const [batchProgress, setBatchProgress] = React.useState<{ done: number; total: number } | null>(null);
   const stopBatch = React.useRef(false);
@@ -137,7 +139,9 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
   }, [selectedSource, page, pageSize, revision, stateFilter]);
 
   React.useEffect(() => {
+    selectionRequest.current++;
     setSelectedIds(new Set());
+    setSelectingAll(false);
   }, [selectedSource, stateFilter]);
 
   function editSource(source?: ProxyDiscoverySource) {
@@ -197,8 +201,11 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
     setBusy(true);
     try {
       const response = await api.runProxyDiscovery(source.id);
-      toast.success(`已获取 ${response.fetched} 条候选结果`);
+      toast.success(response.exhausted
+        ? `已读取 ${response.fetched} 条，本查询已取尽`
+        : `已读取新一批 ${response.fetched} 条，其中 ${response.candidates} 条为候选`);
       await load();
+      setSelectedIds(new Set());
       setPage(1);
       onChanged();
     } catch (error) {
@@ -261,8 +268,25 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
   }
 
   const selectedSourceItem = sources.find((source) => source.id === selectedSource);
-  const pageIDs = results.filter((result) => result.state !== "approved").map((result) => result.id);
-  const selectedOnPage = pageIDs.filter((id) => selectedIds.has(id)).length;
+  const selectableTotal = stateFilter === "approved" ? 0 : stateFilter === "" ? total - summary.approved : total;
+  const allSelected = selectableTotal > 0 && selectedIds.size === selectableTotal;
+  async function toggleAllResults(checked: boolean) {
+    const request = ++selectionRequest.current;
+    if (!checked) {
+      setSelectedIds(new Set());
+      return;
+    }
+    if (!selectedSource) return;
+    setSelectingAll(true);
+    try {
+      const response = await api.proxyDiscoveryResultIDs(selectedSource, stateFilter);
+      if (request === selectionRequest.current) setSelectedIds(new Set(response.ids));
+    } catch (error) {
+      toast.error((error as Error).message || "全选候选失败");
+    } finally {
+      if (request === selectionRequest.current) setSelectingAll(false);
+    }
+  }
   const verifyBlocked = !selectedSourceItem?.enabled || !selectedSourceItem.authorized_scope || !selectedSourceItem.verify_url;
 
   function admissionReason(result: ProxyDiscoveryResult) {
@@ -302,18 +326,38 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
     let done = 0;
     try {
       // Admission can also reverify when the destination pool uses different credentials.
-      const chunkSize = action === "delete" ? 100 : 1;
-      for (let offset = 0; offset < ids.length && !stopBatch.current; offset += chunkSize) {
-        const chunk = ids.slice(offset, offset + chunkSize);
-        const response = await api.batchProxyDiscoveryResults(chunk, action, Number(targetPool) || undefined, target);
-        for (const item of response.items) {
-          if (item.ok) succeeded.add(item.id);
-          else failures.push(`#${item.id}: ${proxyVerificationMessage(item.error || "操作失败")}`);
+      if (action === "verify") {
+        let next = 0;
+        await Promise.all(Array.from({ length: Math.min(10, ids.length) }, async () => {
+          while (next < ids.length && !stopBatch.current && mounted.current) {
+            const id = ids[next++];
+            try {
+              const response = await api.batchProxyDiscoveryResults([id], "verify");
+              const item = response.items[0];
+              if (item?.ok) succeeded.add(id);
+              else failures.push(`#${id}: ${proxyVerificationMessage(item?.error || "操作失败")}`);
+            } catch (error) {
+              failures.push(`#${id}: ${proxyVerificationMessage((error as Error).message || "请求失败")}`);
+            }
+            done++;
+            if (mounted.current) setBatchProgress({ done, total: ids.length });
+          }
+        }));
+        if (mounted.current) setRevision((value) => value + 1);
+      } else {
+        const chunkSize = action === "delete" ? 100 : 1;
+        for (let offset = 0; offset < ids.length && !stopBatch.current; offset += chunkSize) {
+          const chunk = ids.slice(offset, offset + chunkSize);
+          const response = await api.batchProxyDiscoveryResults(chunk, action, Number(targetPool) || undefined, target);
+          for (const item of response.items) {
+            if (item.ok) succeeded.add(item.id);
+            else failures.push(`#${item.id}: ${proxyVerificationMessage(item.error || "操作失败")}`);
+          }
+          done += response.items.length;
+          if (!mounted.current) return;
+          setBatchProgress({ done, total: ids.length });
+          setRevision((value) => value + 1);
         }
-        done += response.items.length;
-        if (!mounted.current) return;
-        setBatchProgress({ done, total: ids.length });
-        setRevision((value) => value + 1);
       }
       if (succeeded.size) toast.success(`成功 ${succeeded.size} 条${done < ids.length ? `，另 ${ids.length - done} 条未执行` : ""}`);
       if (failures.length) toast.error(`失败 ${failures.length} 条，已保留勾选`, { description: failures[0] });
@@ -405,7 +449,7 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
                     <PencilIcon data-icon="inline-start" />
                     编辑配置
                   </Button>
-                  <Button size="sm" disabled={busy} onClick={() => void runSource(selectedSourceItem)}>
+                  <Button size="sm" disabled={busy || selectedSourceItem.exhausted} onClick={() => void runSource(selectedSourceItem)}>
                     <PlayIcon data-icon="inline-start" />
                     手动执行
                   </Button>
@@ -447,7 +491,7 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
                 </div>
                 <div>
                   <span className="text-muted-foreground">每次抓取</span>
-                  <p className="mt-1">{selectedSourceItem.fetch_limit} 条</p>
+                  <p className="mt-1">{selectedSourceItem.fetch_limit} 条{selectedSourceItem.exhausted ? " · 已取尽" : ` · 已读取 ${selectedSourceItem.next_offset ?? 0} 条`}</p>
                 </div>
                 <div>
                   <span className="text-muted-foreground">候选结果</span>
@@ -504,22 +548,22 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
               <option value="approved">已入池（{summary.approved}）</option>
               <option value="ignored">已忽略（{summary.ignored}）</option>
             </select>
-            <span className="text-muted-foreground text-xs">已选 {selectedIds.size} 条 · 当前页可入池 {eligibleOnPage} 条</span>
-            <Button size="sm" variant="outline" disabled={busy || !selectedIds.size || verifyBlocked}
+            <span className="text-muted-foreground text-xs">已选 {selectedIds.size} / {selectableTotal} 条{selectingAll ? " · 正在全选" : ""} · 当前页可入池 {eligibleOnPage} 条</span>
+            <Button size="sm" variant="outline" disabled={busy || selectingAll || !selectedIds.size || verifyBlocked}
               onClick={() => void runBatch("verify")}><ShieldCheckIcon /> 批量验证</Button>
             <span title={batchAdmissionReason || "验证通过，保持停用入池"}>
-            <Button size="sm" variant="outline" disabled={busy || !!batchAdmissionReason}
+            <Button size="sm" variant="outline" disabled={busy || selectingAll || !!batchAdmissionReason}
               onClick={() => void runBatch("approve", "candidate")}>停用入池</Button>
             </span>
             <span title={batchAdmissionReason || "验证通过，入池并启用"}>
-            <Button size="sm" disabled={busy || !!batchAdmissionReason}
+            <Button size="sm" disabled={busy || selectingAll || !!batchAdmissionReason}
               onClick={() => void runBatch("approve", "production")}>入池并启用</Button>
             </span>
-            <Button size="sm" variant="destructive" disabled={busy || !selectedIds.size}
+            <Button size="sm" variant="destructive" disabled={busy || selectingAll || !selectedIds.size}
               onClick={() => void runBatch("delete")}><Trash2Icon /> 批量删除</Button>
             {selectedIds.size > 0 ? <Button size="sm" variant="ghost" disabled={busy} onClick={() => setSelectedIds(new Set())}>清空勾选</Button> : null}
             {batchProgress ? <div role="status" className="flex items-center gap-2 text-sm">
-              <span>已处理 {batchProgress.done}/{batchProgress.total}</span>
+              <span>已完成 {batchProgress.done}/{batchProgress.total}{batchProgress.done < batchProgress.total ? " · 最多同时验证 10 条，单条网络请求最多 3 秒" : ""}</span>
               <Button size="sm" variant="outline" onClick={() => { stopBatch.current = true; }}>停止后续操作</Button>
             </div> : null}
           </div>
@@ -529,13 +573,10 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
               <thead className="border-b bg-muted/30 text-muted-foreground">
                 <tr>
                   <th className="w-10 p-3">
-                    <Checkbox aria-label="勾选当前页未入池候选" disabled={busy || pageIDs.length === 0}
-                      checked={selectedOnPage === 0 ? false : selectedOnPage === pageIDs.length ? true : "indeterminate"}
-                      onCheckedChange={(checked) => setSelectedIds((current) => {
-                        const next = new Set(current);
-                        for (const id of pageIDs) { if (checked === true) next.add(id); else next.delete(id); }
-                        return next;
-                      })} />
+                    <Checkbox aria-label="勾选当前查询全部未入池候选" title="全选当前查询及状态筛选下的所有未入池候选（含其他分页）"
+                      disabled={busy || selectingAll || selectableTotal === 0}
+                      checked={allSelected ? true : selectedIds.size > 0 ? "indeterminate" : false}
+                      onCheckedChange={(checked) => void toggleAllResults(checked === true)} />
                   </th>
                   <th className="p-3">地址</th>
                   <th className="p-3">来源</th>
@@ -550,7 +591,7 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
                 {results.map((result) => (
                   <tr key={result.id} className="border-b">
                     <td className="p-3">
-                      <Checkbox aria-label={`勾选候选 ${result.address}`} disabled={busy || result.state === "approved"}
+                      <Checkbox aria-label={`勾选候选 ${result.address}`} disabled={busy || selectingAll || result.state === "approved"}
                         checked={selectedIds.has(result.id)} onCheckedChange={(checked) => setSelectedIds((current) => {
                           const next = new Set(current);
                           if (checked === true) next.add(result.id); else next.delete(result.id);
@@ -691,13 +732,13 @@ export function ProxyDiscoveryPanel({ onCreatePool, onOpenPool, onChanged, refre
               <Input
                 id="discovery-fetch-limit"
                 type="number"
-                min={1}
-                max={100}
+                min={100}
+                max={1000}
                 required
                 value={form.fetch_limit}
                 onChange={(event) => setForm({ ...form, fetch_limit: Number(event.target.value) })}
               />
-              <p className="text-muted-foreground text-xs">每次手动执行最多获取 1 到 100 个代理地址。</p>
+              <p className="text-muted-foreground text-xs">每次读取 100 到 1000 条；再次执行会继续读取下一批。</p>
             </div>
             <div className="space-y-2">
               <Label htmlFor="discovery-scope">授权范围（可选）</Label>

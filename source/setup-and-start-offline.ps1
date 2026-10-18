@@ -3,7 +3,8 @@
 param(
     [switch]$NoBrowser,
     [switch]$Stop,
-    [ValidateRange(1024, 65535)][int]$DatabasePort = 5433
+    [ValidateRange(1024, 65535)][int]$DatabasePort = 5433,
+    [ValidateRange(1024, 65535)][int]$ConsolePort = 5173
 )
 
 $ErrorActionPreference = 'Stop'
@@ -144,8 +145,8 @@ function Invoke-LocalSQL([string]$PsqlPath, $State, [string]$Sql, [switch]$Appli
 
 function Test-Ready {
     try {
-        $health = Invoke-RestMethod 'http://127.0.0.1:5173/api/health' -TimeoutSec 3
-        $auth = Invoke-RestMethod 'http://127.0.0.1:5173/api/auth/status' -TimeoutSec 3
+        $health = Invoke-RestMethod "http://127.0.0.1:$ConsolePort/api/health" -TimeoutSec 3
+        $auth = Invoke-RestMethod "http://127.0.0.1:$ConsolePort/api/auth/status" -TimeoutSec 3
         return ($health.ok -eq $true -and $health.ready -eq $true -and
             $health.service -eq 'yunkun' -and $auth.initialized -is [bool])
     } catch {
@@ -158,7 +159,7 @@ function Invoke-OfflineSetup {
         $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
         throw 'This offline package requires Windows x64 and 64-bit PowerShell.'
     }
-    if ($DatabasePort -eq 5173) { throw 'DatabasePort must not use the console port 5173.' }
+    if ($DatabasePort -eq $ConsolePort) { throw 'DatabasePort must not use the console port.' }
 
     $root = [IO.Path]::GetFullPath($PSScriptRoot)
     $script:LocalHome = Get-SafePath $root (Join-Path $root '.yunkun-local')
@@ -223,16 +224,16 @@ function Invoke-OfflineSetup {
         return
     }
 
-    $owners = @(Get-PortOwners 5173)
+    $owners = @(Get-PortOwners $ConsolePort)
     if ($run -and (Test-OwnedProcess $run.pid $app)) {
         if ($owners.Count -ne 1 -or $owners[0] -ne $run.pid -or -not (Test-Ready)) {
             throw 'The offline console process exists but is not ready. Check .yunkun-local\logs.'
         }
-        Write-Host 'Already ready: http://127.0.0.1:5173/'
-        if (-not $NoBrowser) { Start-Process 'http://127.0.0.1:5173/' }
+        Write-Host "Already ready: http://127.0.0.1:$ConsolePort/"
+        if (-not $NoBrowser) { Start-Process "http://127.0.0.1:$ConsolePort/" }
         return
     }
-    if ($owners.Count) { throw "Port 5173 is occupied (PID $($owners -join ', ')). No process was stopped." }
+    if ($owners.Count) { throw "Port $ConsolePort is occupied (PID $($owners -join ', ')). No process was stopped." }
     if (-not $state) {
         $state = [PSCustomObject]@{
             format = 1
@@ -242,6 +243,7 @@ function Invoke-OfflineSetup {
         }
         Write-Json $statePath $state
     }
+    if ($state.databasePort -eq $ConsolePort) { throw 'Saved database port conflicts with the console port.' }
     if (-not (Test-Path -LiteralPath $configPath)) {
         Write-Json $configPath @{
             database = @{
@@ -307,19 +309,19 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'yunkun') \gexec
     $env:YUNKUN_SKILL_DIR = Join-Path $root 'skills'
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $process = Start-Process -FilePath $app -WorkingDirectory $script:LocalHome -WindowStyle Hidden -PassThru `
-        -ArgumentList @('-addr', '127.0.0.1:5173', '-proxy=', '-data', $dataDir) `
+        -ArgumentList @('-addr', "127.0.0.1:$ConsolePort", '-proxy=', '-data', ('"' + $dataDir + '"')) `
         -RedirectStandardOutput (Join-Path $script:LocalHome "logs\console-$stamp.out.log") `
         -RedirectStandardError (Join-Path $script:LocalHome "logs\console-$stamp.err.log")
     Write-Json $runPath @{ pid = $process.Id; started = $process.StartTime.ToUniversalTime().ToString('o') }
 
     for ($attempt = 0; $attempt -lt 60; $attempt++) {
         if ($process.HasExited) { throw 'Offline console exited before readiness. Check .yunkun-local\logs.' }
-        if (@(Get-PortOwners 5173).Count -eq 1 -and (Test-Ready)) {
-            Write-Host 'Ready: http://127.0.0.1:5173/'
-            Write-Host "Console port: 5173. Private PostgreSQL: $($state.databasePort)."
+        if (@(Get-PortOwners $ConsolePort).Count -eq 1 -and (Test-Ready)) {
+            Write-Host "Ready: http://127.0.0.1:$ConsolePort/"
+            Write-Host "Console port: $ConsolePort. Private PostgreSQL: $($state.databasePort)."
             Write-Host 'Offline mode: no dependency download or compilation was performed.'
             Write-Host 'First login: username yunkun; set your own console password in the browser.'
-            if (-not $NoBrowser) { Start-Process 'http://127.0.0.1:5173/' }
+            if (-not $NoBrowser) { Start-Process "http://127.0.0.1:$ConsolePort/" }
             return
         }
         Start-Sleep -Seconds 2

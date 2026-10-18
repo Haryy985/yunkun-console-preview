@@ -34,7 +34,7 @@ var reasonHint = map[harness.TerminalReason]string{
 	harness.ReasonCompleted:         "模型正常结束了本轮，但没有留下文字总结；事实和资产以本轮工具调用记录为准",
 	harness.ReasonMaxTurns:          "达到步数上限(MaxTurns)：SDK 已执行收尾并写回事实和资产，意图会标记为 exhausted，供规划者换方向继续，而不是作为失败处理",
 	harness.ReasonTimeout:           "达到单次运行的墙钟预算(MaxDuration)：到点会打断在跑的工具并就地进收尾，把已识别的事实和资产写回，意图会标记为 exhausted",
-	harness.ReasonModelError:        "模型或 API 调用失败（网络、鉴权、限流、供应商 5xx 等），重试用尽后意图标记为 blocked——传输层故障导致这条意图基本没真正探成；查其执行过程（get_worker_trace）后再决定重派或换法",
+	harness.ReasonModelError:        "模型请求失败；可能是接口格式、模型权限、额度或网络问题。查看底层错误与执行过程后再决定是否重派",
 	harness.ReasonBlockingLimit:     "上下文长度达到硬上限，请求在发出前被拦截；应收窄意图粒度或压缩工具返回",
 	harness.ReasonPromptTooLong:     "提示词过长且上下文压缩重试已经用尽，无法继续执行",
 	harness.ReasonImageError:        "当前模型不支持本轮多模态内容；请切换支持视觉的模型或避免工具返回图片",
@@ -72,7 +72,7 @@ func terminalText(ctx context.Context, term *harness.Terminal, tr *runTrace) (st
 	} else if reason == harness.ReasonMaxTurns || reason == harness.ReasonTimeout {
 		sum = "（达到运行预算上限(" + string(reason) + ")，已收尾写回事实" + progressSuffix(term, tr) + "；本次无文字总结）"
 	} else {
-		hint := terminalReasonHint(reason)
+		hint := terminalErrorHint(reason, term.Err)
 		sum = "（无文字总结，终态 " + terminalReasonLabel(reason) + "：" + firstLine(hint, 80) + "）"
 	}
 
@@ -80,7 +80,7 @@ func terminalText(ctx context.Context, term *harness.Terminal, tr *runTrace) (st
 	b.WriteString(sum)
 	b.WriteString("\n\n")
 	displayReason := terminalReasonLabel(reason)
-	fmt.Fprintf(&b, "- **终态**: `%s` - %s\n", displayReason, terminalReasonHint(reason))
+	fmt.Fprintf(&b, "- **终态**: `%s` - %s\n", displayReason, terminalErrorHint(reason, term.Err))
 	if aborted {
 		code, _, why, ok := AbortReason(ctx)
 		if ok {
@@ -116,6 +116,21 @@ func terminalText(ctx context.Context, term *harness.Terminal, tr *runTrace) (st
 		fmt.Fprintf(&b, "- **中断前最后一个工具**: `%s`（已正常返回）\n", tr.name)
 	}
 	return sum, b.String()
+}
+
+func terminalErrorHint(reason harness.TerminalReason, err error) string {
+	if reason == harness.ReasonModelError && err != nil {
+		message := strings.ToLower(err.Error())
+		switch {
+		case missingReasoningError(err):
+			return "模型切换后的思考字段不兼容，工具已返回但后续模型请求被拒绝；不要将其当作网络故障"
+		case strings.Contains(message, "subscription_not_found"):
+			return "当前模型分组没有有效订阅，需检查模型配置或切换可用配置"
+		case strings.Contains(message, "context length budget exceeded"):
+			return "本地上下文预算拦截；检查运行版本与模型窗口配置"
+		}
+	}
+	return terminalReasonHint(reason)
 }
 
 func terminalReasonLabel(reason harness.TerminalReason) string {

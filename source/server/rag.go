@@ -90,8 +90,12 @@ func (s *Server) reviewRAGProposal(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "decision must be approve or reject")
 		return
 	}
-	// All current JWTs belong to the single administrator; multi-user RBAC is not implemented.
-	item, jobID, err := pg.ReviewRAGProposal(id, req.Decision == "approve", "admin", req.Reason)
+	identity, _ := r.Context().Value(authContextKey{}).(*authIdentity)
+	if identity == nil || identity.Role != "admin" {
+		writeErr(w, http.StatusForbidden, "仅管理员可审核知识提案")
+		return
+	}
+	item, jobID, err := pg.ReviewRAGProposal(id, req.Decision == "approve", identity.Username, req.Reason)
 	if err != nil {
 		writeRAGKnowledgeBaseError(w, err)
 		return

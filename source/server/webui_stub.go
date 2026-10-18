@@ -9,7 +9,7 @@ import "net/http"
 // development. Build the bundled single-binary with:
 //
 //	cd web && npm run build:static     # produces web/out
-//	cp -r web/out server/webui/dist    # (or use the build script)
+//	cp -r web/out server/webui/current # (or use the build script)
 //	go build -tags embedui ./cmd/yunkun
 func (s *Server) webuiHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

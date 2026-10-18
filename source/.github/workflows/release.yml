@@ -1,0 +1,102 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # 创建 Release 需要
+
+jobs:
+  # ① 前端静态导出（一次），产物给交叉编译各平台复用
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify release repository
+        run: |
+          test "$GITHUB_REPOSITORY" = "Haryy985/yunkun-console-preview" || {
+            echo "Releases must be published from Haryy985/yunkun-console-preview."
+            exit 1
+          }
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-offline)?$ ]] || {
+            echo "Release tags must use vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-offline."
+            exit 1
+          }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - run: npm run build:static
+        working-directory: web
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/out
+
+  # ② 五平台交叉编译（内嵌前端）+ 打 zip
+  binaries:
+    needs: frontend
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: server/webui/current
+      - name: Build and package with build.sh
+        env:
+          YUNKUN_TARGET_OS: ${{ matrix.goos }}
+          YUNKUN_TARGET_ARCH: ${{ matrix.goarch }}
+          YUNKUN_BUILD_VERSION: ${{ github.ref_name }}
+          YUNKUN_SKIP_FRONTEND: "1"
+          YUNKUN_SKIP_NPM_CI: "1"
+          # UPX 自解压 ELF 在部分 Linux 内核、虚拟化和安全策略下会崩溃。
+          # Release 使用 Go linker 裁剪和 zip 压缩，优先保证可移植性。
+          YUNKUN_COMPRESS: "off"
+          YUNKUN_PACKAGE: "1"
+          YUNKUN_PACKAGE_DIR: dist
+        run: |
+          ./build.sh --target "${YUNKUN_TARGET_OS}/${YUNKUN_TARGET_ARCH}"
+      - name: Smoke test Linux amd64 binary
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: dist/yunkun-linux-amd64/yunkun -h
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: "dist/*.zip"
+
+  # ③ 汇总所有 zip → 创建 GitHub Release
+  release:
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          merge-multiple: true
+          path: dist
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum *.zip > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS
+          generate_release_notes: true
+

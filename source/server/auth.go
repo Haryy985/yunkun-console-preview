@@ -207,8 +207,14 @@ func loadOrCreateJWTKey(keyDir, dataDir string) ([]byte, error) {
 			}
 		}
 	}
-	if data, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(data))) >= 32 {
-		return []byte(strings.TrimSpace(string(data))), nil
+	if data, err := os.ReadFile(path); err == nil {
+		key := strings.TrimSpace(string(data))
+		if len(key) < 32 {
+			return nil, fmt.Errorf("JWT signing key %s is invalid; restore the existing key instead of rotating sessions", path)
+		}
+		return []byte(key), nil
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read JWT signing key %s: %w", path, err)
 	}
 	buf := make([]byte, 32)
 	for i := range buf {
@@ -245,8 +251,9 @@ func verifyJWT(tokenStr string, key []byte) bool {
 	return err == nil && t.Valid
 }
 
-// extractToken reads the JWT from Authorization: Bearer header,
-// the application cookie, or ?token= for SSE connections.
+// extractToken reads the JWT from Authorization: Bearer header or the
+// application cookie. EventSource cannot set an Authorization header, so its
+// legacy query token is accepted only on the three read-only stream routes.
 func extractToken(r *http.Request) string {
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 		return strings.TrimPrefix(h, "Bearer ")
@@ -254,7 +261,12 @@ func extractToken(r *http.Request) string {
 	if c, err := r.Cookie(authCookieName); err == nil && c.Value != "" {
 		return c.Value
 	}
-	return r.URL.Query().Get("token")
+	if r.Method == http.MethodGet && (r.URL.Path == "/api/logs/stream" ||
+		strings.HasPrefix(r.URL.Path, "/api/side-questions/") && strings.HasSuffix(r.URL.Path, "/events") ||
+		r.URL.Path == "/api/exploration/activity/stream") {
+		return r.URL.Query().Get("token")
+	}
+	return ""
 }
 
 // requireAuth wraps h with database-backed identity and role validation.

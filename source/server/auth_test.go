@@ -3,9 +3,38 @@ package server
 import (
 	"encoding/json"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestLoadOrCreateJWTKeyDoesNotReplaceDamagedKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, jwtKeyFilename)
+	if err := os.WriteFile(path, []byte("truncated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadOrCreateJWTKey(dir, dir); err == nil {
+		t.Fatal("a damaged signing key must fail closed")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "truncated" {
+		t.Fatalf("original key must be preserved, data=%q err=%v", data, err)
+	}
+}
+
+func TestLoadOrCreateJWTKeyCreatesOnlyWhenAbsent(t *testing.T) {
+	dir := t.TempDir()
+	first, err := loadOrCreateJWTKey(dir, dir)
+	if err != nil || len(first) < 32 {
+		t.Fatalf("create key: length=%d err=%v", len(first), err)
+	}
+	second, err := loadOrCreateJWTKey(dir, dir)
+	if err != nil || string(first) != string(second) {
+		t.Fatalf("key changed on reload: %v", err)
+	}
+}
 
 // GetSetting 对"键不存在"和"读取出错"的返回值只差一个 error：两种情况 value 都是
 // 空串。密码相关的 handler 一旦把 error 当成"还没设置密码"，就会在数据库抖动期间

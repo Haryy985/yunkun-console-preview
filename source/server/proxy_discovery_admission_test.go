@@ -21,7 +21,7 @@ func TestProxyDiscoveryAdmissionStateErrors(t *testing.T) {
 	}
 	sourceID, err := s.m.pg.SaveProxyDiscoverySource(
 		0, "quake", "admission fixture", "port:8080", "203.0.113.0/24",
-		"http://127.0.0.1:9/ip", cipher, 25,
+		"http://127.0.0.1:9/ip", cipher, 100,
 	)
 	if err != nil {
 		t.Fatal(err)

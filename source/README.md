@@ -4,7 +4,7 @@
 
 # 云鲲自动化渗透控制台
 
-Windows x64 完全离线交付版
+v1.0.3 源码 · Windows x64 离线版另见 Releases
 
 对话与任务 · 执行流水 · RAG 知识库 · 代理资源 · HTTP 证据
 
@@ -14,9 +14,21 @@ Rowan / 云鲲安全
 
 > 本项目仅用于合法授权的安全测试。请在隔离、低权限环境中运行，不要将控制台或数据库直接暴露到公网。
 
-## 离线启动
+## 从源码开始
 
-本包已经包含已编译的云鲲控制台、静态前端和 PostgreSQL 运行时。客户电脑无需安装 Go、Node.js、npm、Docker，也无需联网下载依赖。
+当前 `source/` 是可审计源码，不包含预编译程序或 PostgreSQL 运行时。
+Windows 用户可双击 `setup-and-start.bat`，首次联网下载依赖、编译并启动。
+需自行构建时参考 [原生部署手册](docs/DEPLOYMENT.md)；先生成前端并同步到
+`server/webui/current`，再以 `-tags embedui` 编译，避免得到没有页面的开发二进制。
+源码启动器读取 `VERSION`，本次为 `v1.0.3-offline`。
+
+完整变更见 [1.0.3 更新说明](docs/RELEASE_1.0.3.md)，
+测试范围见 [验收记录](docs/RELEASE_1.0.3_ACCEPTANCE.md)。
+源码随附公开工作流和规则资料，不包含维护者的账号、密钥、数据库或日志。
+
+## 下载离线包后启动
+
+从本仓库 Releases 下载的完整离线 ZIP 包含已编译的云鲲控制台、静态前端和 PostgreSQL 运行时。该 ZIP 的使用者无需安装 Go、Node.js、npm、Docker，也无需联网下载依赖；仓库自动生成的源码 ZIP 不具备这些运行时。
 
 1. 将完整目录解压到可写的短路径，例如 `F:\yunkun-offline`。
 2. 双击根目录的 `setup-and-start-offline.bat`。

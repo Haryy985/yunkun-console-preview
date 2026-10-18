@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sync"
 )
 
 type discoveryBatchRequest struct {
@@ -17,7 +18,6 @@ func (req discoveryBatchRequest) validate() error {
 	limit := 100
 	switch req.Action {
 	case "verify":
-		limit = 5
 	case "delete":
 	case "approve":
 		if req.PoolID <= 0 || (req.Target != "candidate" && req.Target != "production") {
@@ -27,7 +27,7 @@ func (req discoveryBatchRequest) validate() error {
 		return errors.New("批量操作无效")
 	}
 	if len(req.IDs) == 0 || len(req.IDs) > limit {
-		return errors.New("批量删除和入池最多 100 条，单次批量验证最多 5 条")
+		return errors.New("单次批量操作最多 100 条")
 	}
 	seen := make(map[int64]bool, len(req.IDs))
 	for _, id := range req.IDs {
@@ -59,16 +59,38 @@ func (s *Server) batchProxyDiscoveryResults(w http.ResponseWriter, r *http.Reque
 		Status int    `json:"status"`
 		Error  string `json:"error,omitempty"`
 	}
-	items := make([]outcome, 0, len(req.IDs))
-	for _, id := range req.IDs {
+	items := make([]outcome, len(req.IDs))
+	if req.Action == "verify" {
+		var wg sync.WaitGroup
+		for i, id := range req.IDs {
+			if r.Context().Err() != nil {
+				wg.Wait()
+				return
+			}
+			wg.Add(1)
+			go func(i int, id int64) {
+				defer wg.Done()
+				_, status, err := s.verifyDiscoveryCandidateWithTimeout(r.Context(), id, discoveryBatchVerifyTimeout)
+				items[i] = outcome{ID: id, OK: err == nil, Status: status}
+				if err != nil {
+					items[i].Error = err.Error()
+				}
+			}(i, id)
+		}
+		wg.Wait()
+		if r.Context().Err() != nil {
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items})
+		return
+	}
+	for i, id := range req.IDs {
 		if r.Context().Err() != nil {
 			return
 		}
 		var err error
 		var status int
 		switch req.Action {
-		case "verify":
-			_, status, err = s.verifyDiscoveryCandidate(r.Context(), id)
 		case "approve":
 			_, status, err = s.approveDiscoveryCandidate(r.Context(), id, req.PoolID, req.Target)
 		case "delete":
@@ -78,7 +100,7 @@ func (s *Server) batchProxyDiscoveryResults(w http.ResponseWriter, r *http.Reque
 		if err != nil {
 			item.Error = err.Error()
 		}
-		items = append(items, item)
+		items[i] = item
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }

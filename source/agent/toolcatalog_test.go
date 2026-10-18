@@ -33,6 +33,22 @@ func TestBuiltinToolSeeds(t *testing.T) {
 	if !ok || !hasWorker {
 		t.Errorf("record_fact agents = %v, want to include worker", rf.Agents)
 	}
+	profile, ok := byKey["get_target_profile"]
+	if !ok || len(profile.Agents) == 0 {
+		t.Fatalf("get_target_profile not seeded or has no bindings: %+v", profile)
+	}
+	for _, want := range []string{"mainagent", "planner", "worker", "pentest"} {
+		found := false
+		for _, got := range profile.Agents {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("get_target_profile agents=%v, want %s", profile.Agents, want)
+		}
+	}
 	// add_task_scope is bound to the planner (deliberate scope widening).
 	if ts, ok := byKey["add_task_scope"]; !ok || len(ts.Agents) == 0 {
 		t.Errorf("add_task_scope not seeded / has no agent binding: %v", ts.Agents)
@@ -42,6 +58,16 @@ func TestBuiltinToolSeeds(t *testing.T) {
 	for _, k := range []string{"Bash", "Read", "Write", "Edit", "Grep", "sleep"} {
 		if _, ok := byKey[k]; ok {
 			t.Errorf("SDK tool %q should not be seeded", k)
+		}
+	}
+	for _, key := range []string{"asset_intel_search", "threatbook_lookup"} {
+		seed, exists := byKey[key]
+		if !exists {
+			t.Errorf("controlled external tool %q missing from catalog", key)
+			continue
+		}
+		if len(seed.Agents) != 0 {
+			t.Errorf("controlled external tool %q should require explicit binding, got %v", key, seed.Agents)
 		}
 	}
 }

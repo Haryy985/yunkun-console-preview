@@ -21,7 +21,8 @@ func TestTaskResourcesAndBoundedRetrievalIntegration(t *testing.T) {
 	}
 	dsn := os.Getenv("YUNKUN_PG_DSN")
 	u, err := url.Parse(dsn)
-	if err != nil || u.Hostname() != "127.0.0.1" || u.Port() != "26900" {
+	if err != nil || u.Hostname() != "127.0.0.1" ||
+		!strings.HasPrefix(strings.TrimPrefix(u.Path, "/"), "yunkun_test_") {
 		t.Fatal("this integration test requires the dedicated loopback test cluster")
 	}
 	name := fmt.Sprintf("yunkun_resources_%d", time.Now().UnixNano())

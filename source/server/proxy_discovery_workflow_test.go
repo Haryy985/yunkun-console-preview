@@ -113,7 +113,7 @@ func TestDiscoveryVerifyPromoteAndConfigurationChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	sourceID, err := s.m.pg.SaveProxyDiscoverySource(0, "quake", "workflow", "fixture", "127.0.0.1",
-		"http://check.example/ip", cipher, 20)
+		"http://check.example/ip", cipher, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestDiscoveryVerifyPromoteAndConfigurationChange(t *testing.T) {
 	}
 	// Revoking the range invalidates old verification; it must not allow promotion.
 	if _, err := s.m.pg.SaveProxyDiscoverySource(sourceID, "quake", "workflow", "fixture", "",
-		"http://check.example/ip", cipher, 20); err != nil {
+		"http://check.example/ip", cipher, 100); err != nil {
 		t.Fatal(err)
 	}
 	verify(http.StatusBadRequest)
@@ -164,7 +164,7 @@ func TestDiscoveryVerifyPromoteAndConfigurationChange(t *testing.T) {
 		t.Fatal("missing scope caused a network request")
 	}
 	if _, err := s.m.pg.SaveProxyDiscoverySource(sourceID, "quake", "workflow", "fixture", "127.0.0.1",
-		"", cipher, 20); err != nil {
+		"", cipher, 100); err != nil {
 		t.Fatal(err)
 	}
 	verify(http.StatusBadRequest)
@@ -172,7 +172,7 @@ func TestDiscoveryVerifyPromoteAndConfigurationChange(t *testing.T) {
 		t.Fatal("missing verification URL caused a network request")
 	}
 	if _, err := s.m.pg.SaveProxyDiscoverySource(sourceID, "quake", "workflow", "fixture", "127.0.0.1",
-		"http://check.example/ip", cipher, 20); err != nil {
+		"http://check.example/ip", cipher, 100); err != nil {
 		t.Fatal(err)
 	}
 	approve(http.StatusConflict)

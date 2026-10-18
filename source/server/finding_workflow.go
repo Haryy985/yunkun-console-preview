@@ -8,13 +8,14 @@ import (
 	"log"
 	"strconv"
 
+	actool "github.com/Autumn-27/norma/tool"
 	"yunkun/console/agent"
 	"yunkun/console/db"
 	"yunkun/console/traffic"
-	actool "github.com/Autumn-27/norma/tool"
 )
 
 func (s *Server) seedFindingWorkflowTools() {
+	s.seedFindingQualitySchema()
 	const hostSearchDescriptionFlag = "finding_workflow_tools_v3_host_search_description"
 	if value, _, _ := s.m.pg.GetSetting(hostSearchDescriptionFlag); value != "true" {
 		// Only replace the original built-in text. A user-edited description is
@@ -101,6 +102,67 @@ func (s *Server) seedFindingWorkflowTools() {
 		return
 	}
 	if err := s.m.pg.AddAgentToToolBinding("reporter", []string{"bind_finding_traffic"}); err != nil {
+		return
+	}
+	_ = s.m.pg.SetSetting(flag, "true")
+}
+
+// Existing installations keep their edited descriptions, bindings and switch.
+// Only the newly introduced parameters and validation requirement are merged.
+func (s *Server) seedFindingQualitySchema() {
+	const flag = "finding_quality_schema_v1"
+	if value, ok, err := s.m.pg.GetSetting(flag); err != nil {
+		log.Printf("[finding] read quality migration: %v", err)
+		return
+	} else if ok && value == "true" {
+		return
+	}
+	var defaults map[string]any
+	for _, seed := range agent.BuiltinToolSeeds() {
+		if seed.Key == "report_finding" {
+			defaults = seed.Schema
+			break
+		}
+	}
+	props, _ := defaults["properties"].(map[string]any)
+	if props == nil {
+		return
+	}
+	row, err := s.m.pg.GetTool("report_finding")
+	if err != nil || row == nil || !row.System {
+		log.Printf("[finding] load report_finding quality schema: %v", err)
+		return
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(row.Schema, &schema); err != nil {
+		log.Printf("[finding] decode report_finding schema: %v", err)
+		return
+	}
+	if schema == nil {
+		return
+	}
+	existing := objectProperty(schema, "properties")
+	for _, name := range []string{"validation", "learning"} {
+		if _, ok := existing[name]; !ok {
+			existing[name] = props[name]
+		}
+	}
+	required, _ := schema["required"].([]any)
+	found := false
+	for _, name := range required {
+		found = found || name == "validation"
+	}
+	if !found {
+		schema["required"] = append(required, "validation")
+	}
+	raw, _ := json.Marshal(schema)
+	res, err := s.m.pg.Exec(`UPDATE tools SET schema=$2::jsonb, updated_at=now()
+WHERE key='report_finding' AND system AND schema=$1::jsonb`, string(row.Schema), string(raw))
+	if err != nil {
+		log.Printf("[finding] migrate report_finding schema: %v", err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
 		return
 	}
 	_ = s.m.pg.SetSetting(flag, "true")

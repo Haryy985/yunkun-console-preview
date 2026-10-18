@@ -30,7 +30,16 @@ export interface Task {
   goals_met?: number;
   engine_mode?: EngineMode;
   tokens?: TokenTotal; // whole-task token consumption
-  latest_llm?: { request_id: string; session_id: string; worker: string; model: string; input_tokens: number; output_tokens: number; status: string; context_window_tokens: number };
+  latest_llm?: {
+    request_id: string;
+    session_id: string;
+    worker: string;
+    model: string;
+    input_tokens: number;
+    output_tokens: number;
+    status: string;
+    context_window_tokens: number;
+  };
   rag_stats?: { searches: number; nonempty: number; returned_chunks: number };
   llm_profile_id?: number; // LLM profile used; absent = default profile
   llm_profile_ids?: number[]; // ordered task-level failover chain
@@ -397,6 +406,46 @@ export interface TaskScopeRow {
   reason?: string;
 }
 
+export type TaskProfileKind =
+  | "host"
+  | "application"
+  | "route_family"
+  | "identity"
+  | "tenant"
+  | "technology"
+  | "data_class"
+  | "trust_boundary"
+  | "exclusion"
+  | "open_question";
+
+export interface TaskProfileEntry {
+  id: number;
+  task_id: number;
+  scope_id: number | null;
+  kind: TaskProfileKind;
+  label: string;
+  evidence_kind: "observed" | "inferred";
+  source_node_id: number | null;
+  source_summary: string;
+  source_query: string;
+  confidence: number;
+  dedupe_key: string;
+  same_key_count: number;
+  observed_at: string;
+  created_at: string;
+}
+
+export interface TaskProfileInput {
+  scope_id: number;
+  kind: TaskProfileKind;
+  label: string;
+  evidence_kind: TaskProfileEntry["evidence_kind"];
+  source_node_id?: number;
+  source_summary: string;
+  source_query: string;
+  confidence: number;
+}
+
 export type CompanyScopeKind = "domain" | "ip" | "cidr" | "icp" | "keyword";
 
 // 新增企业时提交的结构化资产范围规则。
@@ -535,6 +584,7 @@ export interface Finding {
   summary: string;
   evidence: string;
   report?: string; // 详细报告(Markdown);仅详情接口返回,列表为空
+  quality?: FindingQuality;
   intent_id?: string;
   param_id?: string;
   task_id?: string;
@@ -543,6 +593,27 @@ export interface Finding {
   inherited?: boolean;
   assets?: FindingAsset[];
   ts: string;
+}
+
+export type FindingQualityStatus = "PASS" | "NEEDS_MORE" | "DOWNGRADE" | "DUPLICATE_RISK" | "BLOCKED";
+
+export interface FindingQuality {
+  finding_id: number;
+  quality_status: FindingQualityStatus;
+  vulnerability_type: string;
+  verification_type: string;
+  baseline_evidence: string;
+  proof_evidence: string;
+  verification_evidence: string;
+  verification_rationale: string;
+  reproduction_count: number;
+  success_count: number;
+  blocking_reason: string;
+  duplicate_risk: string;
+  evidence_integrity: string;
+  reviewer: string;
+  reviewed_at?: string;
+  updated_at: string;
 }
 
 // FindingsPage 是发现列表的服务端分页响应。
@@ -683,7 +754,12 @@ export interface Activity {
   detail?: string;
   metadata?: {
     llm_transition?: LLMTransition;
-    record_ref?: { kind: "rag_retrieval" | "rag_proposal" | "finding" | "traffic_read"; id: string; node_id?: string; knowledge_base_id?: string };
+    record_ref?: {
+      kind: "rag_retrieval" | "rag_proposal" | "finding" | "traffic_read";
+      id: string;
+      node_id?: string;
+      knowledge_base_id?: string;
+    };
     llm_request_id?: string;
   };
   source_task_id?: string;
@@ -1789,4 +1865,30 @@ export interface InterceptExecution {
   session: string;
   seq: number;
   items: Activity[];
+}
+
+export interface UpdateCheck {
+  current: string;
+  latest: string;
+  notes?: string;
+  os: string;
+  arch: string;
+  has_update: boolean;
+  comparable: boolean;
+  reason?: string;
+  error?: string;
+  html_url?: string;
+  asset?: string;
+  asset_available?: boolean;
+  size?: number;
+  mode?: "docker" | "binary" | string;
+  has_backup?: boolean;
+  boot_notice?: string;
+}
+
+export interface UpdateProgress {
+  phase: "downloading" | "verifying" | "staged" | "failed" | string;
+  percent?: number;
+  message?: string;
+  error?: string;
 }

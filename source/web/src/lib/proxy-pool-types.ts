@@ -105,6 +105,8 @@ export type TaskNetwork = {
 };
 
 export type ProxyDiscoverySource = {
+  next_offset: number;
+  exhausted: boolean;
   id: number;
   provider: "fofa" | "quake";
   name: string;

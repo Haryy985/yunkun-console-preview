@@ -236,7 +236,13 @@ VALUES($1,$2,$3,$4,$5) ON CONFLICT(finding_id,snapshot_id) DO NOTHING`, findingI
 }
 
 func bumpEvidenceVersionTx(tx *sql.Tx, findingID int64) error {
-	_, err := tx.Exec(`UPDATE findings SET evidence_version=evidence_version+1 WHERE id=$1`, findingID)
+	if _, err := tx.Exec(`UPDATE findings SET evidence_version=evidence_version+1 WHERE id=$1`, findingID); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`UPDATE finding_quality
+		SET quality_status='NEEDS_MORE', reviewer='', reviewed_at=NULL,
+		    blocking_reason='证据绑定发生变化，需要重新审核', updated_at=now()
+		WHERE finding_id=$1 AND quality_status='PASS'`, findingID)
 	return err
 }
 
@@ -332,9 +338,10 @@ type RecordFindingInput struct {
 }
 
 type RecordedFinding struct {
-	FindingID int64           `json:"finding_id,string"`
-	NodeID    int64           `json:"finding_node_id,string"`
-	Traffic   *FindingTraffic `json:"traffic"`
+	FindingID     int64           `json:"finding_id,string"`
+	NodeID        int64           `json:"finding_node_id,string"`
+	Traffic       *FindingTraffic `json:"traffic"`
+	QualityStatus string          `json:"quality_status"`
 }
 
 // ctx 由调用方传入本次事务所用的上下文（而非在内部取 context.Background）：
@@ -386,6 +393,11 @@ VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string
 VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw)).Scan(&out.FindingID); err != nil {
 		return nil, err
 	}
+	quality := evaluateFindingQuality(in, prepared)
+	if err := insertFindingQualityTx(tx, out.FindingID, quality); err != nil {
+		return nil, err
+	}
+	out.QualityStatus = quality.QualityStatus
 	// 在**同一事务**里登记一条推送事件：提交即保证「漏洞落库」与「推送任务存在」
 	// 原子一致，不存在提交成功却没入队、消息永久丢失的窗口。
 	// 这里的失败被隔离在保存点上、不影响漏洞写入（见函数注释），因此忽略返回值。

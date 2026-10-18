@@ -11,11 +11,11 @@ import (
 
 func TestQuakeLegacyProtocolRepair(t *testing.T) {
 	s := newProxyFixture(t)
-	quakeID, err := s.m.pg.SaveProxyDiscoverySource(0, "quake", "legacy SOCKS5", "fixture", "0.0.0.0/0", "", "", 20)
+	quakeID, err := s.m.pg.SaveProxyDiscoverySource(0, "quake", "legacy SOCKS5", "fixture", "0.0.0.0/0", "", "", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fofaID, err := s.m.pg.SaveProxyDiscoverySource(0, "fofa", "unrelated provider", "fixture", "0.0.0.0/0", "", "", 20)
+	fofaID, err := s.m.pg.SaveProxyDiscoverySource(0, "fofa", "unrelated provider", "fixture", "0.0.0.0/0", "", "", 100)
 	if err != nil {
 		t.Fatal(err)
 	}

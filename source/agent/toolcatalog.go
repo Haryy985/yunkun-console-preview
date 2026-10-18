@@ -45,7 +45,7 @@ func builtinToolsByAgent() map[string][]actool.CoreTool {
 		"auto": {ts.addFinding(), ts.insertAssets(), ts.addCompanyScope(), ts.listAssets(), ts.listCompanies()},
 		// pentest（独立渗透 agent）默认绑：查资产 / 插资产 / 报漏洞 / 查漏洞 / 查企业。
 		// 新库由此 seed 写入；老库由 seedPentestDefaultBindings 迁移。
-		"pentest": {ts.listAssets(), ts.insertAssets(), ts.addFinding(), ts.listFindings(), ts.listCompanies()},
+		"pentest": {ts.listAssets(), ts.insertAssets(), ts.addFinding(), ts.listFindings(), ts.listCompanies(), ts.getTargetProfile(), ts.analyzeWebSurface(), ts.assetIntelSearch(), ts.threatBookLookup()},
 	}
 }
 
@@ -54,9 +54,13 @@ func builtinToolsByAgent() map[string][]actool.CoreTool {
 // 之所以仍留在某个 agent 的 base 工具集里(如 goal_met 在 PlannerTools):一是让 seed 能
 // 构造它拿到 desc/schema,二是用户手动绑回后运行时 base 里有它、ToolResolve 才留得住。
 //
-// goal_met：绕过逐个 prove_goal、直接从全局宣布【整个任务完成】,权重大且有误判风险,又与
-// 「prove_goal 标记最后一个目标 → 自动收官」重复,故默认不给任何 agent,需要时再手动绑。
-var defaultUnbound = map[string]bool{"goal_met": true}
+// goal_met 可直接宣布整个任务完成；外部资产测绘与威胁情报会产生第三方额度和外联请求。
+// 这些工具默认不给任何 agent，需要管理员明确绑定后才可使用。
+var defaultUnbound = map[string]bool{
+	"goal_met":           true,
+	"asset_intel_search": true,
+	"threatbook_lookup":  true,
+}
 
 // BuiltinToolSeeds 把各 agent 的内置工具集去重合并成 seed 列表：同名工具（如 list_assets
 // 多个 agent 都有）合成一条，Agents 取并集；defaultUnbound 里的工具则强制绑定为空。

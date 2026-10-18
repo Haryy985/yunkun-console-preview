@@ -37,6 +37,11 @@ type verificationFailure struct {
 	message string
 }
 
+func IsVerificationTimeout(err error) bool {
+	var failure *verificationFailure
+	return errors.As(err, &failure) && failure.code == "timeout"
+}
+
 func (e *verificationFailure) Error() string {
 	return fmt.Sprintf("[proxy_verify:%s:%s] proxy verification %s", e.stage, e.code, e.message)
 }

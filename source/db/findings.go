@@ -38,6 +38,8 @@ type DBFinding struct {
 
 type TaskReportReference struct {
 	FindingID             int64
+	Severity              string
+	Status                string
 	Report                string
 	EvidenceVersion       int64
 	ReportEvidenceVersion int64
@@ -59,7 +61,8 @@ func (d *DB) TaskReportReferences(taskID int64, nodeIDs []int64) (map[int64]Task
 	if taskID <= 0 || len(nodeIDs) == 0 {
 		return out, nil
 	}
-	rows, err := d.Query(`SELECT f.node_id, f.id, COALESCE(f.report,''), f.evidence_version, f.report_evidence_version,
+	rows, err := d.Query(`SELECT f.node_id, f.id, f.severity, COALESCE(f.status,'pending'),
+  COALESCE(f.report,''), f.evidence_version, f.report_evidence_version,
   b.id, b.snapshot_id, b.role, s.source_traffic_id, to_jsonb(s)
 FROM findings f
 JOIN tasks t ON t.id=f.task_id
@@ -78,7 +81,7 @@ ORDER BY f.id, b.position, b.id`, taskID, nodeIDs)
 		var bindingID sql.NullInt64
 		var snapshotID, role, sourceID sql.NullString
 		var snapshotJSON []byte
-		if err := rows.Scan(&nodeID, &ref.FindingID, &ref.Report, &ref.EvidenceVersion,
+		if err := rows.Scan(&nodeID, &ref.FindingID, &ref.Severity, &ref.Status, &ref.Report, &ref.EvidenceVersion,
 			&ref.ReportEvidenceVersion, &bindingID, &snapshotID, &role, &sourceID, &snapshotJSON); err != nil {
 			return nil, err
 		}

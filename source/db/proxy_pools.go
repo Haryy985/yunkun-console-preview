@@ -68,6 +68,8 @@ type ProxyDiscoverySource struct {
 	AuthorizedScope string     `json:"authorized_scope"`
 	VerifyURL       string     `json:"verify_url,omitempty"`
 	FetchLimit      int        `json:"fetch_limit"`
+	NextOffset      int        `json:"next_offset"`
+	Exhausted       bool       `json:"exhausted"`
 	Enabled         bool       `json:"enabled"`
 	HasCredentials  bool       `json:"has_credentials"`
 	LastRunAt       *time.Time `json:"last_run_at,omitempty"`
@@ -384,7 +386,7 @@ FROM proxy_nodes WHERE pool_id=$1`, poolID, interval).
 }
 
 func (d *DB) ListProxyDiscoverySources() ([]ProxyDiscoverySource, error) {
-	rows, err := d.Query(`SELECT id,provider,name,query,authorized_scope,verify_url,fetch_limit,enabled,
+	rows, err := d.Query(`SELECT id,provider,name,query,authorized_scope,verify_url,fetch_limit,next_offset,exhausted,enabled,
 credentials<>'',last_run_at,last_error,created_at,updated_at
 FROM proxy_discovery_sources ORDER BY id DESC`)
 	if err != nil {
@@ -395,7 +397,7 @@ FROM proxy_discovery_sources ORDER BY id DESC`)
 	for rows.Next() {
 		var item ProxyDiscoverySource
 		if err := rows.Scan(&item.ID, &item.Provider, &item.Name, &item.Query, &item.AuthorizedScope,
-			&item.VerifyURL, &item.FetchLimit, &item.Enabled, &item.HasCredentials, &item.LastRunAt, &item.LastError, &item.CreatedAt, &item.UpdatedAt); err != nil {
+			&item.VerifyURL, &item.FetchLimit, &item.NextOffset, &item.Exhausted, &item.Enabled, &item.HasCredentials, &item.LastRunAt, &item.LastError, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, item)
@@ -406,9 +408,9 @@ FROM proxy_discovery_sources ORDER BY id DESC`)
 func (d *DB) ProxyDiscoverySource(id int64) (*ProxyDiscoverySource, string, error) {
 	var item ProxyDiscoverySource
 	var credentials string
-	err := d.QueryRow(`SELECT id,provider,name,query,authorized_scope,verify_url,fetch_limit,enabled,credentials,
+	err := d.QueryRow(`SELECT id,provider,name,query,authorized_scope,verify_url,fetch_limit,next_offset,exhausted,enabled,credentials,
 last_run_at,last_error,created_at,updated_at FROM proxy_discovery_sources WHERE id=$1`, id).
-		Scan(&item.ID, &item.Provider, &item.Name, &item.Query, &item.AuthorizedScope, &item.VerifyURL, &item.FetchLimit, &item.Enabled,
+		Scan(&item.ID, &item.Provider, &item.Name, &item.Query, &item.AuthorizedScope, &item.VerifyURL, &item.FetchLimit, &item.NextOffset, &item.Exhausted, &item.Enabled,
 			&credentials, &item.LastRunAt, &item.LastError, &item.CreatedAt, &item.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, "", nil
@@ -438,7 +440,10 @@ AND (s.authorized_scope<>$2 OR s.verify_url<>$3 OR s.credentials<>$4)`,
 		return 0, err
 	}
 	err = tx.QueryRow(`UPDATE proxy_discovery_sources SET provider=$2,name=$3,query=$4,
-authorized_scope=$5,verify_url=$6,fetch_limit=$7,credentials=$8,updated_at=now() WHERE id=$1 RETURNING id`,
+authorized_scope=$5,verify_url=$6,fetch_limit=$7,credentials=$8,
+next_offset=CASE WHEN provider<>$2 OR query<>$4 OR fetch_limit<>$7 OR credentials<>$8 THEN 0 ELSE next_offset END,
+exhausted=CASE WHEN provider<>$2 OR query<>$4 OR fetch_limit<>$7 OR credentials<>$8 THEN false ELSE exhausted END,
+updated_at=now() WHERE id=$1 RETURNING id`,
 		id, provider, name, query, scope, verifyURL, fetchLimit, credentials).Scan(&out)
 	if err != nil {
 		return 0, err
@@ -460,6 +465,33 @@ func (d *DB) DeleteProxyDiscoverySource(id int64) error {
 func (d *DB) MarkProxyDiscoveryRun(id int64, lastError string) error {
 	_, err := d.Exec(`UPDATE proxy_discovery_sources SET last_run_at=now(),last_error=$2,updated_at=now() WHERE id=$1`, id, lastError)
 	return err
+}
+
+// StoreProxyDiscoveryRun commits candidates and the provider cursor together.
+func (d *DB) StoreProxyDiscoveryRun(sourceID int64, results []ProxyDiscoveryResult, nextOffset int, exhausted bool) error {
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, item := range results {
+		raw, err := json.Marshal(item.Metadata)
+		if err != nil {
+			return err
+		}
+		if _, err = tx.Exec(`INSERT INTO proxy_discovery_results(source_id,address,protocol,host,port,metadata,authorized)
+VALUES($1,$2,$3,$4,$5,$6,$7)
+ON CONFLICT(source_id,address) DO UPDATE SET protocol=EXCLUDED.protocol,host=EXCLUDED.host,
+port=EXCLUDED.port,metadata=EXCLUDED.metadata,authorized=EXCLUDED.authorized,updated_at=now()`,
+			sourceID, item.Address, item.Protocol, item.Host, item.Port, string(raw), item.Authorized); err != nil {
+			return err
+		}
+	}
+	if _, err = tx.Exec(`UPDATE proxy_discovery_sources SET next_offset=$2,exhausted=$3,
+last_run_at=now(),last_error='',updated_at=now() WHERE id=$1`, sourceID, nextOffset, exhausted); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (d *DB) UpsertProxyDiscoveryResults(sourceID int64, results []ProxyDiscoveryResult) error {
@@ -573,6 +605,24 @@ WHERE ($1::bigint=0 OR source_id=$1) AND ($2::text='' OR state=$2)`, sourceID, s
 	return total, err
 }
 
+func (d *DB) FilteredProxyDiscoverySelectableIDs(sourceID int64, state string) ([]int64, error) {
+	rows, err := d.Query(`SELECT id FROM proxy_discovery_results
+WHERE source_id=$1 AND state<>'approved' AND ($2::text='' OR state=$2) ORDER BY id DESC`, sourceID, state)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := []int64{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 func (d *DB) FilteredProxyDiscoveryResultsPage(sourceID int64, state string, limit, offset int) ([]ProxyDiscoveryResult, error) {
 	rows, err := d.Query(`SELECT id,source_id,address,protocol,host,port,metadata,state,authorized,
 verified_ip,verified_at,latency_ms,last_error,created_at,updated_at
@@ -610,7 +660,7 @@ func (d *DB) DeleteProxyDiscoveryResult(id int64) error {
 
 func (d *DB) UpdateProxyDiscoveryResult(id int64, state string, authorized bool, ip string, latencyMS *int, problem string) error {
 	_, err := d.Exec(`UPDATE proxy_discovery_results SET state=$2,authorized=$3,verified_ip=$4,
-verified_at=CASE WHEN $4<>'' THEN now() ELSE verified_at END,latency_ms=$5,last_error=$6,updated_at=now()
+verified_at=CASE WHEN $4<>'' THEN now() ELSE NULL END,latency_ms=$5,last_error=$6,updated_at=now()
 WHERE id=$1`, id, state, authorized, ip, latencyMS, problem)
 	return err
 }

@@ -1,8 +1,11 @@
 package server
 
 import (
+	"context"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestDiscoveryScopeNormalization(t *testing.T) {
@@ -57,8 +60,8 @@ func TestDiscoveryBatchValidation(t *testing.T) {
 		req  discoveryBatchRequest
 		ok   bool
 	}{
-		{"verify", discoveryBatchRequest{Action: "verify", IDs: ids[:5]}, true},
-		{"verify too many", discoveryBatchRequest{Action: "verify", IDs: ids[:6]}, false},
+		{"verify", discoveryBatchRequest{Action: "verify", IDs: ids[:100]}, true},
+		{"verify too many", discoveryBatchRequest{Action: "verify", IDs: ids}, false},
 		{"delete", discoveryBatchRequest{Action: "delete", IDs: ids[:100]}, true},
 		{"delete too many", discoveryBatchRequest{Action: "delete", IDs: ids}, false},
 		{"empty", discoveryBatchRequest{Action: "delete"}, false},
@@ -82,5 +85,71 @@ func TestDiscoveryBatchValidation(t *testing.T) {
 				t.Fatal("validation mutated the requested IDs")
 			}
 		})
+	}
+}
+
+func TestDiscoveryVerifySlotLimitsConcurrencyAndRefills(t *testing.T) {
+	d := &proxyDiscoveryService{}
+	var wg sync.WaitGroup
+	starts := make(chan int, 11)
+	releaseOne := make(chan struct{})
+	releaseAll := make(chan struct{})
+	begin := make(chan struct{})
+	for i := 0; i < 11; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			<-begin
+			release, err := d.acquireVerifySlot(context.Background())
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			starts <- id
+			select {
+			case <-releaseOne:
+			case <-releaseAll:
+			}
+			release()
+		}(i)
+	}
+	close(begin)
+	deadline := time.After(700 * time.Millisecond)
+	for i := 0; i < 10; i++ {
+		select {
+		case <-starts:
+		case <-deadline:
+			close(releaseAll)
+			wg.Wait()
+			t.Fatal("first ten verification slots did not start together")
+		}
+	}
+	select {
+	case <-starts:
+		close(releaseAll)
+		wg.Wait()
+		t.Fatal("more than ten verifications ran concurrently")
+	default:
+	}
+	releaseOne <- struct{}{}
+	select {
+	case <-starts:
+	case <-time.After(700 * time.Millisecond):
+		close(releaseAll)
+		wg.Wait()
+		t.Fatal("waiting verifier did not start after release")
+	}
+	close(releaseAll)
+	wg.Wait()
+}
+
+func TestDiscoveryVerifySlotCancellation(t *testing.T) {
+	d := &proxyDiscoveryService{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	release, err := d.acquireVerifySlot(ctx)
+	if err == nil {
+		release()
+		t.Fatal("canceled verification acquired a slot")
 	}
 }

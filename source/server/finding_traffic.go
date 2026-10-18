@@ -13,10 +13,10 @@ import (
 	"strconv"
 	"unicode/utf8"
 
+	actool "github.com/Autumn-27/norma/tool"
 	"yunkun/console/agent"
 	"yunkun/console/db"
 	"yunkun/console/evidence"
-	actool "github.com/Autumn-27/norma/tool"
 )
 
 func (s *Server) evidenceStore() *evidence.Store {
@@ -309,6 +309,10 @@ func (s *Server) getFindingTrafficDetail(w http.ResponseWriter, r *http.Request)
 		evidenceError(w, err)
 		return
 	}
+	if !s.auditConfidentialAccess(w, r, "view", "finding_evidence", id,
+		fmt.Sprintf("binding:%d:detail", bid)) {
+		return
+	}
 	writeJSON(w, 200, result)
 }
 
@@ -339,6 +343,10 @@ func (s *Server) getFindingTrafficBody(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer f.Close()
+		if !s.auditConfidentialAccess(w, r, "download", "finding_evidence", id,
+			fmt.Sprintf("binding:%d:%s", bid, side)) {
+			return
+		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"evidence-%d-%s.bin\"", bid, side))
@@ -360,6 +368,10 @@ func (s *Server) getFindingTrafficBody(w http.ResponseWriter, r *http.Request) {
 	preview, err := readEvidencePreview(store, b.Snapshot, side, offset, length)
 	if err != nil {
 		evidenceError(w, err)
+		return
+	}
+	if !s.auditConfidentialAccess(w, r, "view", "finding_evidence", id,
+		fmt.Sprintf("binding:%d:%s", bid, side)) {
 		return
 	}
 	writeJSON(w, 200, preview)

@@ -111,6 +111,14 @@ func readRequestPackets(store *evidence.Store, snapshots map[int64]db.TrafficEvi
 	return packets, nil
 }
 
+func exportFindingIDs(findings []*db.DBFinding) []int64 {
+	ids := make([]int64, 0, len(findings))
+	for _, finding := range findings {
+		ids = append(ids, finding.ID)
+	}
+	return ids
+}
+
 func buildFindingsEvidenceZip(path string, findings []*db.DBFinding, stage string, now time.Time) error {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {

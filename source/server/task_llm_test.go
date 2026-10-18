@@ -11,10 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"yunkun/console/agent"
-	"yunkun/console/db"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
+	"yunkun/console/agent"
+	"yunkun/console/db"
+	"yunkun/console/llmpool"
 )
 
 type scriptedLLMProvider struct {
@@ -116,6 +117,7 @@ func TestIsQuotaExhaustedError(t *testing.T) {
 		`You exceeded your current quota, please check your plan and billing details.`,
 		`billing_hard_limit_reached`,
 		`billing_not_active`,
+		`openai-responses: status 403: {"code":"SUBSCRIPTION_NOT_FOUND","message":"No active subscription found for this group"}`,
 		`HTTP status 402 Payment Required`,
 		`账户余额不足，请充值`,
 		`credit balance is too low`,
@@ -148,6 +150,37 @@ func TestIsQuotaExhaustedError(t *testing.T) {
 	}
 	if isQuotaExhaustedError(nil) {
 		t.Error("nil error must not be classified as quota exhaustion")
+	}
+}
+
+func TestProviderCompactionWindowIncludesFailoverMembers(t *testing.T) {
+	primary := agent.Config{ContextWindowK: 200}
+	backup := &llmpool.Member{ID: 2, WindowTokens: 64000, Prov: &scriptedLLMProvider{}}
+	pool := llmpool.New([]*llmpool.Member{
+		{ID: 1, WindowTokens: primary.CompactionWindow(), Prov: &scriptedLLMProvider{}},
+		backup,
+	}, nil)
+	if got := providerCompactionWindow(pool, primary); got != 64000 {
+		t.Fatalf("pool window=%d, want 64000", got)
+	}
+	if got := providerCompactionWindow(&scriptedLLMProvider{}, primary); got != 200000 {
+		t.Fatalf("single provider window=%d, want 200000", got)
+	}
+}
+
+func TestTaskLLMFailureLabel(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		err  error
+		want string
+	}{
+		{errors.New(`openai-responses: status 403: {"code":"SUBSCRIPTION_NOT_FOUND"}`), "模型分组无有效订阅"},
+		{errors.New(`openai: status 429: {"code":"insufficient_quota"}`), "额度不足"},
+	}
+	for _, test := range tests {
+		if got := taskLLMFailureLabel(test.err); got != test.want {
+			t.Errorf("taskLLMFailureLabel(%v) = %q, want %q", test.err, got, test.want)
+		}
 	}
 }
 

@@ -219,6 +219,7 @@ func TestFindingTrafficAPIAndExport(t *testing.T) {
 		t.Fatal(w.Code, w.Body)
 	}
 	exportURL := fmt.Sprintf("/api/exploration/findings/export?format=md-zip&scope=selected&ids=%d", f.FindingID)
+	approveFormalReportFixture(t, s, f, "Verified export fixture")
 	w = req("GET", exportURL, "")
 	if w.Code != 200 {
 		t.Fatal(w.Code, w.Body)
@@ -486,6 +487,7 @@ func TestFindingTrafficUTF8SegmentsAndInheritedWrites(t *testing.T) {
 	if updated.ReportEvidenceVersion != 1 || updated.EvidenceVersion != 1 {
 		t.Fatal("report did not record the read evidence version")
 	}
+	approveFormalReportFixture(t, s, f, updated.Report)
 	for _, format := range []string{"md-single", "json", "csv"} {
 		w := req("GET", fmt.Sprintf("/api/exploration/findings/export?scope=selected&ids=%d&format=%s", f.FindingID, format), "")
 		if w.Code != 200 {

@@ -64,6 +64,118 @@ func TestSkillRelPath(t *testing.T) {
 	}
 }
 
+func TestSkillFilePathRejectsSymlinkComponents(t *testing.T) {
+	root := t.TempDir()
+	skill := filepath.Join(root, "sample")
+	outside := t.TempDir()
+	if err := os.MkdirAll(skill, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(skill, "linked")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if _, err := skillFilePath(root, "sample", "linked/secret.txt"); err == nil {
+		t.Fatal("path traversed a symlinked directory")
+	}
+	if _, err := skillFilePath(root, "sample", "new/file.txt"); err != nil {
+		t.Fatalf("normal new file rejected: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "alias")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := skillFilePath(root, "alias", "SKILL.md"); err == nil {
+		t.Fatal("symlinked skill root was accepted")
+	}
+}
+
+func TestSkillFileEndpointsRejectSymlinkRoot(t *testing.T) {
+	root, outside := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "SKILL.md"), []byte("private"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "alias")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	s := &Server{skillDir: root}
+	for _, tc := range []struct {
+		method, path string
+		handle       func(http.ResponseWriter, *http.Request)
+	}{
+		{http.MethodGet, "/api/skills/alias/files", s.fsListFiles},
+		{http.MethodPut, "/api/skills/alias/meta", s.fsUpdateSkillMeta},
+		{http.MethodGet, "/api/skills/alias/files/SKILL.md", s.fsReadFile},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{}`))
+		req.SetPathValue("name", "alias")
+		req.SetPathValue("file", "SKILL.md")
+		rr := httptest.NewRecorder()
+		tc.handle(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("%s %s: status=%d body=%s", tc.method, tc.path, rr.Code, rr.Body.String())
+		}
+	}
+}
+
+func TestCreateSkillDoesNotOverwriteExistingDirectory(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "demo")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := []byte("original skill")
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/skills", strings.NewReader(`{"name":"demo","description":"replacement"}`))
+	rr := httptest.NewRecorder()
+	(&Server{skillDir: root}).fsCreateSkill(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "SKILL.md"))
+	if err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("existing skill changed: %q, %v", got, err)
+	}
+}
+
+func TestUploadSkillOverwritePreservesExistingOnInvalidArchive(t *testing.T) {
+	root := t.TempDir()
+	old := filepath.Join(root, "demo")
+	if err := os.Mkdir(old, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(old, "SKILL.md"), []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	data := buildZip(t,
+		zipFile{name: "SKILL.md", body: "---\nname: demo\n---\n"},
+		zipFile{name: "../escape", body: "bad"},
+	)
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	f, err := mw.CreateFormFile("file", "demo.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/skills/upload?overwrite=true", &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rr := httptest.NewRecorder()
+	(&Server{skillDir: root}).fsUploadSkill(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	got, err := os.ReadFile(filepath.Join(old, "SKILL.md"))
+	if err != nil || string(got) != "original" {
+		t.Fatalf("existing skill changed: %q, %v", got, err)
+	}
+}
+
 type nopWriteCloser struct{ io.Writer }
 
 func (nopWriteCloser) Close() error { return nil }

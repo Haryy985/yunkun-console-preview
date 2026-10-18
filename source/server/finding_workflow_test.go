@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
+	actool "github.com/Autumn-27/norma/tool"
 	"yunkun/console/agent"
 	"yunkun/console/db"
-	actool "github.com/Autumn-27/norma/tool"
 )
 
 func workflowCall(t *testing.T, ctx context.Context, tool actool.CoreTool, input any, wantError bool) string {
@@ -97,7 +97,9 @@ func TestFindingWorkflowAutoHintToPlannerAndSetting(t *testing.T) {
 		t.Fatal("Planner missed runtime guidance")
 	}
 	report := workflowTool(t, tools, "report_finding")
-	result := workflowCall(t, ctx, report, map[string]any{"vulnclass": "TEST", "severity": "low", "summary": "Planner handoff fixture", "evidence_hint_id": hints.IDs[0]}, false)
+	result := workflowCall(t, ctx, report, map[string]any{"vulnclass": "TEST", "severity": "low", "summary": "Planner handoff fixture", "evidence": "verified control and proof response", "evidence_hint_id": hints.IDs[0],
+		"validation": map[string]any{"authorization": "fixture scope", "asset": "local HTTP service", "identity": "test account", "preconditions": "fixture", "baseline": "normal response", "mutation": "one bounded request", "observed_delta": "changed response", "security_impact": "verified state difference", "cleanup": "no state change"},
+		"learning":   map[string]any{"reusable": false}}, false)
 	var recorded db.RecordedFinding
 	if err := json.Unmarshal([]byte(strings.SplitN(result, "\n", 2)[1]), &recorded); err != nil {
 		t.Fatal(err)
@@ -166,7 +168,27 @@ func TestFindingWorkflowAutoHintToPlannerAndSetting(t *testing.T) {
 	workflowCall(t, ctx, bind, input, true)
 	// Turning binding off must still save a confirmed finding from an already
 	// assembled tool, even if the model sends the old optional evidence fields.
-	offResult := workflowCall(t, ctx, report, map[string]any{"vulnclass": "TEST", "severity": "low", "summary": "off", "evidence_hint_id": hints.IDs[0]}, false)
+	offProof := map[string]any{"authorization": "fixture scope", "asset": "local service", "identity": "test account", "preconditions": "fixture",
+		"baseline": "normal response", "mutation": "bounded request", "observed_delta": "changed response", "security_impact": "verified difference", "cleanup": "no state change"}
+	offResult := workflowCall(t, ctx, report, map[string]any{"vulnclass": "TEST", "severity": "low", "summary": "off",
+		"evidence": "fixture evidence", "validation": offProof, "evidence_hint_id": hints.IDs[0]}, true)
+	if !strings.Contains(offResult, "evidence_step_ids") {
+		t.Fatal("finding without non-HTTP proof should be rejected when traffic binding is disabled", offResult)
+	}
+	if notices != 1 {
+		t.Fatal("rejected report notified the planner")
+	}
+	intentID, err := task.Store.AddIntent(map[string]any{"summary": "non-HTTP proof"}, 1, nil, "planner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stepID, err := task.Store.AppendActivity(db.Activity{NodeID: &intentID, Kind: "tool_result", Tool: "fixture", Detail: "verified TCP response"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	offProof["evidence_step_ids"] = []int64{stepID}
+	offResult = workflowCall(t, ctx, report, map[string]any{"vulnclass": "TCP", "severity": "low", "summary": "non-HTTP verified",
+		"evidence": "verified TCP response", "intent_id": intentID, "validation": offProof, "evidence_hint_id": hints.IDs[0]}, false)
 	var offRecord struct {
 		db.RecordedFinding
 		EvidenceStatus string `json:"evidence_status"`
@@ -176,17 +198,16 @@ func TestFindingWorkflowAutoHintToPlannerAndSetting(t *testing.T) {
 		t.Fatal(err)
 	}
 	if offRecord.FindingID <= 0 || len(offRecord.Traffic.Bindings) != 0 || offRecord.EvidenceStatus != "not_bound" || !strings.Contains(offRecord.EvidenceNote, "已关闭") {
-		t.Fatal("disabled binding discarded finding or bound evidence", offResult)
+		t.Fatal("disabled binding discarded non-HTTP finding or bound evidence", offResult)
 	}
-	workflowCall(t, ctx, report, map[string]any{"vulnclass": "TCP", "severity": "low", "summary": "no packet needed"}, false)
-	if notices != 3 {
-		t.Fatal("optional no-packet report failed")
+	if notices != 2 {
+		t.Fatal("non-HTTP proof failed")
 	}
 	workflowCall(t, ctx, s.toolGetFindingTraffic(), map[string]any{"finding_id": recorded.FindingID}, false)
 	tools, def, closeTools := agent.AugmentTools(ctx, "planner", ts.PlannerTools())
 	defer closeTools()
-	if def.FindingGuidance != "" {
-		t.Fatal("disabled feature still injects guidance")
+	if !strings.Contains(def.FindingGuidance, "漏洞质量门槛") || strings.Contains(def.FindingGuidance, "报告前自动关联流量") {
+		t.Fatal("disabled binding removed quality guidance or kept auto-binding guidance")
 	}
 	for _, tool := range tools {
 		if tool.Name() == "bind_finding_traffic" {
@@ -262,6 +283,69 @@ func TestFindingWorkflowMigrationPreservesUserConfiguration(t *testing.T) {
 	}
 }
 
+func TestFindingQualitySchemaMigrationPreservesUserConfiguration(t *testing.T) {
+	s, _, _ := trafficEvidenceServer(t)
+	pg := s.m.pg
+	original, err := pg.GetTool("report_finding")
+	if err != nil || original == nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		agents, _ := json.Marshal(original.Agents)
+		pg.UpdateTool(original.Key, original.Description, original.Schema, agents, original.Enabled)
+	})
+	var schema map[string]any
+	if err := json.Unmarshal(original.Schema, &schema); err != nil {
+		t.Fatal(err)
+	}
+	properties := objectProperty(schema, "properties")
+	delete(properties, "validation")
+	delete(properties, "learning")
+	properties["summary"] = map[string]any{"type": "string", "description": "USER SUMMARY"}
+	required, _ := schema["required"].([]any)
+	kept := make([]any, 0, len(required))
+	for _, item := range required {
+		if item != "validation" {
+			kept = append(kept, item)
+		}
+	}
+	schema["required"] = kept
+	custom, _ := json.Marshal(schema)
+	if err := pg.UpdateTool("report_finding", "USER DESCRIPTION", custom, json.RawMessage(`["worker"]`), false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pg.Exec(`DELETE FROM settings WHERE key='finding_quality_schema_v1'`); err != nil {
+		t.Fatal(err)
+	}
+	s.seedFindingQualitySchema()
+	s.seedFindingQualitySchema()
+	after, err := pg.GetTool("report_finding")
+	if err != nil || after == nil {
+		t.Fatal(err)
+	}
+	if after.Enabled || after.Description != "USER DESCRIPTION" || len(after.Agents) != 1 || after.Agents[0] != "worker" {
+		t.Fatal("migration overwrote user tool configuration")
+	}
+	if err := json.Unmarshal(after.Schema, &schema); err != nil {
+		t.Fatal(err)
+	}
+	properties = objectProperty(schema, "properties")
+	summary, _ := properties["summary"].(map[string]any)
+	if summary["description"] != "USER SUMMARY" || properties["validation"] == nil || properties["learning"] == nil {
+		t.Fatal("migration lost custom description or missing quality parameters")
+	}
+	required, _ = schema["required"].([]any)
+	count := 0
+	for _, item := range required {
+		if item == "validation" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("validation requirement repeated or absent: %d", count)
+	}
+}
+
 func TestFindingWorkflowReporterBindsBeforeWritingReport(t *testing.T) {
 	s, f, request := trafficEvidenceServer(t)
 	pg := s.m.pg
@@ -315,7 +399,7 @@ func TestFindingWorkflowReporterBindsBeforeWritingReport(t *testing.T) {
 	}
 	off, offDef, closeOff := agent.AugmentTools(ctx, "reporter", nil)
 	defer closeOff()
-	if !strings.Contains(offDef.FindingGuidance, "HTTP 报告复现格式") || strings.Contains(offDef.FindingGuidance, "报告前自动关联流量") {
+	if !strings.Contains(offDef.FindingGuidance, "报告交付格式") || strings.Contains(offDef.FindingGuidance, "报告前自动关联流量") {
 		t.Fatal("off reporter lost report guidance or still receives auto-binding guidance")
 	}
 	for _, tool := range off {

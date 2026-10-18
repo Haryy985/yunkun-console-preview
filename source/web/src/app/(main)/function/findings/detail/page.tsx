@@ -9,6 +9,8 @@ import { ArrowLeftIcon, ArrowUpRightIcon, ShieldAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { CopyButton } from "@/components/copy-button";
+import { FindingQualityPanel } from "@/components/finding-quality-panel";
+import { FindingReportView } from "@/components/finding-report-view";
 import { FindingRetestPanel } from "@/components/finding-retest-panel";
 import { FindingTrafficPanel } from "@/components/finding-traffic-panel";
 import { Markdown } from "@/components/markdown";
@@ -153,6 +155,7 @@ function FindingDetailInner() {
         </div>
         <TabsList>
           <TabsTrigger value="overview">概览</TabsTrigger>
+          <TabsTrigger value="report">报告</TabsTrigger>
           <TabsTrigger value="lineage">链路图</TabsTrigger>
         </TabsList>
       </header>
@@ -172,6 +175,12 @@ function FindingDetailInner() {
                   <p className="text-sm leading-relaxed whitespace-pre-wrap">{finding.summary || "（无摘要）"}</p>
                 </CardContent>
               </Card>
+              <FindingQualityPanel
+                findingId={id}
+                quality={finding.quality}
+                inherited={finding.inherited ?? false}
+                onChanged={load}
+              />
               <FindingRetestPanel key={id} findingId={id} readOnly={finding.inherited} onCompleted={load} />
               <Card>
                 <CardHeader>
@@ -323,6 +332,10 @@ function FindingDetailInner() {
               </CardContent>
             </Card>
           </div>
+        </TabsContent>
+
+        <TabsContent value="report" className="mt-0">
+          <FindingReportView finding={finding} contextTask={contextTaskId || undefined} />
         </TabsContent>
 
         {/* 链路图：从任务初始节点回溯到本漏洞节点的攻击链路 */}

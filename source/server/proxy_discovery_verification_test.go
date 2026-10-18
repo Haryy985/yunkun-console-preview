@@ -61,7 +61,7 @@ func TestDiscoveryAdmissionRechecksPoolConfiguration(t *testing.T) {
 				t.Fatal(err)
 			}
 			sourceID, err := s.m.pg.SaveProxyDiscoverySource(0, "quake", "recheck fixture", "fixture",
-				"127.0.0.1", "http://source-check.invalid/ip", sealed, 20)
+				"127.0.0.1", "http://source-check.invalid/ip", sealed, 100)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -155,7 +155,7 @@ func TestDiscoveryBatchVerificationPersistsSafeFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 	sourceID, err := s.m.pg.SaveProxyDiscoverySource(0, "quake", "batch failure fixture", "fixture",
-		"127.0.0.1", "http://echo.invalid/ip?key=private-target-key", sealed, 20)
+		"127.0.0.1", "http://echo.invalid/ip?key=private-target-key", sealed, 100)
 	if err != nil {
 		t.Fatal(err)
 	}

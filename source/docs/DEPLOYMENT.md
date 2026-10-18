@@ -11,7 +11,7 @@ Windows x64 全新安装增加 `setup-and-start.bat` 双击入口，自动下载
 - 编译：Go 1.26.3 或兼容工具链、Node.js 22/npm，以及下载 Go/npm 依赖所需的网络。Linux/macOS 使用 `build.sh` 时还需 Bash 和 rsync。
 - 运行：PostgreSQL 服务，可以在本机或受控远程服务器；执行文件旁的配置和数据目录须可写。已内嵌前端的程序不需要 Node.js 来托管界面。
 - 任务工具：Python、浏览器及相关命令行工具不是控制台启动的前提，但使用对应 Agent 工具时必须另行安装和配置。
-- 本包不含真实密钥、数据库、登录密码、业务数据、已安装 Skills 或预编译程序。模型、知识库、代理来源及第三方 API 需要自行配置。
+- 本源码不含真实密钥、数据库、登录密码、业务数据或预编译程序，附带公开 Skills 工作流资料。模型、知识库、代理来源及第三方 API 需要自行配置。
 
 原生启动不提供容器隔离。Agent 调用的本机工具继承运行账号的文件和网络权限，建议使用专用低权限账号和独立测试环境，仅对已授权目标执行任务；代理配置不等于强制网络隔离。
 
@@ -50,7 +50,7 @@ try {
     Pop-Location
 }
 
-$assetDir = Join-Path (Get-Location).Path 'server\webui\dist'
+$assetDir = Join-Path (Get-Location).Path 'server\webui\current'
 if (Test-Path -LiteralPath $assetDir) {
     throw 'Static asset destination already exists; preserve or clean previous generated files before retrying.'
 }
@@ -117,7 +117,7 @@ Linux / macOS：
 ## 常见问题
 
 - 数据源不可用：先检查 PostgreSQL 是否启动，以及配置中实际端口、角色、密码和库名；运行进程存在不代表数据库就绪。
-- 页面缺失：检查前端是否成功导出，资源内容是否放在 `server/webui/dist`，Go 是否带 `-tags embedui` 重新编译。
+- 页面缺失：检查前端是否成功导出，资源内容是否放在 `server/webui/current`，Go 是否带 `-tags embedui` 重新编译。
 - 功能缺失：确认 Skills、模型、第三方密钥和工具依赖已配置。控制台不自动提供这些外部能力。
 - 忘记管理员密码：已登录时优先使用界面改密；Bash 环境可使用 `bash reset-password.sh --config config.json`，需要本机 psql，使用脚本读取 JSON 时建议安装 Python 3。脚本使用 pgcrypto 生成哈希，需要该扩展及相应权限；重置前核实目标库，勿误改业务账号。
 - 升级旧安装：先读 `migration/README.md`，停机备份和迁移后再切换，不要将此手册当成覆盖升级命令。

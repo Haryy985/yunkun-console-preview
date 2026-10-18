@@ -31,6 +31,22 @@ CREATE TABLE IF NOT EXISTS auth_users (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Access metadata only; do not record credentials, packets or report content.
+CREATE TABLE IF NOT EXISTS confidential_access_events (
+    id BIGSERIAL PRIMARY KEY,
+    actor_id BIGINT,
+    actor_name TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('view','download','export')),
+    resource TEXT NOT NULL CHECK (resource IN ('finding_evidence','finding_report')),
+    finding_id BIGINT,
+    finding_ids BIGINT[] NOT NULL DEFAULT '{}',
+    detail TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE confidential_access_events ADD COLUMN IF NOT EXISTS finding_ids BIGINT[] NOT NULL DEFAULT '{}';
+CREATE INDEX IF NOT EXISTS idx_confidential_access_events_created
+    ON confidential_access_events(id DESC);
+
 -- =====================================================================
 -- A. 资产层：companies / assets / company_scope
 -- =====================================================================
@@ -775,6 +791,30 @@ CREATE INDEX IF NOT EXISTS idx_ts_domain  ON task_scope(domain) WHERE kind IN ('
 CREATE INDEX IF NOT EXISTS idx_ts_net     ON task_scope USING GIST(net inet_ops) WHERE kind IN ('ip','cidr');
 CREATE INDEX IF NOT EXISTS idx_ts_company ON task_scope(company_id) WHERE kind = 'company';
 
+-- Target-profile observations are evidence notes, never authorization edges.
+-- Removing a scope leaves its historical observations visible but unbound.
+CREATE TABLE IF NOT EXISTS task_target_profile_entries (
+    id             BIGSERIAL PRIMARY KEY,
+    task_id        BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    scope_id       BIGINT REFERENCES task_scope(id) ON DELETE SET NULL,
+    kind           TEXT NOT NULL CHECK (kind IN
+                   ('host','application','route_family','identity','tenant','technology',
+                    'data_class','trust_boundary','exclusion','open_question')),
+    label          TEXT NOT NULL CHECK (char_length(label) BETWEEN 1 AND 240),
+    evidence_kind  TEXT NOT NULL CHECK (evidence_kind IN ('observed','inferred')),
+    source_node_id BIGINT REFERENCES exploration_nodes(id) ON DELETE SET NULL,
+    source_summary TEXT NOT NULL CHECK (char_length(source_summary) BETWEEN 1 AND 300),
+    source_query   TEXT NOT NULL DEFAULT '' CHECK (char_length(source_query) <= 200),
+    confidence     INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
+    dedupe_key     TEXT NOT NULL CHECK (char_length(dedupe_key) = 64),
+    observed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_task_target_profile_page
+    ON task_target_profile_entries(task_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_task_target_profile_dedupe
+    ON task_target_profile_entries(task_id, dedupe_key);
+
 -- =====================================================================
 -- E. Agents / 提示词模板 / 变量目录
 -- =====================================================================
@@ -1157,6 +1197,65 @@ CREATE TRIGGER trg_conversation_retest_delete BEFORE DELETE ON conversations
 
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS evidence_version BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report_evidence_version BIGINT NOT NULL DEFAULT 0;
+
+-- Quality is separate from triage status: records can remain available for
+-- investigation without being eligible for a formal report.
+CREATE TABLE IF NOT EXISTS finding_quality (
+    finding_id BIGINT PRIMARY KEY REFERENCES findings(id) ON DELETE CASCADE,
+    quality_status TEXT NOT NULL DEFAULT 'NEEDS_MORE'
+        CHECK (quality_status IN ('PASS','NEEDS_MORE','DOWNGRADE','DUPLICATE_RISK','BLOCKED')),
+    vulnerability_type TEXT NOT NULL DEFAULT '',
+    verification_type TEXT NOT NULL DEFAULT '',
+    baseline_evidence TEXT NOT NULL DEFAULT '',
+    proof_evidence TEXT NOT NULL DEFAULT '',
+    verification_evidence TEXT NOT NULL DEFAULT '',
+    verification_rationale TEXT NOT NULL DEFAULT '',
+    reproduction_count INTEGER NOT NULL DEFAULT 0 CHECK (reproduction_count >= 0),
+    success_count INTEGER NOT NULL DEFAULT 0 CHECK (success_count >= 0),
+    blocking_reason TEXT NOT NULL DEFAULT '',
+    duplicate_risk TEXT NOT NULL DEFAULT '',
+    evidence_integrity TEXT NOT NULL DEFAULT '',
+    reviewer TEXT NOT NULL DEFAULT '',
+    reviewed_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_finding_quality_status
+    ON finding_quality (quality_status, updated_at DESC);
+ALTER TABLE finding_quality ADD COLUMN IF NOT EXISTS verification_rationale TEXT NOT NULL DEFAULT '';
+
+CREATE OR REPLACE FUNCTION invalidate_finding_quality_on_severity_change() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE finding_quality
+       SET quality_status='NEEDS_MORE', reviewer='', reviewed_at=NULL,
+           blocking_reason='严重等级发生变化，需要重新审核', updated_at=now()
+     WHERE finding_id=NEW.id AND quality_status='PASS';
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_finding_quality_severity_change ON findings;
+CREATE TRIGGER trg_finding_quality_severity_change
+AFTER UPDATE OF severity ON findings
+FOR EACH ROW WHEN (OLD.severity IS DISTINCT FROM NEW.severity)
+EXECUTE FUNCTION invalidate_finding_quality_on_severity_change();
+
+-- Existing installations predate the quality table. Seed conservative,
+-- review-required rows so their detail pages can be reviewed immediately;
+-- never promote historical findings to PASS automatically.
+INSERT INTO finding_quality
+    (finding_id, quality_status, vulnerability_type, proof_evidence,
+     blocking_reason, evidence_integrity)
+SELECT f.id,
+       CASE WHEN f.severity = 'low' THEN 'DOWNGRADE' ELSE 'NEEDS_MORE' END,
+       COALESCE(f.vulnclass, ''),
+       COALESCE(f.evidence, ''),
+       CASE WHEN f.severity = 'low'
+            THEN '低危记录不进入中危及以上正式报告'
+            ELSE '历史记录需要人工审核' END,
+       CASE WHEN COALESCE(f.evidence, '') = ''
+            THEN 'incomplete' ELSE 'text_evidence' END
+FROM findings f
+ON CONFLICT (finding_id) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS traffic_evidence_snapshots (
     id TEXT PRIMARY KEY,
@@ -1776,7 +1875,9 @@ CREATE TABLE IF NOT EXISTS proxy_discovery_sources (
     query TEXT NOT NULL,
     authorized_scope TEXT NOT NULL DEFAULT '',
     verify_url TEXT NOT NULL DEFAULT '',
-    fetch_limit INTEGER NOT NULL DEFAULT 100 CHECK (fetch_limit BETWEEN 1 AND 100),
+    fetch_limit INTEGER NOT NULL DEFAULT 100 CHECK (fetch_limit BETWEEN 100 AND 1000),
+    next_offset INTEGER NOT NULL DEFAULT 0,
+    exhausted BOOLEAN NOT NULL DEFAULT false,
     enabled BOOLEAN NOT NULL DEFAULT true,
     credentials TEXT NOT NULL DEFAULT '',
     last_run_at TIMESTAMPTZ,
@@ -1786,9 +1887,11 @@ CREATE TABLE IF NOT EXISTS proxy_discovery_sources (
 );
 ALTER TABLE proxy_discovery_sources ADD COLUMN IF NOT EXISTS verify_url TEXT NOT NULL DEFAULT '';
 ALTER TABLE proxy_discovery_sources ADD COLUMN IF NOT EXISTS fetch_limit INTEGER NOT NULL DEFAULT 100;
-UPDATE proxy_discovery_sources SET fetch_limit=100 WHERE fetch_limit IS NULL OR fetch_limit<1 OR fetch_limit>100;
 ALTER TABLE proxy_discovery_sources DROP CONSTRAINT IF EXISTS proxy_discovery_sources_fetch_limit_check;
-ALTER TABLE proxy_discovery_sources ADD CONSTRAINT proxy_discovery_sources_fetch_limit_check CHECK (fetch_limit BETWEEN 1 AND 100);
+UPDATE proxy_discovery_sources SET fetch_limit=100 WHERE fetch_limit IS NULL OR fetch_limit<100 OR fetch_limit>1000;
+ALTER TABLE proxy_discovery_sources ADD CONSTRAINT proxy_discovery_sources_fetch_limit_check CHECK (fetch_limit BETWEEN 100 AND 1000);
+ALTER TABLE proxy_discovery_sources ADD COLUMN IF NOT EXISTS next_offset INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE proxy_discovery_sources ADD COLUMN IF NOT EXISTS exhausted BOOLEAN NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS idx_proxy_discovery_sources_provider ON proxy_discovery_sources(provider, enabled);
 
 CREATE TABLE IF NOT EXISTS proxy_discovery_results (

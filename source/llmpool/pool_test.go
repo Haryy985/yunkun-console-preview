@@ -110,6 +110,16 @@ func TestFailoverOnNoCredit(t *testing.T) {
 	}
 }
 
+func TestFailoverAfterStartOnly(t *testing.T) {
+	a := &fakeProv{events: [][]llm.StreamEvent{{{Type: llm.SEMessageStart}}}, errs: []error{errors.New("openai: status 503: unavailable")}}
+	b := okProv("b", "recovered")
+	p := New([]*Member{member(1, "a", 10, a), member(2, "b", 5, b)}, NewRegistry(nil, nil))
+	got, err := drain(p.Stream(context.Background(), llm.CompletionRequest{}))
+	if err != nil || got != "recovered" || b.calls != 1 {
+		t.Fatalf("got=%q err=%v backup calls=%d", got, err, b.calls)
+	}
+}
+
 // A 402 is deterministic: one failure must open the breaker, so the NEXT request
 // skips that profile entirely instead of paying for another round-trip.
 func TestHardFailureTripsBreakerImmediately(t *testing.T) {

@@ -77,11 +77,11 @@ func FindingsMarkdown(fs []*db.DBFinding, generatedAt time.Time, requests ...map
 			fmt.Fprintf(&b, "%s\n\n", s)
 		}
 		if e := strings.TrimSpace(f.Evidence); e != "" {
-			fmt.Fprintf(&b, "**证据：**\n\n```\n%s\n```\n\n", e)
+			b.WriteString(findingEvidenceMarkdown(e))
 		}
 		if rep := strings.TrimSpace(f.Report); rep != "" {
 			b.WriteString("**详细报告：**\n\n")
-			b.WriteString(rep)
+			b.WriteString(reportBodyForExport(rep))
 			b.WriteString("\n\n")
 		}
 		b.WriteString(findingTrafficMarkdown(f, false, firstRequests(requests)))
@@ -93,30 +93,76 @@ func FindingsMarkdown(fs []*db.DBFinding, generatedAt time.Time, requests ...map
 // SingleFindingMarkdown 渲染单条漏洞为一份独立 Markdown(用于「一漏洞一文件」打包)。
 func SingleFindingMarkdown(f *db.DBFinding, generatedAt time.Time, requests ...map[int64]RequestPacket) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "# [%s] %s\n\n", strings.ToUpper(nz(f.Severity, "info")), findingTitle(f))
-	if f.VulnClass != "" {
-		fmt.Fprintf(&b, "- **类别**：%s\n", f.VulnClass)
-	}
-	fmt.Fprintf(&b, "- **严重等级**：%s\n", nz(f.Severity, "info"))
+	fmt.Fprintf(&b, "# %s\n\n", findingTitle(f))
+	fmt.Fprintf(&b, "- **所属项目**：%s\n", nz(f.TaskDescription, "未记录"))
+	fmt.Fprintf(&b, "- **测试目标**：%s\n", findingLocation(f))
+	fmt.Fprintf(&b, "- **漏洞名称**：%s\n", findingTitle(f))
+	fmt.Fprintf(&b, "- **漏洞位置**：%s\n", findingLocation(f))
+	fmt.Fprintf(&b, "- **漏洞分类**：%s\n", nz(f.VulnClass, "未分类"))
+	fmt.Fprintf(&b, "- **所处阶段**：%s\n", "未记录")
+	fmt.Fprintf(&b, "- **风险等级**：%s（以人工审核结果为准）\n", nz(f.Severity, "待定"))
 	fmt.Fprintf(&b, "- **状态**：%s\n", nz(f.Status, "pending"))
-	if desc := strings.TrimSpace(f.TaskDescription); desc != "" {
-		fmt.Fprintf(&b, "- **所属任务**：%s\n", desc)
-	}
 	fmt.Fprintf(&b, "- **发现时间**：%s\n", f.CreatedAt.Format("2006-01-02 15:04:05"))
 	fmt.Fprintf(&b, "- **生成时间**：%s\n\n", generatedAt.Format("2006-01-02 15:04:05"))
-	if s := strings.TrimSpace(f.Summary); s != "" {
-		fmt.Fprintf(&b, "## 概述\n\n%s\n\n", s)
-	}
+	fmt.Fprintf(&b, "## 漏洞描述\n\n%s\n\n", nz(f.Summary, "尚无描述，需补充经验证的影响。"))
+	b.WriteString("## 复现过程与证据\n\n")
 	if e := strings.TrimSpace(f.Evidence); e != "" {
-		fmt.Fprintf(&b, "## 证据\n\n```\n%s\n```\n\n", e)
+		b.WriteString(findingEvidenceMarkdown(e))
 	}
-	if rep := strings.TrimSpace(f.Report); rep != "" {
-		b.WriteString("## 详细报告\n\n")
-		b.WriteString(rep)
-		b.WriteString("\n")
+	if len(f.TrafficBindings) == 0 {
+		b.WriteString("未绑定经核实的 HTTP 请求包；非 HTTP 漏洞请参照实际命令与结果，HTTP 漏洞需补充原始请求和响应后再提交复现。\n\n")
 	}
 	b.WriteString(findingTrafficMarkdown(f, true, firstRequests(requests)))
+	if rep := strings.TrimSpace(f.Report); rep != "" {
+		if !strings.HasPrefix(rep, "#") {
+			b.WriteString("## 详细分析与修复建议\n\n")
+		}
+		b.WriteString(reportBodyForExport(rep))
+		b.WriteString("\n\n")
+	} else {
+		b.WriteString("## 修复建议\n\n待依据实际根因与影响补充。\n\n")
+	}
 	return b.String()
+}
+
+func findingEvidenceMarkdown(evidence string) string {
+	text := redactCurlLines(evidence)
+	fence := "```"
+	for strings.Contains(text, fence) {
+		fence += "`"
+	}
+	return fmt.Sprintf("**原始验证记录（不等同于 HTTP 请求包）：**\n\n%s\n%s\n%s\n\n", fence, text, fence)
+}
+
+func reportBodyForExport(body string) string {
+	return redactCurlLines(body)
+}
+
+func redactCurlLines(text string) string {
+	if !ContainsCurlCommand(text) {
+		return text
+	}
+	lines := strings.Split(text, "\n")
+	const notice = "[旧版 curl 命令已从交付报告省略；请绑定实际 HTTP 请求包]"
+	continuation := false
+	for i, line := range lines {
+		if continuation || ContainsCurlCommand(line) {
+			continuation = strings.HasSuffix(strings.TrimSpace(line), "\\") ||
+				strings.HasSuffix(strings.TrimSpace(line), "`") ||
+				strings.HasSuffix(strings.TrimSpace(line), "^")
+			lines[i] = notice
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func findingLocation(f *db.DBFinding) string {
+	for _, binding := range f.TrafficBindings {
+		if url := strings.TrimSpace(binding.Snapshot.URL); url != "" {
+			return url
+		}
+	}
+	return "未记录具体 URL 或端口"
 }
 
 var unsafeFilenameChars = regexp.MustCompile(`[^\p{Han}\p{L}\p{N}._-]+`)

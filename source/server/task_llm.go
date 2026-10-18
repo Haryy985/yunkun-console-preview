@@ -16,6 +16,7 @@ import (
 	"github.com/Autumn-27/norma/transcript"
 	"yunkun/console/agent"
 	"yunkun/console/db"
+	"yunkun/console/llmpool"
 	"yunkun/console/llmrec"
 )
 
@@ -128,7 +129,7 @@ func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 	}
 	if len(pt.LLMProfileIDs) > 0 {
 		if pt.ActiveLLMProfileID == nil {
-			return sel, &taskLLMError{taskID: r.taskID, chainExhausted: true, cause: errors.New("all selected profiles are quota exhausted")}
+			return sel, &taskLLMError{taskID: r.taskID, chainExhausted: true, cause: errors.New("all selected LLM profiles are unavailable")}
 		}
 		sel.profileID = *pt.ActiveLLMProfileID
 		prov, cfg, ok := r.s.providerForProfile(sel.profileID)
@@ -458,8 +459,8 @@ func isRetryableStreamError(err error) bool {
 // CompactionWindow mirrors current()'s precedence so the context window always
 // matches the provider the role will actually stream on.
 func (r *taskLLMRuntime) CompactionWindow() int {
-	if _, cfg, ok := r.s.agentBindingProvider(r.agentKey); ok {
-		return cfg.CompactionWindow()
+	if prov, cfg, ok := r.s.agentBindingProvider(r.agentKey); ok {
+		return providerCompactionWindow(prov, cfg)
 	}
 	taskNum, err := parseTaskID(r.taskID)
 	if err != nil {
@@ -470,8 +471,8 @@ func (r *taskLLMRuntime) CompactionWindow() int {
 		return (agent.Config{}).CompactionWindow()
 	}
 	if len(chain) == 0 {
-		if _, cfg, ok := r.s.globalProvider(); ok {
-			return cfg.CompactionWindow()
+		if prov, cfg, ok := r.s.globalProvider(); ok {
+			return providerCompactionWindow(prov, cfg)
 		}
 		return (agent.Config{}).CompactionWindow()
 	}
@@ -488,6 +489,22 @@ func (r *taskLLMRuntime) CompactionWindow() int {
 		return (agent.Config{}).CompactionWindow()
 	}
 	return minimum
+}
+
+// A failover pool can route a later turn to a smaller model. Compact against
+// the smallest usable member before that switch, not just the initial profile.
+func providerCompactionWindow(prov llm.Provider, cfg agent.Config) int {
+	window := cfg.CompactionWindow()
+	pool, ok := prov.(*llmpool.Pool)
+	if !ok {
+		return window
+	}
+	for _, member := range pool.Members() {
+		if member.WindowTokens > 0 && member.WindowTokens < window {
+			window = member.WindowTokens
+		}
+	}
+	return window
 }
 
 // agentBindingProvider resolves the profile a role is explicitly bound to
@@ -632,7 +649,7 @@ func (s *Server) emitTaskLLMTransition(t *Task, transition db.TaskLLMTransition,
 	}
 	mode := "automatic"
 	kind := "llm_switch"
-	summary := fmt.Sprintf("%s 额度不足", llmAuditProfileLabel(previous))
+	summary := fmt.Sprintf("%s %s", llmAuditProfileLabel(previous), taskLLMFailureLabel(cause))
 	if transition.NextProfileID != nil {
 		summary += fmt.Sprintf("，后续调用切换到 %s", llmAuditProfileLabel(next))
 	} else {
@@ -645,6 +662,13 @@ func (s *Server) emitTaskLLMTransition(t *Task, transition db.TaskLLMTransition,
 	}})
 	s.engine.emitActivity(t, db.Activity{Worker: "system", Kind: kind, IsError: transition.ChainExhausted, Summary: summary, Detail: cause.Error(), Metadata: metadata})
 	log.Printf("[llm-failover] task %s: %s", t.ID, summary)
+}
+
+func taskLLMFailureLabel(cause error) string {
+	if cause != nil && strings.Contains(strings.ToLower(cause.Error()), `"code":"subscription_not_found"`) {
+		return "模型分组无有效订阅"
+	}
+	return "额度不足"
 }
 
 func (s *Server) llmAuditProfile(id int64) *llmAuditProfile {

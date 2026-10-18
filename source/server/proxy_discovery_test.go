@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/url"
@@ -40,10 +41,10 @@ func TestQuakeDiscoveryUsesServiceProtocol(t *testing.T) {
 					return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(payload)), Header: make(http.Header)}, nil
 				}),
 			}}}
-			results, err := s.fetchQuake(context.Background(), &db.ProxyDiscoverySource{ID: 9, AuthorizedScope: "203.0.113.0/24"},
+			results, fetched, err := s.fetchQuake(context.Background(), &db.ProxyDiscoverySource{ID: 9, AuthorizedScope: "203.0.113.0/24"},
 				proxypool.Secrets{APIValue: `{"key":"fixture"}`})
-			if err != nil || len(results) != 1 {
-				t.Fatalf("fetch results: %#v %v", results, err)
+			if err != nil || len(results) != 1 || fetched != 1 {
+				t.Fatalf("fetch results: %#v fetched=%d %v", results, fetched, err)
 			}
 			got := results[0]
 			if got.Protocol != test.want || got.Address != test.want+"://203.0.113.7:1080" {
@@ -54,7 +55,7 @@ func TestQuakeDiscoveryUsesServiceProtocol(t *testing.T) {
 }
 
 func TestDiscoveryFetchLimitUsesConfiguredValueAndDefault(t *testing.T) {
-	if got := discoveryFetchLimit(&db.ProxyDiscoverySource{FetchLimit: 17}); got != 17 {
+	if got := discoveryFetchLimit(&db.ProxyDiscoverySource{FetchLimit: 1000}); got != 1000 {
 		t.Fatalf("configured fetch limit: got %d", got)
 	}
 	for _, source := range []*db.ProxyDiscoverySource{
@@ -66,6 +67,40 @@ func TestDiscoveryFetchLimitUsesConfiguredValueAndDefault(t *testing.T) {
 		if got := discoveryFetchLimit(source); got != defaultProxyDiscoveryFetchLimit {
 			t.Fatalf("default fetch limit for %#v: got %d", source, got)
 		}
+	}
+}
+
+func TestDiscoveryProviderOffsets(t *testing.T) {
+	for _, provider := range []string{"fofa", "quake"} {
+		t.Run(provider, func(t *testing.T) {
+			s := &Server{proxyDiscovery: &proxyDiscoveryService{client: &http.Client{
+				Transport: discoveryProtocolTransport(func(r *http.Request) (*http.Response, error) {
+					if provider == "fofa" {
+						if r.URL.Query().Get("page") != "3" || r.URL.Query().Get("size") != "100" {
+							t.Errorf("incorrect FOFA pagination: %s", r.URL)
+						}
+						return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"results":[["host","203.0.113.7",1080,"socks5"]]}`))}, nil
+					}
+					var body struct{ Start, Size int }
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Start != 200 || body.Size != 100 {
+						t.Errorf("incorrect Quake pagination: %+v %v", body, err)
+					}
+					return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"data":[{"ip":"203.0.113.7","port":1080}]}`))}, nil
+				}),
+			}}}
+			source := &db.ProxyDiscoverySource{Provider: provider, Query: "fixture", FetchLimit: 100, NextOffset: 200}
+			secrets := proxypool.Secrets{APIValue: `{"email":"fixture@example.invalid","key":"fixture"}`}
+			var count int
+			var err error
+			if provider == "fofa" {
+				_, count, err = s.fetchFOFA(context.Background(), source, secrets)
+			} else {
+				_, count, err = s.fetchQuake(context.Background(), source, secrets)
+			}
+			if err != nil || count != 1 {
+				t.Fatalf("fetch: count=%d err=%v", count, err)
+			}
+		})
 	}
 }
 

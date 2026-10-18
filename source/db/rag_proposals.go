@@ -6,9 +6,29 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
+
+var ragProposalSecretPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?im)\bauthorization\s*[:=]\s*(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}`),
+	regexp.MustCompile(`(?im)\bcookie\s*[:=]\s*[^;\r\n]{8,}`),
+	regexp.MustCompile(`(?im)\b(?:password|passwd|client_secret|api[_-]?key|access[_-]?token|refresh[_-]?token)\s*[:=]\s*["']?[A-Za-z0-9._~+/=-]{8,}`),
+	regexp.MustCompile(`(?i)https?://[^/\s:@]{1,64}:[^/\s@]{4,}@`),
+}
+
+var ragProposalPlaceholderPattern = regexp.MustCompile(`(?i)<(?:redacted|captured[^>]*|omitted|placeholder)[^>]*>`)
+
+func containsRAGProposalSecret(value string) bool {
+	value = strings.TrimSpace(ragProposalPlaceholderPattern.ReplaceAllString(value, ""))
+	for _, pattern := range ragProposalSecretPatterns {
+		if pattern.MatchString(value) {
+			return true
+		}
+	}
+	return false
+}
 
 var (
 	ErrRAGProposalInvalid  = errors.New("invalid RAG proposal")
@@ -60,6 +80,9 @@ func (d *DB) CreateRAGProposal(p RAGChangeProposal) (*RAGChangeProposal, error) 
 		(p.Kind == "create" && p.TargetDocumentID != nil) ||
 		(p.Kind == "update" && (p.TargetDocumentID == nil || *p.TargetDocumentID <= 0)) {
 		return nil, ErrRAGProposalInvalid
+	}
+	if containsRAGProposalSecret(p.Content) || containsRAGProposalSecret(p.Rationale) || containsRAGProposalSecret(p.SourceRef) {
+		return nil, fmt.Errorf("%w: proposal contains credential-like data; remove secrets before submission", ErrRAGProposalInvalid)
 	}
 	tx, err := d.Begin()
 	if err != nil {

@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -75,10 +76,23 @@ func (s *Server) chatUpload(w http.ResponseWriter, r *http.Request) {
 		defer s.engine.decInflight(id)
 	}
 	dir := filepath.Join(s.m.dir, sub, id, "uploads")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	root, err := s.wsRoot()
+	if err != nil {
+		writeErr(w, 500, "打开工作区失败: "+err.Error())
+		return
+	}
+	defer root.Close()
+	dirName := filepath.Join(sub, id, "uploads")
+	if err := root.MkdirAll(dirName, 0o755); err != nil {
 		writeErr(w, 500, "建目录失败: "+err.Error())
 		return
 	}
+	uploads, err := root.OpenRoot(dirName)
+	if err != nil {
+		writeErr(w, 500, "打开上传目录失败: "+err.Error())
+		return
+	}
+	defer uploads.Close()
 	r.Body = http.MaxBytesReader(w, r.Body, maxChatUpload)
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		writeErr(w, 400, "解析上传失败或超出大小限制: "+err.Error())
@@ -95,32 +109,32 @@ func (s *Server) chatUpload(w http.ResponseWriter, r *http.Request) {
 		if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
 			continue
 		}
-		dest := uniqueUploadPath(dir, name)
-		if err := saveUpload(hdr, dest); err != nil {
+		base, err := saveUniqueChatUpload(uploads, name, hdr)
+		if err != nil {
 			writeErr(w, 500, "保存失败: "+err.Error())
 			return
 		}
-		base := filepath.Base(dest)
+		dest := filepath.Join(dir, base)
 		out = append(out, chatAttachment{Name: base, Path: "uploads/" + base, Size: hdr.Size, Abs: dest})
 	}
 	writeJSON(w, 200, map[string]any{"attachments": out})
 }
 
-// uniqueUploadPath returns dir/name, or dir/name-1, dir/name-2… when it already exists,
-// so re-uploading the same filename never clobbers a prior attachment.
-func uniqueUploadPath(dir, name string) string {
-	dest := filepath.Join(dir, name)
-	if _, err := os.Stat(dest); os.IsNotExist(err) {
-		return dest
-	}
+func saveUniqueChatUpload(root *os.Root, name string, hdr *multipart.FileHeader) (string, error) {
 	ext := filepath.Ext(name)
 	stem := strings.TrimSuffix(name, ext)
-	for i := 1; ; i++ {
-		cand := filepath.Join(dir, fmt.Sprintf("%s-%d%s", stem, i, ext))
-		if _, err := os.Stat(cand); os.IsNotExist(err) {
-			return cand
+	for i := 0; i < 10000; i++ {
+		candidate := name
+		if i > 0 {
+			candidate = fmt.Sprintf("%s-%d%s", stem, i, ext)
 		}
+		err := saveRootUpload(root, candidate, hdr, os.O_CREATE|os.O_EXCL|os.O_WRONLY)
+		if os.IsExist(err) {
+			continue
+		}
+		return candidate, err
 	}
+	return "", fmt.Errorf("too many attachments named %q", name)
 }
 
 // composeAgentMessage appends an attachment manifest to the user's message so the agent

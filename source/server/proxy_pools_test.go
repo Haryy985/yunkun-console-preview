@@ -57,6 +57,7 @@ func newProxyFixture(t *testing.T) *Server {
 	if err := s.initProxyPools(t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
+	s.initProxyDiscovery()
 	return s
 }
 
@@ -332,7 +333,7 @@ func TestProxyDiscoveryApprovalUsesResultSourceAndTargetPool(t *testing.T) {
 	}
 	sourceID, err := s.m.pg.SaveProxyDiscoverySource(
 		0, "fofa", "fixture source", `port="8080"`, "203.0.113.0/24",
-		"http://127.0.0.1:9/ip", cipher, 25,
+		"http://127.0.0.1:9/ip", cipher, 100,
 	)
 	if err != nil {
 		t.Fatal("source:", err)
@@ -411,7 +412,7 @@ func TestProxyDiscoverySourcePersistsFetchLimit(t *testing.T) {
 	s := newProxyFixture(t)
 	w := proxyAPICall(t, s, "POST", "/api/proxy-discovery/sources", map[string]any{
 		"provider": "quake", "name": "limited source", "query": `port:8080`,
-		"fetch_limit": 17,
+		"fetch_limit": 200,
 		"credentials": map[string]string{"key": "fixture-key"},
 	})
 	if w.Code != http.StatusOK {
@@ -427,14 +428,14 @@ func TestProxyDiscoverySourcePersistsFetchLimit(t *testing.T) {
 	if err != nil || source == nil {
 		t.Fatalf("read custom source: %v %#v", err, source)
 	}
-	if source.FetchLimit != 17 {
+	if source.FetchLimit != 200 {
 		t.Fatalf("custom fetch limit was not persisted: got %d", source.FetchLimit)
 	}
 }
 
 func TestProxyDiscoverySourceRejectsInvalidFetchLimit(t *testing.T) {
 	s := newProxyFixture(t)
-	for _, value := range []int{-1, 101} {
+	for _, value := range []int{-1, 99, 1001} {
 		w := proxyAPICall(t, s, "POST", "/api/proxy-discovery/sources", map[string]any{
 			"provider": "quake", "name": "invalid limit", "query": `port:8080`,
 			"fetch_limit": value,

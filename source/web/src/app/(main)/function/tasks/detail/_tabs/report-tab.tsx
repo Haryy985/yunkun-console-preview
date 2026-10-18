@@ -13,19 +13,24 @@ import { copyText } from "@/lib/utils";
 
 export function ReportTab({ taskId }: { taskId: string }) {
   const [report, setReport] = React.useState<string>("");
+  const [error, setError] = React.useState<string>("");
   const [loading, setLoading] = React.useState(true);
   const [copied, setCopied] = React.useState(false);
 
   React.useEffect(() => {
     let active = true;
     setLoading(true);
+    setError("");
     api
       .report(taskId)
       .then((text) => {
         if (active) setReport(text);
       })
-      .catch(() => {
-        if (active) setReport("");
+      .catch((reason) => {
+        if (active) {
+          setReport("");
+          setError((reason as Error).message);
+        }
       })
       .finally(() => {
         if (active) setLoading(false);
@@ -60,6 +65,12 @@ export function ReportTab({ taskId }: { taskId: string }) {
       <div className="max-h-[60vh] overflow-auto rounded-md border bg-muted/20 p-4">
         <Markdown text={report} />
       </div>
+    );
+  } else if (error) {
+    content = (
+      <p role="alert" className="py-8 text-center text-destructive text-sm">
+        {error}
+      </p>
     );
   } else {
     content = (

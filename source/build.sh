@@ -15,7 +15,7 @@
 #   YUNKUN_PACKAGE_DIR=dist            Directory for release archives.
 #   YUNKUN_COMPRESS=off                UPX mode: off, auto, or required.
 #   YUNKUN_UPX_ARGS="--best --lzma"    Arguments passed to UPX.
-#   YUNKUN_SKIP_FRONTEND=1             Reuse server/webui/dist (for CI artifact builds).
+#   YUNKUN_SKIP_FRONTEND=1             Reuse server/webui/current (for CI artifact builds).
 #   YUNKUN_SKIP_NPM_CI=1               Skip npm ci while rebuilding the frontend.
 #   YUNKUN_GOSUMDB=sum.golang.org      Go checksum database.
 set -euo pipefail
@@ -112,7 +112,7 @@ else
 fi
 
 if [ "${YUNKUN_SKIP_FRONTEND:-0}" = "1" ]; then
-  [ -d server/webui/dist ] || die "YUNKUN_SKIP_FRONTEND=1 但 server/webui/dist 不存在"
+  [ -d server/webui/current ] || die "YUNKUN_SKIP_FRONTEND=1 但 server/webui/current 不存在"
 else
   command -v npm >/dev/null 2>&1 || die "未检测到 npm（前端静态构建需要 Node.js/npm）"
   command -v rsync >/dev/null 2>&1 || die "未检测到 rsync"
@@ -121,9 +121,9 @@ else
     (cd web && npm ci)
   fi
   (cd web && npm run build:static)
-  info "同步前端资源到 server/webui/dist"
-  mkdir -p server/webui/dist
-  rsync -a --delete web/out/ server/webui/dist/
+  info "同步前端资源到 server/webui/current"
+  mkdir -p server/webui/current
+  rsync -a --delete web/out/ server/webui/current/
 fi
 
 compress_binary() {
@@ -183,7 +183,6 @@ package_binary() {
   cp -R skills "$package_root/"
   cp config.example.json "$package_root/"
   if [ -f README.md ]; then cp README.md "$package_root/"; fi
-  cp NATIVE_DEPLOYMENT.md "$package_root/"
   cp LICENSE YUNKUN_AUTHORIZATION.md "$package_root/"
   (cd "$YUNKUN_PACKAGE_DIR" && zip -q -r -9 "$(basename "$archive")" "$(basename "$package_root")")
   rm -rf "$package_root"

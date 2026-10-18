@@ -187,10 +187,10 @@ function Get-LocalDependency($Spec, [string]$Tools, [string]$Cache) {
 function Get-SourceFingerprint([string]$Root) {
     $files = @(
         Get-ChildItem -LiteralPath $Root -File |
-            Where-Object { $_.Name -in @('go.mod', 'go.sum', 'setup-and-start.ps1', 'setup-dependencies.json') }
+            Where-Object { $_.Name -in @('go.mod', 'go.sum', 'VERSION', 'setup-and-start.ps1', 'setup-dependencies.json') }
         foreach ($directory in @('agent', 'cmd', 'config', 'db', 'enrich', 'evidence', 'guard',
             'intercept', 'llmpool', 'llmrec', 'mcphttp', 'notify', 'proxypool', 'rag',
-            'report', 'server', 'sidequestion', 'traffic', 'web')) {
+            'report', 'selfupdate', 'server', 'sidequestion', 'traffic', 'web')) {
             # Enumerate one level at a time so node_modules is never traversed.
             $pending = New-Object 'Collections.Generic.Stack[string]'
             $pending.Push((Join-Path $Root $directory))
@@ -200,7 +200,9 @@ function Get-SourceFingerprint([string]$Root) {
                         throw "Source links are not supported: $($item.FullName)"
                     }
                     if ($item.PSIsContainer) {
-                        if ($item.Name -notin @('node_modules', '.next', 'out', 'dist', '.git')) {
+                        $generatedUI = $item.Parent.FullName -eq (Join-Path $Root 'server\webui') -and
+                            $item.Name -in @('current', 'release103')
+                        if ($item.Name -notin @('node_modules', '.next', 'out', 'dist', '.git') -and -not $generatedUI) {
                             $pending.Push($item.FullName)
                         }
                     } elseif ($item.Name -notin @('tsconfig.tsbuildinfo', 'next-env.d.ts') -and
@@ -421,7 +423,7 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'yunkun') \gexec
                 Invoke-LocalNative (Join-Path (Split-Path -Parent $node) 'npm.cmd') @('ci', '--no-audit', '--no-fund')
                 Invoke-LocalNative (Join-Path (Split-Path -Parent $node) 'npm.cmd') @('run', 'build:static')
             } finally { Pop-Location }
-            $assets = Assert-LocalPath $root (Join-Path $root 'server\webui\dist')
+            $assets = Assert-LocalPath $root (Join-Path $root 'server\webui\current')
             $export = Join-Path $root 'web\out'
             if (-not (Test-Path -LiteralPath (Join-Path $export 'index.html'))) { throw 'Static export has no index.html.' }
             if (Test-Path -LiteralPath $assets) { Remove-Item -LiteralPath $assets -Recurse -Force }
@@ -430,8 +432,16 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'yunkun') \gexec
                 Copy-Item -LiteralPath $_.FullName -Destination $assets -Recurse -Force
             }
             $candidate = Join-Path $script:LocalHome 'yunkun.build.exe'
+            $buildVersion = 'dev'
+            $versionPath = Join-Path $root 'VERSION'
+            if (Test-Path -LiteralPath $versionPath) {
+                $buildVersion = [IO.File]::ReadAllText($versionPath).Trim()
+                if ($buildVersion -notmatch '^v?\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$') {
+                    throw 'VERSION does not contain a valid release version.'
+                }
+            }
             Push-Location $root
-            try { Invoke-LocalNative $go @('build', '-tags', 'embedui', '-trimpath', '-o', $candidate, './cmd/yunkun') }
+            try { Invoke-LocalNative $go @('build', '-tags', 'embedui', '-trimpath', '-ldflags', "-X main.version=$buildVersion", '-o', $candidate, './cmd/yunkun') }
             finally { Pop-Location }
             if ((Get-SourceFingerprint $root) -ne $fingerprint) { throw 'Source changed during compilation. Retry after edits finish.' }
             Move-Item -LiteralPath $candidate -Destination $app -Force

@@ -23,6 +23,7 @@ func TestIsQuotaExhaustedMessage(t *testing.T) {
 		`RESOURCE_EXHAUSTED`,
 		`You exceeded your current quota, please check your plan and billing details.`,
 		`billing_not_active`,
+		`openai-responses: status 403: {"code":"SUBSCRIPTION_NOT_FOUND","message":"No active subscription found for this group"}`,
 		`credit balance is too low`,
 		`账户余额不足，请充值`,
 	}

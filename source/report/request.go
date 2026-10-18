@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 	"unicode/utf8"
 
@@ -12,6 +13,12 @@ import (
 )
 
 const maxInlineRequestBody = 16 * 1024
+
+var curlCommand = regexp.MustCompile(`(?im)^\s*(?:\$\s*)?curl(?:\.exe)?\s`)
+
+func ContainsCurlCommand(text string) bool {
+	return curlCommand.MatchString(text)
+}
 
 type RequestPacket struct {
 	Text   string
@@ -41,7 +48,7 @@ func ReadRequestPacket(store requestBodyStore, snapshot db.TrafficEvidenceSnapsh
 	if snapshot.ReqLen > maxInlineRequestBody {
 		return RequestPacket{Reason: fmt.Sprintf("请求正文 %d 字节，超过报告内嵌上限；请从证据 ZIP 下载完整 request.http", snapshot.ReqLen)}, nil
 	}
-	f, _, err := store.OpenBody(snapshot, "request")
+	f, size, err := store.OpenBody(snapshot, "request")
 	if err != nil {
 		return RequestPacket{}, err
 	}
@@ -52,6 +59,9 @@ func ReadRequestPacket(store requestBodyStore, snapshot db.TrafficEvidenceSnapsh
 	}
 	if len(body) > maxInlineRequestBody {
 		return RequestPacket{Reason: "请求正文超过报告内嵌上限；请从证据 ZIP 下载完整 request.http"}, nil
+	}
+	if int64(len(body)) != snapshot.ReqLen || int64(len(body)) != size {
+		return RequestPacket{Reason: "保存的请求正文长度与证据记录不符，无法提供完整 HTTP 请求包"}, nil
 	}
 	if !utf8.Valid(body) || bytes.IndexByte(body, 0) >= 0 {
 		return RequestPacket{Reason: "请求含二进制正文；请从证据 ZIP 下载完整 request.http"}, nil

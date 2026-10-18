@@ -44,6 +44,9 @@ web/next-env.d.ts
 !/docs/DEPLOYMENT.md
 !/docs/WINDOWS.md
 !/docs/agent-reliability-2026-10-16.md
+!/docs/RELEASE_1.0.3.md
+!/docs/RELEASE_1.0.3_ACCEPTANCE.md
+!/docs/AGENT_SKILL_GO_PORT.md
 !/docs/upstream-README.md
 !/docs/ui-layout-review/
 /docs/ui-layout-review/*
@@ -65,6 +68,8 @@ Thumbs.db
 /*.failed
 /*.upgrade.json
 /server/webui/dist/
+/server/webui/current/
+/server/webui/release103/
 /dist/
 
 # JWT 签名密钥（运行时生成，存项目根，绝不提交）
