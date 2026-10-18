@@ -1,0 +1,95 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify release repository
+        run: |
+          test "$GITHUB_REPOSITORY" = "Haryy985/yunkun-console-preview"
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-offline)?$ ]]
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: source/web/package-lock.json
+      - run: npm ci
+        working-directory: source/web
+      - run: npm run build:static
+        working-directory: source/web
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: source/web/out
+  binaries:
+    needs: frontend
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: source/server/webui/current
+      - name: Build and package
+        working-directory: source
+        env:
+          YUNKUN_TARGET_OS: ${{ matrix.goos }}
+          YUNKUN_TARGET_ARCH: ${{ matrix.goarch }}
+          YUNKUN_BUILD_VERSION: ${{ github.ref_name }}
+          YUNKUN_SKIP_FRONTEND: "1"
+          YUNKUN_SKIP_NPM_CI: "1"
+          YUNKUN_COMPRESS: "off"
+          YUNKUN_PACKAGE: "1"
+          YUNKUN_PACKAGE_DIR: dist
+        run: ./build.sh --target "${YUNKUN_TARGET_OS}/${YUNKUN_TARGET_ARCH}"
+      - name: Smoke test Linux amd64 binary
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: source/dist/yunkun-linux-amd64/yunkun -h
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: source/dist/*.zip
+  release:
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          merge-multiple: true
+          path: dist
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum *.zip > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: 云鲲自动化渗透控制台 v1.0.6 离线版
+          body: |
+            ## v1.0.6-offline
+
+            - FOFA / Quake 默认查询语句固定为 `service:socks5 AND country: "CN" AND response:"No authentication"`。
+            - 默认每次抓取 500 条，旧来源为空配置会自动使用新默认值。
+            - 抓取后自动验证新候选；验证通过后只进入候选区，不会自动入池或启用。
+            - 默认代理验证地址为 `https://api.ipify.org?format=json`。
+            - 更新保留 `.yunkun-local`、PostgreSQL、账号、凭据、任务和 Skills 数据。
+
+            本 Release 仅提供 Linux、Windows、macOS 三个平台包及 `SHA256SUMS` 校验文件。
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS
+          generate_release_notes: false
