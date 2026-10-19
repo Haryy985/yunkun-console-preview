@@ -58,7 +58,8 @@ def start():
         try:
             health = api("/api/health")
             if health.get("ready"):
-                assert health.get("version") == "v1.0.3-offline", health
+                expected_version = (root / "VERSION").read_text().strip()
+                assert health.get("version") == expected_version, health
                 return
         except (OSError, urllib.error.URLError, json.JSONDecodeError):
             pass
