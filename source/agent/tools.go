@@ -1059,6 +1059,27 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 		priority = 5
 	}
 	anchors := pidList(it.AssetIDs)
+	if len(anchors) != len(it.AssetIDs) {
+		return 0, fmt.Errorf("asset_ids 必须全部是有效的正整数资产 id")
+	}
+	if len(anchors) > 0 {
+		if t.as == nil || t.taskID <= 0 {
+			return 0, fmt.Errorf("无法核验意图资产的任务范围")
+		}
+		assets, err := t.as.GetByIDsInScope(t.taskID, anchors)
+		if err != nil {
+			return 0, fmt.Errorf("核验意图资产范围失败：%w", err)
+		}
+		allowed := make(map[int64]bool, len(assets))
+		for _, asset := range assets {
+			allowed[asset.ID] = true
+		}
+		for _, id := range anchors {
+			if !allowed[id] {
+				return 0, fmt.Errorf("资产 %d 未关联到本任务或直接来源任务的授权范围", id)
+			}
+		}
+	}
 	// 资产拦截：意图绑定的资产若命中系统资产拦截规则，则禁止下发该意图。
 	if t.as != nil && len(anchors) > 0 {
 		hits, err := t.as.CheckAssetsIntercept(t.taskID, anchors)
@@ -1227,7 +1248,7 @@ func (t *ToolSet) goalMet() actool.CoreTool {
 // --- worker write tools ---
 
 func (t *ToolSet) addFinding() actool.CoreTool {
-	return writeTool("report_finding", "仅记录证据齐全的已确认漏洞。validation 填写授权、目标、身份、基线、受控变异、实际差异、影响和清理；提供本任务成功工具结果的 evidence_step_ids 或核实的 traffic_refs。缺失则用 record_fact 记录待验证线索，不得硬报。返回 finding_id 与 finding_node_id。", obj(map[string]any{
+	return writeTool("report_finding", "仅记录证据齐全且有实际安全影响的已确认漏洞。不要把 CORS、IDOR、BOLA 作为独立正式漏洞；它们只有在已证明数据读取、权限提升或重大业务影响链时才按最终影响报告，否则用 record_fact 保存线索。validation 填写授权、目标、身份、基线、受控变异、实际差异、影响和清理；提供本任务成功工具结果的 evidence_step_ids 或核实的 traffic_refs。缺失则用 record_fact 记录待验证线索，不得硬报。返回 finding_id 与 finding_node_id。", obj(map[string]any{
 		"vulnclass": str("漏洞类别"), "name": str("漏洞名称"), "severity": str("critical|high|medium|low"), "summary": str("发现摘要"),
 		"intent_id": idp("当前任务的意图 id"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "受影响资产 id"},
 		"evidence": str("实际验证的关键输出；不得填推测"),
@@ -1264,6 +1285,9 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		}
 		if err := json.Unmarshal(in, &a); err != nil {
 			return actool.Errorf(err.Error()), nil
+		}
+		if class := db.ExcludedFindingClass(a.VulnClass, a.Name); class != "" {
+			return actool.Errorf(fmt.Sprintf("%s 已被任务策略排除，不登记为独立正式漏洞；用 record_fact 保留线索。不得只改标签或夸大影响绕过审核", class)), nil
 		}
 		if t.ts == nil {
 			return actool.Errorf("report_finding 需要任务上下文；平台对话请通过 add_task_hint 向对应任务交接漏洞，并在提示中携带已有的 traffic_refs，由任务 Agent 登记。已登记漏洞可用 bind_finding_traffic 补绑。"), nil

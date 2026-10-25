@@ -26,6 +26,7 @@ type LLMUsage struct {
 	OutputTokens        int    `json:"output_tokens"`
 	CacheRead           int    `json:"cache_read"`
 	CacheWrite          int    `json:"cache_write"`
+	UsageKnown          bool   `json:"usage_known"`
 	Status              string `json:"status"`                // ok | error
 	ContextWindowTokens int    `json:"context_window_tokens"` // 0 = not confirmed for this request
 }
@@ -63,6 +64,7 @@ CREATE TABLE IF NOT EXISTS llm_usage (
     output_tokens  INTEGER NOT NULL DEFAULT 0,
     cache_read     INTEGER NOT NULL DEFAULT 0,
     cache_write    INTEGER NOT NULL DEFAULT 0,
+    usage_known    BOOLEAN NOT NULL DEFAULT false,
     status         TEXT,
     context_window_tokens INTEGER NOT NULL DEFAULT 0
 );
@@ -85,6 +87,15 @@ const llmUsageMigrate = `
 ALTER TABLE llm_usage ADD COLUMN IF NOT EXISTS request_id TEXT;
 ALTER TABLE llm_usage ADD COLUMN IF NOT EXISTS session_id TEXT;
 ALTER TABLE llm_usage ADD COLUMN IF NOT EXISTS context_window_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE llm_usage ADD COLUMN IF NOT EXISTS usage_known BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE llm_usage ALTER COLUMN usage_known SET DEFAULT false;
+CREATE TABLE IF NOT EXISTS llm_usage_migrations (version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM llm_usage_migrations WHERE version='usage-known-v1') THEN
+        UPDATE llm_usage SET usage_known=false;
+        INSERT INTO llm_usage_migrations(version) VALUES ('usage-known-v1');
+    END IF;
+END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_llm_usage_request ON llm_usage(request_id) WHERE request_id IS NOT NULL;
 `
 
@@ -115,10 +126,10 @@ func (d *DB) InsertLLMUsage(u *LLMUsage) error {
 		expID = u.ExplorationID
 	}
 	_, err := d.Exec(`
-INSERT INTO llm_usage(task_id, exploration_id, request_id, session_id, worker, model, profile_name, latency_ms, input_tokens, output_tokens, cache_read, cache_write, status, context_window_tokens)
-VALUES (NULLIF($1,''),$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),NULLIF($7,''),$8,$9,$10,$11,$12,$13,$14)`,
+INSERT INTO llm_usage(task_id, exploration_id, request_id, session_id, worker, model, profile_name, latency_ms, input_tokens, output_tokens, cache_read, cache_write, usage_known, status, context_window_tokens)
+VALUES (NULLIF($1,''),$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),NULLIF($7,''),$8,$9,$10,$11,$12,$13,$14,$15)`,
 		u.TaskID, expID, u.RequestID, u.SessionID, u.Worker, u.Model, u.ProfileName,
-		u.LatencyMs, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.Status, u.ContextWindowTokens)
+		u.LatencyMs, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.UsageKnown, u.Status, u.ContextWindowTokens)
 	return err
 }
 
@@ -176,9 +187,9 @@ func (d *DB) LatestTaskLLMUsage(taskID string) (*LLMUsage, error) {
 	var u LLMUsage
 	err := d.QueryRow(`
 SELECT COALESCE(request_id,''), COALESCE(session_id,''), COALESCE(worker,''),
-       COALESCE(model,''), input_tokens, output_tokens, COALESCE(status,''), context_window_tokens
+       COALESCE(model,''), input_tokens, output_tokens, usage_known, COALESCE(status,''), context_window_tokens
 FROM llm_usage WHERE task_id=$1 ORDER BY id DESC LIMIT 1`, taskID).
-		Scan(&u.RequestID, &u.SessionID, &u.Worker, &u.Model, &u.InputTokens, &u.OutputTokens, &u.Status, &u.ContextWindowTokens)
+		Scan(&u.RequestID, &u.SessionID, &u.Worker, &u.Model, &u.InputTokens, &u.OutputTokens, &u.UsageKnown, &u.Status, &u.ContextWindowTokens)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -193,7 +204,7 @@ FROM llm_usage WHERE task_id=$1 ORDER BY id DESC LIMIT 1`, taskID).
 func (d *DB) LatestTaskLLMUsageAll() (map[string]LLMUsage, error) {
 	rows, err := d.Query(`
 SELECT DISTINCT ON (task_id) task_id, COALESCE(request_id,''), COALESCE(session_id,''),
-       COALESCE(worker,''), COALESCE(model,''), input_tokens, output_tokens, COALESCE(status,''), context_window_tokens
+       COALESCE(worker,''), COALESCE(model,''), input_tokens, output_tokens, usage_known, COALESCE(status,''), context_window_tokens
 FROM llm_usage WHERE task_id IS NOT NULL
 ORDER BY task_id, id DESC`)
 	if err != nil {
@@ -204,7 +215,7 @@ ORDER BY task_id, id DESC`)
 	for rows.Next() {
 		var u LLMUsage
 		if err := rows.Scan(&u.TaskID, &u.RequestID, &u.SessionID, &u.Worker,
-			&u.Model, &u.InputTokens, &u.OutputTokens, &u.Status, &u.ContextWindowTokens); err != nil {
+			&u.Model, &u.InputTokens, &u.OutputTokens, &u.UsageKnown, &u.Status, &u.ContextWindowTokens); err != nil {
 			return nil, err
 		}
 		out[u.TaskID] = u
@@ -220,7 +231,8 @@ func (d *DB) TokenByModel(taskID string) ([]ModelTokenStat, error) {
 	rows, err := d.Query(`
 SELECT COALESCE(NULLIF(model,''),'(unknown)') AS model, COUNT(*) AS calls,
        COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-       COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_write),0)
+       COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_write),0),
+       COUNT(*) FILTER (WHERE NOT usage_known)
 FROM llm_usage
 WHERE COALESCE(task_id,'') = $1
 GROUP BY model
@@ -233,7 +245,7 @@ ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC, model`, taskID)
 	for rows.Next() {
 		var m ModelTokenStat
 		if err := rows.Scan(&m.Model, &m.Calls, &m.InputTokens, &m.OutputTokens,
-			&m.CacheReadTokens, &m.CacheWriteTokens); err != nil {
+			&m.CacheReadTokens, &m.CacheWriteTokens, &m.UnknownCalls); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -246,6 +258,7 @@ ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC, model`, taskID)
 type ProfileUsage struct {
 	ProfileName      string `json:"profile_name"`
 	Calls            int    `json:"calls"`
+	UnknownCalls     int    `json:"unknown_calls"`
 	Tasks            int    `json:"tasks"`
 	InputTokens      int    `json:"input_tokens"`
 	OutputTokens     int    `json:"output_tokens"`
@@ -258,6 +271,7 @@ type ProfileUsage struct {
 func (d *DB) UsageByProfile() ([]ProfileUsage, error) {
 	rows, err := d.Query(`
 SELECT COALESCE(profile_name,'') AS profile_name, COUNT(*) AS calls,
+       COUNT(*) FILTER (WHERE NOT usage_known),
        COUNT(DISTINCT task_id) AS tasks,
        COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
        COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_write),0)
@@ -271,7 +285,7 @@ ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC`)
 	out := []ProfileUsage{}
 	for rows.Next() {
 		var p ProfileUsage
-		if err := rows.Scan(&p.ProfileName, &p.Calls, &p.Tasks,
+		if err := rows.Scan(&p.ProfileName, &p.Calls, &p.UnknownCalls, &p.Tasks,
 			&p.InputTokens, &p.OutputTokens, &p.CacheReadTokens, &p.CacheWriteTokens); err != nil {
 			return nil, err
 		}
@@ -293,6 +307,7 @@ ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC`)
 			current := byName[cold.ProfileName]
 			current.ProfileName = cold.ProfileName
 			current.Calls += cold.Calls
+			current.UnknownCalls += cold.UnknownCalls
 			current.Tasks += cold.Tasks
 			current.InputTokens += cold.InputTokens
 			current.OutputTokens += cold.OutputTokens

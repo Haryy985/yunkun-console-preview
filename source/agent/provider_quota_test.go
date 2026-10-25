@@ -26,6 +26,9 @@ func TestIsQuotaExhaustedMessage(t *testing.T) {
 		`openai-responses: status 403: {"code":"SUBSCRIPTION_NOT_FOUND","message":"No active subscription found for this group"}`,
 		`credit balance is too low`,
 		`账户余额不足，请充值`,
+		`openai-responses: status 429: {"error":{"message":"Daily usage quota exhausted for this platform.","type":"rate_limit_exceeded"}}`,
+		`status 429: {"message":"daily quota exhausted"}`,
+		`status 429: 每日用量已耗尽`,
 	}
 	for _, message := range positive {
 		if !IsQuotaExhaustedMessage(message) {
@@ -64,6 +67,7 @@ func TestQuotaAwareTransportOnlyNormalizesExplicitQuota429(t *testing.T) {
 		wantStatus int
 	}{
 		{name: "quota", status: http.StatusTooManyRequests, body: `{"code":"insufficient_quota"}`, wantStatus: http.StatusPaymentRequired},
+		{name: "explicit daily quota despite generic type", status: http.StatusTooManyRequests, body: `{"error":{"message":"Daily usage quota exhausted for this platform.","type":"rate_limit_exceeded"}}`, wantStatus: http.StatusPaymentRequired},
 		{name: "ordinary rate limit", status: http.StatusTooManyRequests, body: `{"message":"rate limit exceeded"}`, wantStatus: http.StatusTooManyRequests},
 		{name: "server error", status: http.StatusInternalServerError, body: `insufficient_quota`, wantStatus: http.StatusInternalServerError},
 	}
@@ -107,7 +111,7 @@ func TestProviderDoesNotRetryExplicitQuota429(t *testing.T) {
 		requests.Add(1)
 		w.Header().Set("content-type", "application/json")
 		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = io.WriteString(w, `{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}`)
+		_, _ = io.WriteString(w, `{"error":{"message":"Daily usage quota exhausted for this platform.","type":"rate_limit_exceeded"}}`)
 	}))
 	defer upstream.Close()
 

@@ -8,11 +8,11 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Autumn-27/norma/skill"
+	actool "github.com/Autumn-27/norma/tool"
 	"yunkun/console/agent"
 	"yunkun/console/db"
 	"yunkun/console/traffic"
-	"github.com/Autumn-27/norma/skill"
-	actool "github.com/Autumn-27/norma/tool"
 )
 
 // wireAgentAugment connects the PG agent_visibility table into the agent runtime:
@@ -24,8 +24,12 @@ import (
 // filters them per-agent binding. Empty/nil → no host tools this run (capture off).
 func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.CoreTool, map[string][]string)) {
 	agent.ToolAugment = func(ctx context.Context, agentKey string) ([]actool.CoreTool, agent.DeferredInfo, func()) {
+		trace := agent.RunInfoFrom(ctx).Trace
 		a, err := pg.GetAgentByKey(agentKey)
 		if err != nil || a == nil {
+			if trace != nil {
+				trace.SetLoadedSkills(nil)
+			}
 			return nil, agent.DeferredInfo{}, nil
 		}
 		var extra []actool.CoreTool
@@ -50,6 +54,19 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 					reg = nil
 				}
 			}
+		}
+		if trace != nil {
+			var loaded []string
+			if reg != nil {
+				for _, item := range reg.List() {
+					if item.Dir != "" {
+						loaded = append(loaded, filepath.Base(item.Dir))
+					} else {
+						loaded = append(loaded, item.Name)
+					}
+				}
+			}
+			trace.SetLoadedSkills(loaded)
 		}
 		// A server named by any visible skill's `mcps:` is skill-gated: its tools
 		// are deferred + locked (not in the global block) until that skill loads.
@@ -275,7 +292,11 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 		// and therefore never includes ToolSet-backed domain tools. Per-task instances
 		// in the base always win: inList is built from the original incoming list so a
 		// worker's own upsert_asset is never shadowed by the server-level registry copy.
-		if len(domainReg) > 0 {
+		runDomainReg := domainReg
+		if runInfo.TaskID > 0 && len(domainReg) > 0 {
+			runDomainReg = buildDomainRegForTask(pg.Assets(), pg, runInfo.TaskID)
+		}
+		if len(runDomainReg) > 0 {
 			inList := make(map[string]bool, len(tools))
 			for _, t := range tools {
 				inList[t.Name()] = true
@@ -284,7 +305,7 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 				if row.Kind == "shell" || !row.Enabled || !contains(row.Agents, agentKey) || inList[row.Key] {
 					continue
 				}
-				inst, ok := domainReg[row.Key]
+				inst, ok := runDomainReg[row.Key]
 				if !ok {
 					continue // not a domain tool; custom/host tools are injected via hostTools()
 				}
@@ -359,6 +380,21 @@ func buildDomainReg(as *db.AssetStore, stores ...*db.DB) map[string]actool.CoreT
 	reg := make(map[string]actool.CoreTool)
 	for _, t := range serverTS.AllDomainTools() {
 		reg[t.Name()] = t
+	}
+	return reg
+}
+
+func buildDomainRegForTask(as *db.AssetStore, database *db.DB, taskID int64) map[string]actool.CoreTool {
+	if as == nil || taskID <= 0 {
+		return nil
+	}
+	serverTS := agent.NewToolSet(nil, "")
+	serverTS.SetTaskID(taskID)
+	serverTS.SetRAGDB(database)
+	serverTS.SetAssetStore(as, as.Companies())
+	reg := make(map[string]actool.CoreTool)
+	for _, tool := range serverTS.AllDomainTools() {
+		reg[tool.Name()] = tool
 	}
 	return reg
 }

@@ -776,11 +776,10 @@ func (e *Engine) ReadyFor(t *Task) bool {
 	return p != nil && w != nil
 }
 
-// Run starts the planner loop + N worker loops for a task. The loops always run
+// Run starts the planner loop + a worker controller for a task. The loops always run
 // but no-op until an LLM is configured (so a task created while idle picks up
 // automatically once LLM is set from the UI).
 func (e *Engine) Run(ctx context.Context, t *Task) {
-	workers := e.m.Workers()
 	e.deleteMu.RLock()
 	if e.shuttingDown || e.IsDeleting(t.ID) {
 		e.deleteMu.RUnlock()
@@ -791,14 +790,11 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 		t.Notify() // already running — just nudge a planning round
 		return
 	}
-	rt := e.registerTaskRoutines(ctx, t.ID, 1+workers)
+	rt := e.registerTaskRoutines(ctx, t.ID, 2)
 	e.deleteMu.RUnlock()
 	e.touch(t.ID)
 	runTaskRoutine(rt, func(loopCtx context.Context) { e.plannerLoop(loopCtx, t) })
-	for i := 0; i < workers; i++ {
-		name := fmt.Sprintf("work#%d", i+1)
-		runTaskRoutine(rt, func(loopCtx context.Context) { e.workerLoop(loopCtx, t, name) })
-	}
+	runTaskRoutine(rt, func(loopCtx context.Context) { e.workerPoolLoop(loopCtx, t, rt) })
 	e.startDeadlineCoordinator(ctx, t) // 任务级超时定时器(仅 timeout>0;去重)
 	// 仅在「完全没有活动意图(open+running)」时才 kick 首轮规划。带种子意图的任务:种子已
 	// 是 open,或已被上面刚起的 worker 抢先 claim 成 running——两种都算「有活干」,一律跳过
@@ -947,10 +943,44 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	}
 }
 
-func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
+func (e *Engine) workerPoolLoop(ctx context.Context, t *Task, rt *taskRuntime) {
+	var pool workerPool
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	resize := func() {
+		pool.resize(e.m.Workers(), func(index int, slot *workerSlot) bool {
+			e.deleteMu.RLock()
+			if e.shuttingDown || e.IsDeleting(t.ID) || ctx.Err() != nil {
+				e.deleteMu.RUnlock()
+				return false
+			}
+			rt.wg.Add(1)
+			e.deleteMu.RUnlock()
+			go func() {
+				defer rt.wg.Done()
+				defer close(slot.done)
+				e.workerLoop(ctx, t, fmt.Sprintf("work#%d", index), slot.retire)
+			}()
+			return true
+		})
+	}
+	resize()
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			resize()
+		}
+	}
+}
+
+func (e *Engine) workerLoop(ctx context.Context, t *Task, name string, retire <-chan struct{}) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-retire:
 			return
 		default:
 		}
@@ -987,8 +1017,17 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 		}
 		claimed := e.runWorkerStep(ctx, t, name, worker)
 		e.decInflight(t.ID)
-		if !claimed && sleepCtx(ctx, 800*time.Millisecond) {
-			return
+		if !claimed {
+			timer := time.NewTimer(800 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-retire:
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
 		}
 	}
 }

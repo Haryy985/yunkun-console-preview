@@ -298,20 +298,24 @@ func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
 // the intent is the worker's whole job. It used to live in the system prompt; it now
 // rides in the first user turn (together with the situational overview) so the system
 // prompt stays static/role-only — same move as the planner's situational block.
-// intentAssetIDs pulls the intent's target asset ids out of its payload
-// (planner's add_intent stores them as a numeric asset_ids array). nil on absence
-// or malformed payload.
-func intentAssetIDs(intent *db.Node) []int64 {
+// intentAssetIDs reads the intent's target ids. Invalid persisted payloads must
+// fail closed, especially when an old intent is resumed after an upgrade.
+func intentAssetIDs(intent *db.Node) ([]int64, error) {
 	if intent == nil {
-		return nil
+		return nil, fmt.Errorf("意图不存在")
 	}
-	var p struct {
-		AssetIDs []int64 `json:"asset_ids"`
-	}
+	var p map[string]json.RawMessage
 	if err := json.Unmarshal(intent.Payload, &p); err != nil {
-		return nil
+		return nil, fmt.Errorf("意图资产数据无效: %w", err)
 	}
-	return p.AssetIDs
+	if len(p["asset_ids"]) == 0 {
+		return nil, nil
+	}
+	var ids []int64
+	if err := json.Unmarshal(p["asset_ids"], &ids); err != nil {
+		return nil, fmt.Errorf("意图 asset_ids 无效: %w", err)
+	}
+	return ids, nil
 }
 
 func renderIntentTask(intent *db.Node) string {
@@ -360,6 +364,29 @@ func (w *Worker) ExecuteWithMessage(ctx context.Context, name string, taskID int
 }
 
 func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, intent *db.Node, hooks harness.HookRunner, emit func(db.Activity), enr EnrichTrigger, notifyFinding func(int64, string), requestID, message string) (harness.TerminalReason, WriteCounts, error) {
+	var intentAssets []*db.Asset
+	ids, err := intentAssetIDs(intent)
+	if err != nil {
+		return "", WriteCounts{}, err
+	}
+	if len(ids) > 0 {
+		if as == nil || taskID <= 0 {
+			return "", WriteCounts{}, fmt.Errorf("无法核验意图资产的任务范围")
+		}
+		intentAssets, err = as.GetByIDsInScope(taskID, ids)
+		if err != nil {
+			return "", WriteCounts{}, fmt.Errorf("核验意图资产范围失败：%w", err)
+		}
+		allowed := make(map[int64]bool, len(intentAssets))
+		for _, asset := range intentAssets {
+			allowed[asset.ID] = true
+		}
+		for _, id := range ids {
+			if id <= 0 || !allowed[id] {
+				return "", WriteCounts{}, fmt.Errorf("意图资产 %d 不在本任务或直接来源任务的授权范围内", id)
+			}
+		}
+	}
 	tsx := NewToolSet(ts, name)
 	tsx.SetFindingRecorder(w.findingRecorder)
 	tsx.SetTaskID(taskID)
@@ -378,7 +405,16 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// worker 刻意不给 MultiEdit/Glob/Grep：文件精改用 Edit、检索走 Bash(grep/find)，
 	// 收敛工具面、减少低价值调用。其余 SDK 默认工具(Read/Write/Edit/LS/Bash/Sleep)照常。
 	base = append(base, defaultToolsExcept("MultiEdit", "Glob", "Grep")...)
-	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), IntentID: intent.ID, AgentID: "worker"})
+	traceEmit := func(activity db.Activity) {
+		if emit == nil {
+			return
+		}
+		intentID := intent.ID
+		activity.NodeID, activity.Worker = &intentID, name
+		emit(activity)
+	}
+	trace := NewActivityRunTrace("worker", traceEmit)
+	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), IntentID: intent.ID, AgentID: "worker", Trace: trace})
 	tools, def, cleanup := AugmentTools(ctx, "worker", base)
 	defer cleanup()
 
@@ -400,22 +436,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	}
 	// 意图块 → 意图锚定资产块 → 启动指令，依次追加到 system 尾部（与 constraintBlock 同一套追加法）。
 	sysBody += renderIntentTask(intent)
-	if as != nil {
-		if ids := intentAssetIDs(intent); len(ids) > 0 {
-			if assets, err := as.GetByIDs(ids); err == nil && len(assets) > 0 {
-				if b, err := json.Marshal(assets); err == nil {
-					sysBody += "\n\n本意图 asset_ids 对应的目标资产：\n" + string(b)
-				}
-				// 意图明确针对的这些资产 → 自动纳入任务测试范围（与 insertAssets 同一套
-				// 保守粒度）。upsertTaskScope 的 ON CONFLICT DO NOTHING + uq_task_scope
-				// 唯一索引保证不会重复添加；重跑/重试同样是幂等 no-op。
-				// 资产覆盖度功能关闭时不再累积测试范围(分母)。
-				if coverageEnabled {
-					for _, a := range assets {
-						_ = as.AddAutoScope(taskID, a.Type, a.Domain, a.URL, a.IP)
-					}
-				}
-			}
+	if len(intentAssets) > 0 {
+		if b, err := json.Marshal(intentAssets); err == nil {
+			sysBody += "\n\n本意图 asset_ids 对应的目标资产：\n" + string(b)
 		}
 	}
 	sysBody += "\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。"
@@ -532,5 +555,6 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// still settles (no external hard-timeout backstop needed). ctx itself carries only
 	// pause / planner kill / shutdown, which the engine distinguishes and re-queues/stops.
 	_, reason, err := captureRunSession(ctx, s, input, emitWrap)
+	trace.Finish(reason, err)
 	return reason, tsx.Writes(), err
 }

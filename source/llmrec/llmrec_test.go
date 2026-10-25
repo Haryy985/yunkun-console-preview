@@ -7,10 +7,10 @@ import (
 	"os"
 	"testing"
 
-	"yunkun/console/db"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
 	"github.com/google/uuid"
+	"yunkun/console/db"
 )
 
 type completeProvider struct{}
@@ -59,6 +59,26 @@ func TestRequestIDIsUniqueAndOpaque(t *testing.T) {
 	}
 }
 
+func TestMergeUsageSnapshotKeepsSplitFieldsAndDeduplicatesCumulativeFrames(t *testing.T) {
+	total, delta := mergeUsageSnapshot(llm.Usage{}, llm.Usage{InputTokens: 23})
+	if total.InputTokens != 23 || delta.InputTokens != 23 {
+		t.Fatalf("initial input snapshot: total=%+v delta=%+v", total, delta)
+	}
+	total, delta = mergeUsageSnapshot(total, llm.Usage{InputTokens: 23, OutputTokens: 5})
+	if total.InputTokens != 23 || total.OutputTokens != 5 || delta.InputTokens != 0 || delta.OutputTokens != 5 {
+		t.Fatalf("split/cumulative frame: total=%+v delta=%+v", total, delta)
+	}
+	total, delta = mergeUsageSnapshot(total, llm.Usage{InputTokens: 23, OutputTokens: 5})
+	if total.InputTokens != 23 || total.OutputTokens != 5 || hasUsage(delta) {
+		t.Fatalf("duplicate frame was counted: total=%+v delta=%+v", total, delta)
+	}
+	total, delta = mergeUsageSnapshot(total, llm.Usage{InputTokens: 31, OutputTokens: 9, CacheReadTokens: 4})
+	if total.InputTokens != 31 || total.OutputTokens != 9 || total.CacheReadTokens != 4 ||
+		delta.InputTokens != 8 || delta.OutputTokens != 4 || delta.CacheReadTokens != 4 {
+		t.Fatalf("monotonic advance: total=%+v delta=%+v", total, delta)
+	}
+}
+
 func TestRAGPromptCandidatesOnlyToolResults(t *testing.T) {
 	payload := `{"retrieval_log_id":42,"results":[{"chunk_id":7,"content":"exact chunk"}]}`
 	req := llm.CompletionRequest{Messages: []llm.Message{
@@ -97,10 +117,27 @@ func (meteredStreamProvider) Stream(context.Context, llm.CompletionRequest) iter
 		if !yield(llm.StreamEvent{Type: llm.SEMessageStart, Usage: llm.Usage{InputTokens: 23}}, nil) {
 			return
 		}
-		if !yield(llm.StreamEvent{Type: llm.SEMessageDelta, Usage: llm.Usage{OutputTokens: 5}}, nil) {
+		if !yield(llm.StreamEvent{Type: llm.SEMessageDelta, Usage: llm.Usage{InputTokens: 23, OutputTokens: 5}}, nil) {
+			return
+		}
+		if !yield(llm.StreamEvent{Type: llm.SEMessageDelta, Usage: llm.Usage{InputTokens: 23, OutputTokens: 5}}, nil) {
 			return
 		}
 		yield(llm.StreamEvent{Type: llm.SEMessageStop}, nil)
+	}
+}
+
+func TestStreamForwardsOnlyUsageAdvances(t *testing.T) {
+	recorder := Wrap(meteredStreamProvider{}, nil, "fixture", "profile", "", "", func() bool { return false })
+	var downstream llm.Usage
+	for event, err := range recorder.Stream(context.Background(), llm.CompletionRequest{}) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		downstream.Add(event.Usage)
+	}
+	if downstream.InputTokens != 23 || downstream.OutputTokens != 5 {
+		t.Fatalf("downstream usage counted cumulative snapshots more than once: %+v", downstream)
 	}
 }
 

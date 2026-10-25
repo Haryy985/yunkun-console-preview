@@ -168,8 +168,10 @@ func TestProxyPoolAPIAndTaskLifecycle(t *testing.T) {
 		t.Fatal("credentials not encrypted")
 	}
 	for _, role := range []string{"viewer", "operator"} {
-		if !roleAllows(role, "GET", "/api/proxy-pools") || roleAllows(role, "POST", "/api/proxy-pools") ||
-			roleAllows(role, "GET", fmt.Sprintf("/api/proxy-pools/%d/nodes", id)) {
+		if roleAllows(role, "GET", "/api/proxy-pools") || roleAllows(role, "POST", "/api/proxy-pools") ||
+			roleAllows(role, "GET", fmt.Sprintf("/api/proxy-pools/%d/nodes", id)) ||
+			roleAllows(role, "POST", fmt.Sprintf("/api/proxy-pools/%d/nodes/import", id)) ||
+			roleAllows(role, "GET", fmt.Sprintf("/api/proxy-pools/%d/nodes/export", id)) {
 			t.Fatalf("bad RBAC for %s", role)
 		}
 		r := httptest.NewRequest("GET", "/api/proxy-pools", nil)
@@ -228,6 +230,67 @@ func TestProxyPoolAPIAndTaskLifecycle(t *testing.T) {
 	}
 	if _, err := s.resolveProxyRoute(context.Background(), task.ID); err == nil {
 		t.Fatal("disabled source routed")
+	}
+}
+
+func TestParseProxyImport(t *testing.T) {
+	got, err := parseProxyImport([]byte("address\n127.0.0.1:8080\nhttp://127.0.0.1:8080\n# comment\nhttps://example.test:443\n"), "http")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "http://127.0.0.1:8080" || got[1] != "https://example.test:443" {
+		t.Fatalf("unexpected normalized import: %#v", got)
+	}
+	for _, input := range []string{"http://user:secret@127.0.0.1:8080", "ftp://127.0.0.1:21", "127.0.0.1"} {
+		if _, err := parseProxyImport([]byte(input), "http"); err == nil {
+			t.Fatalf("accepted unsafe/invalid address %q", input)
+		}
+	}
+}
+
+func TestDiscoveredProxyEvidenceGatesLeaseAndRoute(t *testing.T) {
+	s := newProxyFixture(t)
+	poolID := createTestPool(t, s, "http://127.0.0.1:9999")
+	nodes, err := s.m.pg.ProxyNodes(poolID)
+	if err != nil || len(nodes) != 1 {
+		t.Fatalf("fixture nodes: %v %v", nodes, err)
+	}
+	nodeID := nodes[0].ID
+	if _, err := s.m.pg.Exec(`UPDATE proxy_nodes SET origin='quake',verified_ip='198.51.100.9',
+verified_at=now()-interval '16 minutes',last_success_at=now()-interval '16 minutes' WHERE id=$1`, nodeID); err != nil {
+		t.Fatal(err)
+	}
+	options := db.TaskCreateOptions{ProxyPoolID: &poolID, NetworkMode: "configured"}
+	if _, err := s.m.pg.CreateTaskWithOptions("stale discovery", "test", options); err == nil {
+		t.Fatal("stale discovery node accepted for task")
+	}
+	if _, err := s.m.pg.Exec(`UPDATE proxy_nodes SET verified_at=now(),last_success_at=now() WHERE id=$1`, nodeID); err != nil {
+		t.Fatal(err)
+	}
+	task, err := s.m.pg.CreateTaskWithOptions("fresh discovery", "test", options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.resolveProxyRoute(context.Background(), task.ID); err != nil {
+		t.Fatalf("fresh evidence rejected: %v", err)
+	}
+	if _, err := s.m.pg.Exec(`UPDATE proxy_nodes SET last_error='timeout',last_failure_at=now() WHERE id=$1`, nodeID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.resolveProxyRoute(context.Background(), task.ID); err == nil {
+		t.Fatal("failed discovery node routed despite unhealthy state")
+	}
+	if _, err := s.m.pg.Exec(`UPDATE tasks SET paused=true WHERE id=$1`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.m.pg.ReassignProxyLease(task.ID); err == nil {
+		t.Fatal("unhealthy node reassigned")
+	}
+	if _, err := s.m.pg.Exec(`UPDATE proxy_nodes SET verified_at=now()-interval '16 minutes',last_error='',last_success_at=now() WHERE id=$1`, nodeID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.m.pg.ReassignProxyLease(task.ID); err == nil {
+		t.Fatal("stale node reassigned")
 	}
 }
 
@@ -325,6 +388,12 @@ func TestProxyPoolSafetyBoundaries(t *testing.T) {
 
 func TestProxyDiscoveryApprovalUsesResultSourceAndTargetPool(t *testing.T) {
 	s := newProxyFixture(t)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "198.51.100.10")
+	}))
+	defer proxy.Close()
+	u, _ := url.Parse(proxy.URL)
+	port, _ := strconv.Atoi(u.Port())
 	cipher, err := s.proxyPools.vault.Seal(proxypool.Secrets{
 		APIValue: `{"proxy_username":"test-user","proxy_password":"never-echo-this-password"}`,
 	})
@@ -332,8 +401,8 @@ func TestProxyDiscoveryApprovalUsesResultSourceAndTargetPool(t *testing.T) {
 		t.Fatal(err)
 	}
 	sourceID, err := s.m.pg.SaveProxyDiscoverySource(
-		0, "fofa", "fixture source", `port="8080"`, "203.0.113.0/24",
-		"http://127.0.0.1:9/ip", cipher, 100,
+		0, "fofa", "fixture source", `port="8080"`, "127.0.0.1",
+		"http://check.invalid/ip", cipher, 100,
 	)
 	if err != nil {
 		t.Fatal("source:", err)
@@ -341,8 +410,8 @@ func TestProxyDiscoveryApprovalUsesResultSourceAndTargetPool(t *testing.T) {
 	firstPool := createTestPool(t, s, "http://127.0.0.1:9998")
 	targetPool := createTestPool(t, s, "http://127.0.0.1:9997")
 	if err := s.m.pg.UpsertProxyDiscoveryResults(sourceID, []db.ProxyDiscoveryResult{{
-		SourceID: sourceID, Address: "http://203.0.113.10:8080", Protocol: "http",
-		Host: "203.0.113.10", Port: 8080, Metadata: map[string]any{"fixture": true},
+		SourceID: sourceID, Address: proxy.URL, Protocol: "http",
+		Host: u.Hostname(), Port: port, Metadata: map[string]any{"fixture": true},
 	}}); err != nil {
 		t.Fatal("result:", err)
 	}
@@ -404,10 +473,10 @@ func TestProxyDiscoverySourceAllowsOptionalScopeAndVerifyURL(t *testing.T) {
 		t.Fatalf("optional scope was not preserved as empty: %#v", source)
 	}
 	if source.VerifyURL != defaultProxyDiscoveryVerifyURL {
-		t.Fatalf("default verification URL: got %q", source.VerifyURL)
+		t.Fatalf("default verification URL: got %q want %q", source.VerifyURL, defaultProxyDiscoveryVerifyURL)
 	}
-	if source.Query != defaultProxyDiscoveryQuery {
-		t.Fatalf("default query: got %q", source.Query)
+	if source.Query != `port="8080"` {
+		t.Fatalf("custom query was not preserved: got %q", source.Query)
 	}
 	if source.FetchLimit != defaultProxyDiscoveryFetchLimit {
 		t.Fatalf("default fetch limit: got %d", source.FetchLimit)

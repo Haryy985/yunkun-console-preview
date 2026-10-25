@@ -8,7 +8,7 @@ package notify
 // 而推送内容应当反映**事发当时**的结论——回查会得到「事后被改成 low」的
 // 危险误导。另外 fan-out 与渲染因此不必 JOIN findings/tasks/assets 三张表。
 type Snapshot struct {
-	// 事件类型：finding_created / finding_status_changed
+	// 事件类型：finding_created / finding_verified / finding_status_changed
 	Kind      string  `json:"kind"`
 	FindingID int64   `json:"finding_id"`
 	TaskID    int64   `json:"task_id"`
@@ -25,6 +25,8 @@ type Snapshot struct {
 // Item 是一条待推送的漏洞，供渠道渲染。
 type Item struct {
 	FindingID int64
+	TaskID    int64
+	Kind      string
 	Name      string
 	VulnClass string
 	Severity  string

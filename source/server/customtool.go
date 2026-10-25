@@ -14,12 +14,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
-	"yunkun/console/db"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
+	"yunkun/console/db"
 )
 
 // 本文件实现自定义工具执行器(docs/自定义工具设计.md)。system=false 的 tools 行按
@@ -510,13 +511,18 @@ func identity(s string) string { return s }
 // shellQuote single-quotes a value for safe shell interpolation.
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
+var templateParam = regexp.MustCompile(`\{([a-zA-Z_][a-zA-Z_0-9]*)\}`)
+
 // renderTemplate replaces {name} placeholders with each param's rendered value.
 func renderTemplate(tmpl string, params map[string]any, quote func(string) string) string {
-	out := tmpl
-	for k, v := range params {
-		out = strings.ReplaceAll(out, "{"+k+"}", quote(valToStr(v)))
-	}
-	return out
+	return templateParam.ReplaceAllStringFunc(tmpl, func(placeholder string) string {
+		key := placeholder[1 : len(placeholder)-1]
+		v, ok := params[key]
+		if !ok {
+			return placeholder
+		}
+		return quote(valToStr(v))
+	})
 }
 
 // valToStr renders a param value: scalars as-is, arrays/objects as compact JSON.

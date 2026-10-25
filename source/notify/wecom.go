@@ -48,7 +48,7 @@ func (c weComChannel) Send(ctx context.Context, cfg map[string]any, m Message) (
 	}
 	// 汇总批可能很长（50 条 × 每条一行 + 前缀），4096 字节很容易超。
 	// 截断在这里做而不是靠平台报错：被拒意味着这一批全丢，而截断至少送达前若干条。
-	content, kept := markdownBody(m, weComMarkdownLimit)
+	content, kept := weComBody(m)
 	payload := map[string]any{
 		"msgtype":  "markdown",
 		"markdown": map[string]any{"content": content},

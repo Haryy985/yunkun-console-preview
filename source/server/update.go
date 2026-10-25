@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -224,6 +227,11 @@ func (s *Server) updateCheck(w http.ResponseWriter, r *http.Request) {
 		"boot_notice": boot.Detail,
 		"rolled_back": boot.RolledBack,
 	}
+	_, supportErr := selfupdate.CurrentOfflineInstall()
+	out["auto_update_supported"] = supportErr == nil
+	if supportErr != nil {
+		out["auto_update_reason"] = supportErr.Error()
+	}
 
 	// 顶栏提示走缓存（默认）；用户点"检查更新"时带 force=1 强制回源。
 	force := r.URL.Query().Get("force") != ""
@@ -245,7 +253,8 @@ func (s *Server) updateCheck(w http.ResponseWriter, r *http.Request) {
 
 	asset := selfupdate.AssetName(latest, runtime.GOOS, runtime.GOARCH)
 	out["asset"] = asset
-	if a, ok := rel.FindAsset(asset); ok {
+	if a, ok := selfupdate.FindOfflineAsset(rel, runtime.GOOS, runtime.GOARCH); ok {
+		out["asset"] = a.Name
 		out["asset_available"] = true
 		out["size"] = a.Size
 	} else {
@@ -255,6 +264,7 @@ func (s *Server) updateCheck(w http.ResponseWriter, r *http.Request) {
 	cmp, comparable := selfupdate.CompareVersions(current, latest)
 	out["comparable"] = comparable
 	out["has_update"] = comparable && cmp < 0
+	out["one_click_update_available"] = supportErr == nil && out["asset_available"] == true
 	if !comparable {
 		// 开发构建（dev / git describe 带后缀）没有可比较的版本号。放行只会
 		// 用正式版覆盖掉本地正在调试的二进制，所以直接不给更新。
@@ -269,12 +279,46 @@ func (s *Server) updateCheck(w http.ResponseWriter, r *http.Request) {
 // 挂在请求上会被反代超时掐断。进度走 /api/update/stream。
 func (s *Server) updateApply(w http.ResponseWriter, r *http.Request) {
 	current := BuildVersion
+	var input struct {
+		Version string `json:"version"`
+	}
+	if decode(r, &input) != nil || input.Version == "" {
+		writeErr(w, 400, "请确认目标版本后再更新")
+		return
+	}
+	in, err := selfupdate.CurrentOfflineInstall()
+	if err != nil {
+		writeErr(w, 409, err.Error())
+		return
+	}
+	expectedData := filepath.Join(in.Root, ".yunkun-local", "data")
+	managedData := filepath.Clean(s.m.dir) == expectedData
+	if runtime.GOOS == "windows" {
+		managedData = strings.EqualFold(filepath.Clean(s.m.dir), expectedData)
+	}
+	if !managedData {
+		writeErr(w, 409, "工作数据目录不属于标准离线安装，请使用手动升级")
+		return
+	}
+	state := selfupdate.OfflineStatus(in.Root)
+	if selfupdate.OfflineActive(state.Phase) || state.Phase == "recovery_required" {
+		writeErr(w, 409, "已有未完成的更新，请先检查更新状态和备份")
+		return
+	}
+	if err := s.updateIdle(); err != nil {
+		writeErr(w, 409, err.Error())
+		return
+	}
 
 	// 走缓存：确保装上的就是用户在界面上看到并确认的那个版本。
 	client := selfupdate.NewClient(s.m.GlobalProxy())
 	rel, err := relCache.get(r.Context(), client, false)
 	if err != nil {
 		writeErr(w, 502, err.Error())
+		return
+	}
+	if rel.TagName != input.Version {
+		writeErr(w, 409, "发布版本已变化，请重新检查并确认更新内容")
 		return
 	}
 	cmp, comparable := selfupdate.CompareVersions(current, rel.TagName)
@@ -294,9 +338,15 @@ func (s *Server) updateApply(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		// 刻意用 s.ctx 而不是请求的 ctx：HTTP 响应一返回请求就结束了，
 		// 挂在它上面下载会立刻被取消。
-		err := selfupdate.Stage(s.ctx, client, rel, current, func(ph selfupdate.Phase, pct int, msg string) {
+		job, err := selfupdate.PrepareOffline(s.ctx, client, rel, current, in, func(ph selfupdate.Phase, pct int, msg string) {
 			updHub.publish(ph, pct, msg)
 		})
+		if err == nil {
+			err = s.updateIdle()
+		}
+		if err == nil {
+			err = selfupdate.StartOfflineWorker(job)
+		}
 		updHub.finish(err)
 		if err != nil {
 			log.Printf("[update] 更新失败：%v", err)
@@ -309,6 +359,75 @@ func (s *Server) updateApply(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	writeJSON(w, 202, map[string]any{"ok": true, "target": rel.TagName})
+}
+
+func (s *Server) updateIdle() error {
+	for _, task := range s.m.List() {
+		state := task.lifecycleSnapshot()
+		if !state.Paused && !isTerminalStatus(state.Status) {
+			return errors.New("请先暂停运行中或排队中的任务，再执行更新")
+		}
+	}
+	s.chatMu.Lock()
+	for _, busy := range s.chatBusy {
+		if busy {
+			s.chatMu.Unlock()
+			return errors.New("仍有 Agent 对话或复测在运行，请结束后再更新")
+		}
+	}
+	s.chatMu.Unlock()
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	for _, queue := range s.triggerQ {
+		if len(queue) != 0 {
+			return errors.New("仍有排队的自定义 Agent，请等待队列完成后更新")
+		}
+	}
+	return nil
+}
+
+func updateInProgress() bool {
+	_, running := updHub.snapshot()
+	if running {
+		return true
+	}
+	root := os.Getenv("YUNKUN_OFFLINE_ROOT")
+	if root == "" {
+		return false
+	}
+	state := selfupdate.OfflineStatus(root)
+	return selfupdate.OfflineActive(state.Phase) || state.Phase == "recovery_required"
+}
+
+func (s *Server) updateStatus(w http.ResponseWriter, r *http.Request) {
+	cur, running := updHub.snapshot()
+	if running || cur.Phase == selfupdate.PhaseFailed {
+		writeJSON(w, 200, cur)
+		return
+	}
+	if root := os.Getenv("YUNKUN_OFFLINE_ROOT"); root != "" {
+		state := selfupdate.OfflineStatus(root)
+		if state.Phase != "" {
+			writeJSON(w, 200, state)
+			return
+		}
+	}
+	writeJSON(w, 200, cur)
+}
+
+func (s *Server) updateMaintenance(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/update/") || r.URL.Path == "/api/health" ||
+			r.URL.Path == "/api/auth/status" || r.URL.Path == "/api/auth/me" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if updateInProgress() {
+			writeErr(w, 503, "正在备份或更新服务，请等待更新完成")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // updateRollback 主动退回上一版本（换装前备份的 artex.old）。

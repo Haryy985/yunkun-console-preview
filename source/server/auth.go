@@ -124,51 +124,11 @@ func roleAllows(role, method, path string) bool {
 	if role == "admin" {
 		return true
 	}
-	taskPath := strings.TrimPrefix(path, "/api/tasks/")
-	taskParts := strings.Split(taskPath, "/")
-	taskID := len(taskParts) > 0 && taskParts[0] != ""
-	if taskID {
-		id, err := strconv.ParseInt(taskParts[0], 10, 64)
-		taskID = err == nil && id > 0
-	}
-	if method != http.MethodGet {
-		if role != "operator" {
-			return false
-		}
-		switch {
-		case method == http.MethodPost && path == "/api/tasks",
-			method == http.MethodPost && path == "/api/tasks/control/batch":
-			return true
-		case taskID && len(taskParts) == 2 && taskParts[1] == "control":
-			return method == http.MethodPost
-		case taskID && len(taskParts) == 3 && taskParts[1] == "network" && taskParts[2] == "lease":
-			return method == http.MethodPost
-		default:
-			return false
-		}
-	}
-	if path == "/api/auth/me" || path == "/api/health" || path == "/api/tasks" || path == "/api/proxy-pools" ||
-		path == "/api/proxy-settings" ||
-		path == "/api/task-categories" || path == "/api/task-templates" {
-		return true
-	}
-	// Proxy node addresses, route events, discovery candidates and source
-	// metadata are sensitive egress data. Keep the list-level pool view
-	// readable while requiring administrator access to these subresources.
-	if strings.HasPrefix(path, "/api/proxy-pools/") || strings.HasPrefix(path, "/api/proxy-discovery/") {
-		return false
-	}
-	if taskID {
-		if len(taskParts) == 1 {
-			return true
-		}
-		return len(taskParts) == 2 && (taskParts[1] == "runtime-metrics" || taskParts[1] == "network")
-	}
-	if path == "/api/exploration/findings" || path == "/api/exploration/activity/history" ||
-		(strings.HasPrefix(path, "/api/exploration/findings/") && strings.HasSuffix(path, "/traffic")) {
-		return true
-	}
-	return false
+	// Tasks have no per-user ownership yet, and an operator-created task can
+	// invoke host tools. Until both ownership and execution isolation exist,
+	// only administrators may access task, finding, proxy or execution APIs.
+	return (role == "operator" || role == "viewer") && method == http.MethodGet &&
+		(path == "/api/auth/me" || path == "/api/health")
 }
 
 // errDataSourceUnavailable 是密码相关读操作失败时统一的回复。这些 handler 绝不能
@@ -536,16 +496,22 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/auth/login — validates username/password and returns a JWT.
 func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
-	pg := s.pg(w)
-	if pg == nil {
-		return
-	}
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
 	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, "请求格式错误")
+		return
+	}
+	retry := s.loginLimiter.allow(r.RemoteAddr, req.Username, time.Now())
+	if retry > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retry.Seconds())+1))
+		writeErr(w, http.StatusTooManyRequests, "登录尝试过于频繁，请稍后再试")
+		return
+	}
+	pg := s.pg(w)
+	if pg == nil {
 		return
 	}
 	if req.Username != adminUsername {

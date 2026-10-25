@@ -140,4 +140,8 @@ func TestMatchStatusChangeRequiresOptIn(t *testing.T) {
 	if !Match(Filter{MinSeverity: "low"}, created) {
 		t.Fatal("创建事件不应依赖 on_status_change")
 	}
+	verified := Snapshot{Kind: EventFindingVerified, Severity: "high"}
+	if !Match(Filter{MinSeverity: "low"}, verified) {
+		t.Fatal("质量审核通过事件应按普通漏洞事件匹配，不依赖状态变更开关")
+	}
 }

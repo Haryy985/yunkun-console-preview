@@ -131,7 +131,10 @@ func Stage(ctx context.Context, c *http.Client, rel *Release, currentVersion str
 func fetchSums(ctx context.Context, c *http.Client, rel *Release) (map[string]string, error) {
 	asset, ok := rel.FindAsset(sumsAsset)
 	if !ok {
-		return nil, fmt.Errorf("该 Release 没有 %s，无法校验完整性，拒绝升级", sumsAsset)
+		asset, ok = rel.FindAsset("SHA256SUMS.txt")
+		if !ok {
+			return nil, fmt.Errorf("该 Release 没有 %s，无法校验完整性，拒绝升级", sumsAsset)
+		}
 	}
 	body, err := get(ctx, c, asset.URL)
 	if err != nil {
@@ -203,7 +206,10 @@ func download(ctx context.Context, c *http.Client, a Asset, dst string, prog Pro
 
 	h := sha256.New()
 	pw := &progressWriter{total: a.Size, prog: prog, name: a.Name, last: time.Now()}
-	if _, err := io.Copy(io.MultiWriter(f, h, pw), body); err != nil {
+	if a.Size <= 0 || a.Size > maxOfflineZip {
+		return "", fmt.Errorf("发布包大小无效或超限")
+	}
+	if _, err := io.Copy(io.MultiWriter(f, h, pw), io.LimitReader(body, a.Size+1)); err != nil {
 		return "", fmt.Errorf("下载中断: %w", err)
 	}
 	if err := f.Sync(); err != nil {
@@ -224,7 +230,7 @@ func get(ctx context.Context, c *http.Client, rawURL string) (io.ReadCloser, err
 	if err := checkURL(req.URL); err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "artex-selfupdate")
+	req.Header.Set("User-Agent", "yunkun-selfupdate")
 	resp, err := c.Do(req)
 	if err != nil {
 		return nil, err

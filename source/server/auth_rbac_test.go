@@ -102,10 +102,13 @@ func TestRBACRevocationAndDefaultDeny(t *testing.T) {
 		method, path string
 		want         int
 	}{
-		{"GET", "/api/tasks", 200},
+		{"GET", "/api/tasks", 403},
 		{"GET", "/api/auth/me", 200},
-		{"GET", "/api/tasks/1", 404},
-		{"GET", "/api/tasks/1/runtime-metrics", 404},
+		{"GET", "/api/tasks/1", 403},
+		{"GET", "/api/tasks/1/runtime-metrics", 403},
+		{"GET", "/api/exploration/findings", 403},
+		{"GET", "/api/exploration/findings/1/traffic", 403},
+		{"GET", "/api/proxy-pools", 403},
 		{"POST", "/api/tasks", 403},
 		{"DELETE", "/api/tasks/1", 403},
 		{"GET", "/api/tasks/1/chat/status", 403},
@@ -116,6 +119,9 @@ func TestRBACRevocationAndDefaultDeny(t *testing.T) {
 		{"GET", "/api/workspace/read", 403},
 		{"GET", "/api/llm/records", 403},
 		{"GET", "/api/auth/users", 403},
+		{"POST", "/api/update/apply", 403},
+		{"POST", "/api/update/rollback", 403},
+		{"GET", "/api/update/status", 403},
 		{"GET", "/api/not-yet-classified", 403},
 	} {
 		rec := call(tc.method, tc.path, viewer, nil)
@@ -136,8 +142,10 @@ func TestRBACRevocationAndDefaultDeny(t *testing.T) {
 	})
 	_ = json.Unmarshal(login.Body.Bytes(), &credentials)
 	operator := credentials.Token
-	if !roleAllows("operator", "POST", "/api/tasks") {
-		t.Fatal("operator must be allowed to create tasks")
+	if roleAllows("operator", "POST", "/api/tasks") ||
+		roleAllows("operator", "POST", "/api/tasks/1/control") ||
+		roleAllows("operator", "POST", "/api/tasks/1/network/lease") {
+		t.Fatal("operator must not run host tools through tasks")
 	}
 	if roleAllows("operator", "POST", "/api/tasks/1/intents/2/control") ||
 		roleAllows("viewer", "GET", "/api/tasks/1/chat/status") {
@@ -164,5 +172,39 @@ func TestRBACRevocationAndDefaultDeny(t *testing.T) {
 	}
 	if rec := call("GET", "/api/auth/users", admin, nil); rec.Code != 401 {
 		t.Fatalf("old admin token after password change: %d", rec.Code)
+	}
+}
+
+func TestRoleAllowsTaskAndSensitiveAPIsAdminOnly(t *testing.T) {
+	paths := []struct{ method, path string }{
+		{"GET", "/api/tasks"},
+		{"GET", "/api/tasks/1"},
+		{"GET", "/api/tasks/1/runtime-metrics"},
+		{"GET", "/api/tasks/1/network"},
+		{"POST", "/api/tasks"},
+		{"POST", "/api/tasks/control/batch"},
+		{"POST", "/api/tasks/1/control"},
+		{"POST", "/api/tasks/1/network/lease"},
+		{"GET", "/api/exploration/findings"},
+		{"GET", "/api/exploration/findings/1/traffic"},
+		{"GET", "/api/exploration/activity/history"},
+		{"GET", "/api/proxy-pools"},
+		{"GET", "/api/proxy-settings"},
+		{"POST", "/api/tools/test"},
+	}
+	for _, tc := range paths {
+		if !roleAllows("admin", tc.method, tc.path) {
+			t.Errorf("admin lost %s %s", tc.method, tc.path)
+		}
+		for _, role := range []string{"operator", "viewer", "unknown"} {
+			if roleAllows(role, tc.method, tc.path) {
+				t.Errorf("%s allowed %s %s", role, tc.method, tc.path)
+			}
+		}
+	}
+	for _, role := range []string{"operator", "viewer"} {
+		if !roleAllows(role, "GET", "/api/auth/me") || !roleAllows(role, "GET", "/api/health") {
+			t.Errorf("%s cannot read basic status", role)
+		}
 	}
 }

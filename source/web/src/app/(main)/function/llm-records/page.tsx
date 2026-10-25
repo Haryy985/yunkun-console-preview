@@ -46,6 +46,7 @@ import {
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
+import { formatTokens } from "@/lib/token-format";
 import type { LLMRecordItem, LLMRecordDetail, LLMTask } from "@/lib/types";
 
 function fmtTime(ts: string) {
@@ -64,8 +65,7 @@ function fmtLatency(ms: number) {
 }
 
 function fmtTokens(n: number) {
-  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
-  return String(n);
+  return formatTokens(n);
 }
 
 function tryFormatJSON(s: string): string {

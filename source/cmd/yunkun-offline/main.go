@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"yunkun/console/selfupdate"
 )
 
 type installState struct {
@@ -38,6 +39,8 @@ type installation struct {
 	state                installState
 }
 
+var version = "dev"
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "Yunkun:", err)
@@ -50,12 +53,15 @@ func run() error {
 	dbPort := flag.Int("database-port", 5433, "private database port on first installation")
 	noBrowser := flag.Bool("no-browser", false, "do not open a browser")
 	stop := flag.Bool("stop", false, "stop this installation, retaining all data")
+	check := flag.Bool("check", false, "check bundled dependencies without creating an installation")
+	showVersion := flag.Bool("version", false, "print build version")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version)
+		return nil
+	}
 	if flag.NArg() != 0 || !validPort(*port) || !validPort(*dbPort) || *port == *dbPort {
 		return errors.New("use distinct ports between 1024 and 65535")
-	}
-	if os.Geteuid() == 0 {
-		return errors.New("run as a regular user, without sudo; PostgreSQL cannot run as root")
 	}
 	syscall.Umask(0077)
 	exe, err := os.Executable()
@@ -73,8 +79,26 @@ func run() error {
 	if *stop {
 		return i.stop(exe)
 	}
+	if err := i.preflight(); err != nil {
+		return err
+	}
+	if *check {
+		fmt.Printf("Dependencies ready: %s %s/%s (no installation data created)\n", version, runtime.GOOS, runtime.GOARCH)
+		return nil
+	}
+	if os.Geteuid() == 0 {
+		return errors.New("run as a regular user, without sudo; PostgreSQL cannot run as root")
+	}
 	if err := privateDir(i.home); err != nil {
 		return err
+	}
+	update := selfupdate.OfflineStatus(i.root)
+	updateJob := os.Getenv("YUNKUN_UPDATE_JOB")
+	if selfupdate.OfflineActive(update.Phase) || update.Phase == "recovery_required" {
+		if updateJob == "" || updateJob != update.Job ||
+			(update.Phase != "starting" && update.Phase != "rolling_back") {
+			return errors.New("offline update or recovery is in progress; inspect .yunkun-local/update-state.json")
+		}
 	}
 	lock, err := os.OpenFile(filepath.Join(i.home, "launcher.lock"), os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0600)
 	if err != nil {
@@ -127,22 +151,15 @@ func run() error {
 	if err := portFree(*port); err != nil {
 		return err
 	}
+	configPath := filepath.Join(i.home, "config.json")
+	if err := i.ensureConfig(configPath); err != nil {
+		return err
+	}
 	if err := i.ensureDatabase(); err != nil {
 		return err
 	}
 	defer i.stopDatabase()
 	if err := i.provision(); err != nil {
-		return err
-	}
-	configPath := filepath.Join(i.home, "config.json")
-	config := map[string]any{
-		"database": map[string]any{
-			"host": "127.0.0.1", "port": i.state.DatabasePort, "user": "yunkun",
-			"password": i.state.AppPassword, "dbname": "yunkun", "sslmode": "disable",
-		},
-		"skill_dir": filepath.Join(i.root, "skills"),
-	}
-	if err := writeJSON(configPath, config); err != nil {
 		return err
 	}
 	appLog, err := os.OpenFile(filepath.Join(i.home, "logs", "console.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY|syscall.O_NOFOLLOW, 0600)
@@ -157,6 +174,16 @@ func run() error {
 	app.Dir = i.home
 	app.Env = cleanEnv(map[string]string{
 		"YUNKUN_CONFIG": configPath, "YUNKUN_SKILL_DIR": filepath.Join(i.root, "skills"),
+		"YUNKUN_OFFLINE_ROOT": i.root, "YUNKUN_OFFLINE_CONSOLE_PORT": strconv.Itoa(*port),
+		"YUNKUN_OFFLINE_PUBLIC": "0",
+		"YUNKUN_UPDATE_JOB":     updateJob,
+		"YUNKUN_UPDATE_PROBE": func() string {
+			if updateJob != "" && updateJob == update.Job && os.Getenv("YUNKUN_UPDATE_PROBE") == "1" {
+				return "1"
+			}
+			return ""
+		}(),
+		"NORMA_RIPGREP_NO_INSTALL": "1",
 	})
 	app.Stdout, app.Stderr = appLog, appLog
 	// A separate process group lets shutdown reach child tools as well as the server.
@@ -200,6 +227,10 @@ func run() error {
 		return nil
 	case err := <-exited:
 		exited <- err
+		if selfupdate.OfflineActive(selfupdate.OfflineStatus(i.root).Phase) {
+			fmt.Println("The update supervisor is restarting this installation; follow progress in the console.")
+			return nil
+		}
 		if err == nil {
 			return errors.New("console exited unexpectedly; inspect .yunkun-local/logs/console.log")
 		}
@@ -245,6 +276,10 @@ func privateDir(path string) error {
 }
 
 func readPrivate(path string) ([]byte, error) {
+	return readPrivateLimit(path, 8192)
+}
+
+func readPrivateLimit(path string, limit int64) ([]byte, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
@@ -257,12 +292,73 @@ func readPrivate(path string) ([]byte, error) {
 	if !st.Mode().IsRegular() || st.Mode().Perm()&0077 != 0 || st.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) {
 		return nil, fmt.Errorf("unsafe private file: %s", path)
 	}
-	if st.Size() > 8192 {
-		return nil, errors.New("installation state is too large")
+	if st.Size() > limit {
+		return nil, errors.New("private file is too large")
 	}
 	b := make([]byte, st.Size())
 	_, err = f.ReadAt(b, 0)
 	return b, err
+}
+
+func (i installation) ensureConfig(path string) error {
+	raw, err := readPrivateLimit(path, 4<<20)
+	if errors.Is(err, os.ErrNotExist) {
+		return writeJSON(path, map[string]any{
+			"database": map[string]any{
+				"host": "127.0.0.1", "port": i.state.DatabasePort, "user": "yunkun",
+				"password": i.state.AppPassword, "dbname": "yunkun", "sslmode": "disable",
+			},
+			"skill_dir": filepath.Join(i.root, "skills"),
+		})
+	}
+	if err != nil {
+		return err
+	}
+	var config struct {
+		Database struct {
+			Host, User, Password, DBName, SSLMode string
+			Port                                  int
+		}
+	}
+	if json.Unmarshal(raw, &config) != nil {
+		return errors.New("invalid config.json; existing configuration was preserved")
+	}
+	d := config.Database
+	if d.Host != "127.0.0.1" || d.Port != i.state.DatabasePort || d.User != "yunkun" ||
+		d.Password != i.state.AppPassword || d.DBName != "yunkun" || d.SSLMode != "disable" {
+		return errors.New("config.json differs from this managed database; existing configuration was preserved")
+	}
+	return nil
+}
+
+func (i installation) preflight() error {
+	for _, tool := range []string{"bash", "ps"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			return fmt.Errorf("required system command %s is missing; use a full supported OS installation", tool)
+		}
+	}
+	for _, name := range []string{"postgres", "initdb", "pg_ctl"} {
+		if err := i.pgCommand(name, "--version"); err != nil {
+			return fmt.Errorf("bundled PostgreSQL dependency check: %w; use the package matching your OS and CPU; see README.txt", err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	app := exec.CommandContext(ctx, filepath.Join(i.root, "bin", "yunkun"), "-version")
+	app.Env = cleanEnv(nil)
+	out, err := app.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("bundled console could not execute: %w; use the package matching your OS and CPU", err)
+	}
+	if strings.TrimSpace(string(out)) != version {
+		return errors.New("console and launcher versions differ; extract a complete matching package")
+	}
+	for _, relative := range []string{"runtime/share/postgresql/postgres.bki", "skills"} {
+		if _, err := os.Stat(filepath.Join(i.root, relative)); err != nil {
+			return fmt.Errorf("incomplete offline package: %s", relative)
+		}
+	}
+	return nil
 }
 
 func writeJSON(path string, value any) error {
@@ -349,6 +445,10 @@ func (i installation) ensureDatabase() error {
 		}
 	} else if err != nil {
 		return err
+	}
+	major, err := os.ReadFile(filepath.Join(i.data, "PG_VERSION"))
+	if err != nil || strings.TrimSpace(string(major)) != "18" {
+		return errors.New("this launcher requires PostgreSQL 18 data; existing database was not changed")
 	}
 	if i.pgCommand("pg_ctl", "-D", i.data, "status") == nil {
 		return i.verifyDatabase()
@@ -524,12 +624,27 @@ func waitReady(ctx context.Context, baseURL string, exited <-chan error) (bool, 
 				continue
 			}
 			var health struct {
-				Ready bool `json:"ready"`
+				Ready   bool   `json:"ready"`
+				OK      bool   `json:"ok"`
+				Service string `json:"service"`
+				Version string `json:"version"`
 			}
 			err = json.NewDecoder(response.Body).Decode(&health)
 			response.Body.Close()
-			if err == nil && response.StatusCode == 200 && health.Ready {
-				return true, nil
+			if err == nil && response.StatusCode == 200 && health.Ready && health.OK &&
+				health.Service == "yunkun" && health.Version == version {
+				auth, err := client.Get(baseURL + "/api/auth/status")
+				if err != nil {
+					continue
+				}
+				var status struct {
+					Initialized *bool `json:"initialized"`
+				}
+				err = json.NewDecoder(auth.Body).Decode(&status)
+				auth.Body.Close()
+				if err == nil && auth.StatusCode == 200 && status.Initialized != nil {
+					return true, nil
+				}
 			}
 		}
 	}

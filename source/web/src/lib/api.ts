@@ -9,11 +9,15 @@ import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
 import type {
   ProxyDiscoveryResult,
+  ProxyDiscoveryRunSummary,
   ProxyDiscoverySource,
   ProxyEvent,
   ProxyGlobalSettings,
   ProxyNode,
   ProxyNodeSummary,
+  ProxyNodeQuery,
+  ProxyVerificationMode,
+  ProxyVerificationResult,
   ProxyPool,
   ProxyPoolConfig,
   ProxyQuota,
@@ -142,10 +146,11 @@ function getToken(): string | null {
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   if (MOCK) return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
   const token = getToken();
+  const isFormData = typeof FormData !== "undefined" && init?.body instanceof FormData;
   const r = await fetch(`/api${path}`, {
     ...init,
     headers: {
-      ...(init?.body ? { "Content-Type": "application/json" } : {}),
+      ...(init?.body && !isFormData ? { "Content-Type": "application/json" } : {}),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(init?.headers as Record<string, string> | undefined),
     },
@@ -271,7 +276,30 @@ export const api = {
       ? put<{ id: number }>(`/proxy-pools/${id}`, { config, secrets })
       : post<{ id: number }>("/proxy-pools", { config, secrets }),
   deleteProxyPool: (id: number) => http<{ ok: boolean }>(`/proxy-pools/${id}`, { method: "DELETE" }),
-  proxyNodes: (id: number) => get<{ nodes: ProxyNode[]; summary: ProxyNodeSummary }>(`/proxy-pools/${id}/nodes`),
+  proxyNodes: (id: number, query?: ProxyNodeQuery) => {
+    const params = new URLSearchParams();
+    if (query) for (const [key, value] of Object.entries(query)) params.set(key, String(value));
+    return get<{ nodes: ProxyNode[]; summary: ProxyNodeSummary; total: number }>(
+      `/proxy-pools/${id}/nodes${query ? `?${params}` : ""}`,
+    );
+  },
+  importProxyNodes: (id: number, file: File) => {
+    const body = new FormData();
+    body.append("file", file);
+    return http<{ node_ids: number[]; imported: number; skipped: number }>(`/proxy-pools/${id}/nodes/import`, { method: "POST", body });
+  },
+  proxyImportStatus: (id: number) => http<{ pending: number }>(`/proxy-pools/${id}/nodes/import-status`),
+  exportProxyNodes: async (id: number) => {
+    const token = getToken();
+    const response = await fetch(`/api/proxy-pools/${id}/nodes/export`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+      if (!response.ok) {
+        const problem = await response.json().catch(() => ({}));
+        throw new Error(problem.error || `导出失败（HTTP ${response.status}）`);
+      }
+    return response.blob();
+  },
   updateProxyNode: (pool: number, node: number, input: { enabled?: boolean; notes?: string }) =>
     patch<{ ok: boolean }>(`/proxy-pools/${pool}/nodes/${node}`, input),
   batchUpdateProxyNodes: (pool: number, nodeIDs: number[], action: "enable" | "disable") =>
@@ -280,9 +308,16 @@ export const api = {
     http<{ ok: boolean }>(`/proxy-pools/${pool}/nodes/${node}`, { method: "DELETE" }),
   fetchProxyNodes: (id: number) => post<{ fetched: number }>(`/proxy-pools/${id}/fetch`),
   proxyQuota: (id: number) => post<ProxyQuota>(`/proxy-pools/${id}/quota`),
-  verifyProxyNode: (pool: number, node: number) => post<{ ip: string }>(`/proxy-pools/${pool}/nodes/${node}/verify`),
+  verifyProxyNode: (pool: number, node: number, mode?: ProxyVerificationMode, signal?: AbortSignal) =>
+    http<ProxyVerificationResult>(`/proxy-pools/${pool}/nodes/${node}/verify`, {
+      method: "POST", body: JSON.stringify({ mode }), signal,
+    }),
   proxyEvents: (id: number) => get<{ events: ProxyEvent[] }>(`/proxy-pools/${id}/events`),
   proxyDiscoverySources: () => get<{ sources: ProxyDiscoverySource[] }>("/proxy-discovery/sources"),
+  proxyDiscoveryLatestRun: (id: number) =>
+    get<{ latest: ProxyDiscoveryRunSummary | null }>(`/proxy-discovery/sources/${id}/latest-run`),
+  confirmProxyDiscoveryProtocol: (id: number, protocol: "http" | "https" | "socks5") =>
+    put<{ ok: boolean }>(`/proxy-discovery/results/${id}/protocol`, { protocol }),
   saveProxyDiscoverySource: (
     input: Partial<ProxyDiscoverySource> & { credentials?: Record<string, string> },
     id?: number,
@@ -1598,6 +1633,7 @@ export const api = {
   // Update checks use the fixed Yunkun GitHub release feed. Applying a release
   // downloads and verifies the selected latest package before restarting.
   checkUpdate: (force = false) => get<UpdateCheck>(`/update/check${force ? "?force=true" : ""}`),
-  applyUpdate: () => post<UpdateProgress>("/update/apply", {}),
+  applyUpdate: (version: string) => post<{ ok: boolean; target: string }>("/update/apply", { version }),
+  updateStatus: () => get<UpdateProgress>("/update/status"),
   rollbackUpdate: () => post<UpdateProgress>("/update/rollback", {}),
 };

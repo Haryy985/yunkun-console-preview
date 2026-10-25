@@ -24,7 +24,7 @@ func TestDiscoveryAdmissionRechecksPoolConfiguration(t *testing.T) {
 		wantRequests                 int32
 		appAuth                      bool
 	}{
-		{"matching proof", "source-user", "", false, 1, false},
+		{"matching proof", "source-user", "", false, 2, false},
 		{"different valid credentials", "pool-user", "", false, 2, false},
 		{"different rejected credentials", "rejected-user", "", true, 2, false},
 		{"different endpoint", "source-user", "http://pool-check.invalid/ip", false, 2, false},
@@ -116,9 +116,9 @@ func TestDiscoveryAdmissionRechecksPoolConfiguration(t *testing.T) {
 				}
 				return
 			}
-			wantIP := "198.51.100.20"
-			if test.wantRequests == 1 {
-				wantIP = "198.51.100.10"
+			wantIP := "198.51.100.10"
+			if test.poolUser == "pool-user" || test.poolEndpoint != "" {
+				wantIP = "198.51.100.20"
 			}
 			if admitted.Code != http.StatusOK || candidate.State != "approved" || len(nodes) != 1 ||
 				!nodes[0].Enabled || nodes[0].VerifiedIP != wantIP || nodes[0].LastSuccessAt == nil {

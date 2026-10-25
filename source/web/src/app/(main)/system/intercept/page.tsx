@@ -51,6 +51,7 @@ import {
 import { Card, CardContent } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
+import { formatTokens } from "@/lib/token-format";
 import type {
   InterceptAction,
   InterceptRule,
@@ -63,9 +64,7 @@ import type {
 
 // fmtTokens 把 token 数压成紧凑写法(1.2k / 3.4M),用于审批用量统计。
 function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
-  if (n >= 1000) return (n / 1000).toFixed(1) + "k";
-  return String(n);
+  return formatTokens(n);
 }
 
 // JudgeStat 是一块统计数字(标签 + 数值)。

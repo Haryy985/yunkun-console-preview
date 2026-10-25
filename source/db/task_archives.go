@@ -716,21 +716,21 @@ AND NOT EXISTS (
 
 func taskArchiveAggregates(tx *sql.Tx, taskID, expID int64) (map[string]any, error) {
 	stats := map[string]any{}
-	var calls, input, output, cacheRead, cacheWrite int64
-	if err := tx.QueryRow(`SELECT count(*),COALESCE(sum(input_tokens),0),COALESCE(sum(output_tokens),0),
+	var calls, unknownCalls, input, output, cacheRead, cacheWrite int64
+	if err := tx.QueryRow(`SELECT count(*),count(*) FILTER (WHERE NOT usage_known),COALESCE(sum(input_tokens),0),COALESCE(sum(output_tokens),0),
 COALESCE(sum(cache_read),0),COALESCE(sum(cache_write),0)
 FROM llm_usage WHERE COALESCE(task_id,'')=$1 OR exploration_id=$2`, strconv.FormatInt(taskID, 10), expID).
-		Scan(&calls, &input, &output, &cacheRead, &cacheWrite); err != nil {
+		Scan(&calls, &unknownCalls, &input, &output, &cacheRead, &cacheWrite); err != nil {
 		return nil, err
 	}
-	stats["tokens"] = map[string]int64{"calls": calls, "input_tokens": input, "output_tokens": output, "cache_read_tokens": cacheRead, "cache_write_tokens": cacheWrite}
+	stats["tokens"] = map[string]int64{"calls": calls, "unknown_calls": unknownCalls, "input_tokens": input, "output_tokens": output, "cache_read_tokens": cacheRead, "cache_write_tokens": cacheWrite}
 	for _, item := range []struct {
 		name  string
 		query string
 		args  []any
 	}{
 		{"token_profiles", `SELECT COALESCE(jsonb_agg(to_jsonb(x)),'[]'::jsonb) FROM (
-SELECT COALESCE(profile_name,'') profile_name,count(*) calls,1 tasks,
+SELECT COALESCE(profile_name,'') profile_name,count(*) calls,count(*) FILTER (WHERE NOT usage_known) unknown_calls,1 tasks,
        COALESCE(sum(input_tokens),0) input_tokens,COALESCE(sum(output_tokens),0) output_tokens,
        COALESCE(sum(cache_read),0) cache_read_tokens,COALESCE(sum(cache_write),0) cache_write_tokens
 FROM llm_usage WHERE COALESCE(task_id,'')=$1 OR exploration_id=$2

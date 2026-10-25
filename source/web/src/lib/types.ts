@@ -37,6 +37,7 @@ export interface Task {
     model: string;
     input_tokens: number;
     output_tokens: number;
+    usage_known: boolean;
     status: string;
     context_window_tokens: number;
   };
@@ -731,6 +732,7 @@ export type ActivityKind =
   | "usage" // live cumulative token usage (per model turn); not rendered
   | "llm_switch" // automatic/manual task-level LLM switch
   | "llm_failover" // task-level provider switch / chain exhaustion audit event
+  | "agent_run" // actual conversational agent, loaded skills, skill calls and final result
   | "intercept_request"; // user-approval request from the intercept layer
 
 // ChatAttachment 是一次上传的文件:path 相对该会话/任务工作目录(即 agent 的 CWD)。
@@ -924,6 +926,7 @@ export interface TokenTotal {
 export interface ProfileUsage {
   profile_name: string;
   calls: number;
+  unknown_calls: number;
   tasks: number;
   input_tokens: number;
   output_tokens: number;
@@ -951,6 +954,7 @@ export interface UsageStats {
 export interface ModelTokenStat {
   model: string;
   calls: number;
+  unknown_calls: number;
   input_tokens: number;
   output_tokens: number;
   cache_read_tokens: number;
@@ -1039,7 +1043,7 @@ export interface Settings {
   // MITM 上游；关闭捕获时直接注入 agent 的 bash/WebFetch。空=直连。
   global_proxy?: string;
   python_interpreter?: string; // 自定义脚本工具的 python 解释器路径(空=运行时检测)
-  workers?: number; // 并发工作 agent 数(默认3)；对之后启动的任务生效
+  workers?: number; // 并发工作 Agent 数(默认3)；运行中任务动态调整
   // 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
   task_concurrency_enabled?: boolean; // 默认 false
   task_concurrency_limit?: number; // 开启后默认 5
@@ -1119,7 +1123,7 @@ export interface NotificationMeta {
 export interface NotificationDelivery {
   id: number;
   finding_id: string;
-  event_kind: string; // finding_created | finding_status_changed
+  event_kind: string; // finding_created | finding_verified | finding_status_changed
   channel_id: number;
   channel_name: string;
   channel_kind: string;
@@ -1884,6 +1888,8 @@ export interface UpdateCheck {
   mode?: "docker" | "binary" | string;
   has_backup?: boolean;
   boot_notice?: string;
+  auto_update_supported?: boolean;
+  auto_update_reason?: string;
 }
 
 export interface UpdateProgress {
@@ -1891,4 +1897,6 @@ export interface UpdateProgress {
   percent?: number;
   message?: string;
   error?: string;
+  version?: string;
+  backup?: string;
 }

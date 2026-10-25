@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"yunkun/console/db"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
+	"yunkun/console/db"
 )
 
 type taskIDContextKey struct{}
@@ -166,6 +166,7 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 			textBuf     strings.Builder
 			thinkingBuf strings.Builder
 			usage       llm.Usage
+			usageKnown  bool
 			stopReason  string
 			streamErr   error
 		)
@@ -181,7 +182,7 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 				status = "error"
 			}
 			// Lightweight metering row — always written.
-			r.recordUsage(taskID, expID, session, requestID, worker, usage, int(time.Since(start).Milliseconds()), status)
+			r.recordUsage(taskID, expID, session, requestID, worker, usage, usageKnown, int(time.Since(start).Milliseconds()), status)
 			r.recordPromptInclusions(taskID, requestID, req)
 			// Heavy trace row — only when body recording is on.
 			if recordBodies {
@@ -202,9 +203,8 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 			// Always track usage (cheap); accumulate text/thinking only for bodies.
 			// Anthropic (and the other providers) split token usage across events:
 			// message_start carries ONLY the input side (input + cache), message_delta
-			// ONLY the output. They must be FOLDED with Add — overwriting on delta
-			// would zero out the input already counted at start (mirrors the SDK's own
-			// llm.Accumulator; see norma/llm/accumulate.go).
+			// ONLY the output. Preserve split fields, deduplicate cumulative
+			// snapshots, and forward just the advances to the SDK accumulator.
 			switch ev.Type {
 			case llm.SETextDelta:
 				if recordBodies {
@@ -215,12 +215,14 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 					thinkingBuf.WriteString(ev.Text)
 				}
 			case llm.SEMessageStart:
-				usage.Add(ev.Usage)
+				usageKnown = usageKnown || hasUsage(ev.Usage)
+				usage, ev.Usage = mergeUsageSnapshot(usage, ev.Usage)
 			case llm.SEMessageDelta:
 				if ev.StopReason != "" {
 					stopReason = ev.StopReason
 				}
-				usage.Add(ev.Usage)
+				usageKnown = usageKnown || hasUsage(ev.Usage)
+				usage, ev.Usage = mergeUsageSnapshot(usage, ev.Usage)
 			}
 			if !yield(ev, err) {
 				return
@@ -262,12 +264,44 @@ func (r *Recorder) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 	if err != nil {
 		status = "error"
 	}
-	r.recordUsage(taskID, expID, session, requestID, worker, usage, int(time.Since(start).Milliseconds()), status)
+	r.recordUsage(taskID, expID, session, requestID, worker, usage, hasUsage(usage), int(time.Since(start).Milliseconds()), status)
 	r.recordPromptInclusions(taskID, requestID, req)
 	if recordBodies {
 		r.record(req, session, requestID, taskID, worker, reqBody, capt, start, msg.Text(), thinkingText(msg), usage, stopReason, err)
 	}
 	return msg, stopReason, usage, err
+}
+
+func hasUsage(usage llm.Usage) bool {
+	return usage.InputTokens > 0 || usage.OutputTokens > 0 ||
+		usage.CacheReadTokens > 0 || usage.CacheWriteTokens > 0
+}
+
+// mergeUsageSnapshot accepts either split fields (for example input on message
+// start and output on message delta) or cumulative snapshots. Only positive
+// per-field advances are forwarded, so norma's additive accumulator and this
+// ledger agree without counting repeated snapshots twice.
+func mergeUsageSnapshot(current, incoming llm.Usage) (total, delta llm.Usage) {
+	total = current
+	if incoming.InputTokens > total.InputTokens {
+		total.InputTokens = incoming.InputTokens
+	}
+	if incoming.OutputTokens > total.OutputTokens {
+		total.OutputTokens = incoming.OutputTokens
+	}
+	if incoming.CacheReadTokens > total.CacheReadTokens {
+		total.CacheReadTokens = incoming.CacheReadTokens
+	}
+	if incoming.CacheWriteTokens > total.CacheWriteTokens {
+		total.CacheWriteTokens = incoming.CacheWriteTokens
+	}
+	delta = llm.Usage{
+		InputTokens:      total.InputTokens - current.InputTokens,
+		OutputTokens:     total.OutputTokens - current.OutputTokens,
+		CacheReadTokens:  total.CacheReadTokens - current.CacheReadTokens,
+		CacheWriteTokens: total.CacheWriteTokens - current.CacheWriteTokens,
+	}
+	return total, delta
 }
 
 func ragPromptCandidates(req llm.CompletionRequest) []db.RAGPromptCandidate {
@@ -338,7 +372,7 @@ func newRequestID() string {
 	return hex.EncodeToString(bytes[:])
 }
 
-func (r *Recorder) recordUsage(taskID string, expID int64, session, requestID, worker string, usage llm.Usage, latencyMs int, status string) {
+func (r *Recorder) recordUsage(taskID string, expID int64, session, requestID, worker string, usage llm.Usage, usageKnown bool, latencyMs int, status string) {
 	if r.pg == nil {
 		return
 	}
@@ -359,6 +393,7 @@ func (r *Recorder) recordUsage(taskID string, expID int64, session, requestID, w
 		OutputTokens:        usage.OutputTokens,
 		CacheRead:           usage.CacheReadTokens,
 		CacheWrite:          usage.CacheWriteTokens,
+		UsageKnown:          usageKnown,
 		Status:              status,
 		ContextWindowTokens: r.contextWindowTokens,
 	})

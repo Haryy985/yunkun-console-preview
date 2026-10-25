@@ -3,10 +3,13 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
+
+	"yunkun/console/notify"
 )
 
 const (
@@ -58,11 +61,73 @@ func FindingDeliveryMetadataBlockers(findingID int64, severity, status string) [
 	return blockers
 }
 
+// ExcludedFindingClass identifies labels that the SRC workflow treats as
+// low-value standalone leads. They may still be mentioned as part of a proven
+// impact chain, but must not be submitted as an independent formal finding.
+func ExcludedFindingClass(values ...string) string {
+	var words []string
+	var rawValues []string
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			continue
+		}
+		rawValues = append(rawValues, value)
+		var b strings.Builder
+		for _, r := range value {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+				b.WriteRune(r)
+			} else {
+				b.WriteByte(' ')
+			}
+		}
+		words = append(words, strings.Fields(b.String())...)
+	}
+	set := make(map[string]bool, len(words))
+	for _, word := range words {
+		set[word] = true
+	}
+	switch {
+	case set["cors"]:
+		return "CORS"
+	case set["idor"]:
+		return "IDOR"
+	case set["bola"]:
+		return "BOLA"
+	}
+	joined := strings.Join(words, " ")
+	switch {
+	case strings.Contains(joined, "cross origin resource sharing"):
+		return "CORS"
+	case strings.Contains(joined, "insecure direct object reference"):
+		return "IDOR"
+	case strings.Contains(joined, "broken object level authorization"):
+		return "BOLA"
+	}
+	raw := strings.Join(rawValues, " ")
+	switch {
+	case strings.Contains(raw, "跨域资源共享"):
+		return "CORS"
+	case strings.Contains(raw, "不安全直接对象引用"), strings.Contains(raw, "对象引用越权"):
+		return "IDOR"
+	case strings.Contains(raw, "对象级别授权失效"), strings.Contains(raw, "对象级授权失效"):
+		return "BOLA"
+	default:
+		return ""
+	}
+}
+
 func evaluateFindingQuality(in RecordFindingInput, traffic []PreparedTrafficEvidence) FindingQuality {
 	q := FindingQuality{
 		QualityStatus:     FindingQualityNeedsMore,
 		VulnerabilityType: strings.TrimSpace(in.VulnClass),
 		VerificationType:  "type_specific",
+	}
+	if class := ExcludedFindingClass(in.VulnClass, in.Name); class != "" {
+		q.QualityStatus = FindingQualityBlocked
+		q.BlockingReason = fmt.Sprintf("%s 不能作为独立正式漏洞；请用 record_fact 保留线索，只有已证实的数据读取、权限提升或重大业务影响链才可报告", class)
+		q.EvidenceIntegrity = "not_applicable"
+		return q
 	}
 	if strings.TrimSpace(in.Summary) == "" || strings.TrimSpace(in.Evidence) == "" {
 		q.BlockingReason = "缺少漏洞摘要或可验证证据"
@@ -200,15 +265,35 @@ func (d *DB) SetFindingQuality(ctx context.Context, q FindingQuality) error {
 			(strings.TrimSpace(q.BaselineEvidence) == "" && strings.TrimSpace(q.VerificationRationale) == "") {
 			return errors.New("PASS requires type, proof, verification, 3-5 reproductions, success count, verified integrity, and baseline or rationale")
 		}
-		var severity string
-		if err := d.QueryRowContext(ctx, `SELECT severity FROM findings WHERE id=$1`, q.FindingID).Scan(&severity); err != nil {
-			return err
+	}
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// Lock the finding before its quality row, matching evidence mutations.
+	var (
+		vulnclass, name, severity, summary string
+		taskID                             sql.NullInt64
+		assetIDs                           []byte
+	)
+	if err := tx.QueryRowContext(ctx, `SELECT vulnclass,name,severity,summary,task_id,asset_ids
+FROM findings WHERE id=$1 FOR UPDATE`, q.FindingID).Scan(&vulnclass, &name, &severity, &summary, &taskID, &assetIDs); err != nil {
+		return err
+	}
+	if q.QualityStatus == FindingQualityPass {
+		if class := ExcludedFindingClass(vulnclass, name, q.VulnerabilityType); class != "" {
+			return fmt.Errorf("%s 不能作为独立正式漏洞通过质量审核", class)
 		}
 		if severity == SeverityLow {
 			return errors.New("low severity cannot pass the formal report quality gate")
 		}
 	}
-	result, err := d.ExecContext(ctx, `UPDATE finding_quality SET quality_status=$2,
+	var previous string
+	if err := tx.QueryRowContext(ctx, `SELECT quality_status FROM finding_quality WHERE finding_id=$1 FOR UPDATE`, q.FindingID).Scan(&previous); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE finding_quality SET quality_status=$2,
 		vulnerability_type=$3, verification_type=$4, baseline_evidence=$5,
 		proof_evidence=$6, verification_evidence=$7, verification_rationale=$8,
 		reproduction_count=$9, success_count=$10, blocking_reason=$11, duplicate_risk=$12,
@@ -229,7 +314,23 @@ func (d *DB) SetFindingQuality(ctx context.Context, q FindingQuality) error {
 	if n == 0 {
 		return fmt.Errorf("finding quality not found")
 	}
-	return nil
+	if q.QualityStatus == FindingQualityPass && previous != FindingQualityPass {
+		var assets []int64
+		_ = json.Unmarshal(assetIDs, &assets)
+		snapshot, err := json.Marshal(notify.Snapshot{
+			Kind: notify.EventFindingVerified, FindingID: q.FindingID, TaskID: taskID.Int64,
+			VulnClass: vulnclass, Name: name, Severity: severity, Summary: summary, AssetIDs: assets,
+		})
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO notification_events(kind,finding_id,snapshot)
+VALUES($1,$2,$3) ON CONFLICT (finding_id) WHERE kind='finding_verified' DO NOTHING`,
+			notify.EventFindingVerified, q.FindingID, string(snapshot)); err != nil {
+			return fmt.Errorf("登记已验证漏洞通知失败: %w", err)
+		}
+	}
+	return tx.Commit()
 }
 
 func (d *DB) FormalFindingExportBlockers(findings []*DBFinding) ([]string, error) {
@@ -249,11 +350,19 @@ func (d *DB) FormalFindingExportBlockers(findings []*DBFinding) ([]string, error
 			continue
 		}
 		blockers = append(blockers, FindingDeliveryMetadataBlockers(f.ID, f.Severity, f.Status)...)
+		if class := ExcludedFindingClass(f.VulnClass, f.Name); class != "" {
+			blockers = append(blockers, fmt.Sprintf("#%d:EXCLUDED_%s", f.ID, class))
+		}
 		q := quality[f.ID]
 		if q == nil {
 			blockers = append(blockers, fmt.Sprintf("#%d:UNREVIEWED", f.ID))
 		} else if q.QualityStatus != FindingQualityPass {
 			blockers = append(blockers, fmt.Sprintf("#%d:%s", f.ID, q.QualityStatus))
+		}
+		if q != nil {
+			if class := ExcludedFindingClass(q.VulnerabilityType); class != "" {
+				blockers = append(blockers, fmt.Sprintf("#%d:EXCLUDED_%s", f.ID, class))
+			}
 		}
 		if strings.TrimSpace(f.Report) == "" {
 			blockers = append(blockers, fmt.Sprintf("#%d:REPORT_MISSING", f.ID))

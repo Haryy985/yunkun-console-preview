@@ -51,24 +51,27 @@ type Secrets struct {
 }
 
 type Node struct {
-	ID            int64      `json:"id"`
-	PoolID        int64      `json:"pool_id"`
-	Address       string     `json:"address"`
-	DeclaredIP    string     `json:"declared_ip,omitempty"`
-	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
-	VerifiedIP    string     `json:"verified_ip,omitempty"`
-	VerifiedAt    *time.Time `json:"verified_at,omitempty"`
-	LastError     string     `json:"last_error,omitempty"`
-	Enabled       bool       `json:"enabled"`
-	Origin        string     `json:"origin,omitempty"`
-	LastCheckedAt *time.Time `json:"last_checked_at,omitempty"`
-	LatencyMS     *int       `json:"latency_ms,omitempty"`
-	SuccessCount  int64      `json:"success_count"`
-	FailureCount  int64      `json:"failure_count"`
-	LastSuccessAt *time.Time `json:"last_success_at,omitempty"`
-	LastFailureAt *time.Time `json:"last_failure_at,omitempty"`
-	Notes         string     `json:"notes,omitempty"`
-	DeletedAt     *time.Time `json:"deleted_at,omitempty"`
+	ID               int64      `json:"id"`
+	PoolID           int64      `json:"pool_id"`
+	Address          string     `json:"address"`
+	DeclaredIP       string     `json:"declared_ip,omitempty"`
+	ExpiresAt        *time.Time `json:"expires_at,omitempty"`
+	VerifiedIP       string     `json:"verified_ip,omitempty"`
+	VerifiedAt       *time.Time `json:"verified_at,omitempty"`
+	LastError        string     `json:"last_error,omitempty"`
+	Enabled          bool       `json:"enabled"`
+	Origin           string     `json:"origin,omitempty"`
+	LastCheckedAt    *time.Time `json:"last_checked_at,omitempty"`
+	LatencyMS        *int       `json:"latency_ms,omitempty"`
+	SuccessCount     int64      `json:"success_count"`
+	FailureCount     int64      `json:"failure_count"`
+	LastSuccessAt    *time.Time `json:"last_success_at,omitempty"`
+	LastFailureAt    *time.Time `json:"last_failure_at,omitempty"`
+	Notes            string     `json:"notes,omitempty"`
+	DeletedAt        *time.Time `json:"deleted_at,omitempty"`
+	LastVerifyMode   string     `json:"last_verify_mode,omitempty"`
+	LastVerifyTarget string     `json:"last_verify_target,omitempty"`
+	LastHTTPStatus   int        `json:"last_http_status,omitempty"`
 }
 
 type Quota struct {
@@ -78,6 +81,21 @@ type Quota struct {
 	Remaining   *int64     `json:"remaining,omitempty"`
 	CheckedAt   *time.Time `json:"checked_at,omitempty"`
 	Error       string     `json:"error,omitempty"`
+}
+
+// HasFreshVerification accepts explicit connectivity evidence without claiming
+// an exit IP. Legacy IP proofs remain valid until their original expiry.
+func (n Node) HasFreshVerification(now time.Time) bool {
+	if n.LastError != "" || (n.LastFailureAt != nil &&
+		(n.LastSuccessAt == nil || n.LastSuccessAt.Before(*n.LastFailureAt))) {
+		return false
+	}
+	cutoff := now.Add(-15 * time.Minute)
+	if n.LastVerifyMode == VerifyConnectivity {
+		return n.LastHTTPStatus == http.StatusOK && n.LastSuccessAt != nil && n.LastSuccessAt.After(cutoff)
+	}
+	return (n.LastVerifyMode == "" || n.LastVerifyMode == VerifyExitIP) &&
+		net.ParseIP(n.VerifiedIP) != nil && n.VerifiedAt != nil && n.VerifiedAt.After(cutoff)
 }
 
 func (c *Config) Validate() error {
@@ -147,6 +165,9 @@ func (c *Config) Validate() error {
 		c.QuotaSupported = false
 	}
 	if c.VerifyURL != "" {
+		if c.VerifyURL == "www.baidu.com" || c.VerifyURL == "www.baidu.com/" {
+			c.VerifyURL = BaiduVerifyURL
+		}
 		u, err := url.Parse(c.VerifyURL)
 		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || u.User != nil || u.Fragment != "" {
 			return errors.New("invalid verification URL")

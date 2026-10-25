@@ -4,13 +4,13 @@ import (
 	"context"
 	"fmt"
 
-	"yunkun/console/db"
-	"yunkun/console/intercept"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
+	"yunkun/console/db"
+	"yunkun/console/intercept"
 )
 
 // MainAgent is the thin human-interface orchestrator (docs §4.2 / §7). The human
@@ -125,7 +125,19 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	// 领域工具 + 基础默认工具集（Read/Write/Edit/MultiEdit/LS/Glob/Grep/Bash）
 	// 资产覆盖度功能关闭时剔除 add_task_scope/list_untested_assets（不入 prompt）。
 	base := append(tsx.DropCoverageTools(tsx.MainAgentTools()), actool.DefaultTools()...)
-	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), AgentID: "mainagent"})
+	traceEmit := func(activity db.Activity) {
+		if emit == nil {
+			return
+		}
+		activity.Worker = "mainagent"
+		if mainSeg > 0 {
+			segment := mainSeg
+			activity.MainSeg = &segment
+		}
+		emit(activity)
+	}
+	trace := NewActivityRunTrace("mainagent", traceEmit)
+	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), AgentID: "mainagent", Trace: trace})
 	tools, def, cleanup := AugmentTools(ctx, "mainagent", base)
 	defer cleanup()
 	// 本任务的工作目录 <workDir>/tasks/<taskID>，先建好。
@@ -192,11 +204,12 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	// C2: this session is fresh each turn; re-unlock skill-gated MCPs from prior
 	// Skill() calls in the reloaded history so revealed tools stay callable.
 	seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
-	text, _, err := captureRunSession(ctx, s, message, func(r db.Activity) {
+	text, reason, err := captureRunSession(ctx, s, message, func(r db.Activity) {
 		if emit != nil {
 			r.Worker = "mainagent"
 			emit(r)
 		}
 	})
+	trace.Finish(reason, err)
 	return text, err
 }

@@ -3,7 +3,7 @@ const stages: Record<string, string> = {
   handshake: "代理握手",
   tls: "TLS 握手",
   response: "等待验证接口响应",
-  body: "读取出口 IP",
+  body: "读取验证响应",
 };
 
 const reasons: Record<string, string> = {
@@ -17,7 +17,7 @@ const reasons: Record<string, string> = {
   socks_protocol: "SOCKS5 响应不符合协议，请核对端口和协议；端口连通不代表代理可用",
   target_rejected: "SOCKS5 代理无法连接验证地址，可能受访问策略或目标连通性限制",
   connect_rejected: "HTTP 代理拒绝建立 CONNECT 隧道",
-  redirect: "验证地址发生重定向，请填写最终返回 IP 的地址",
+  redirect: "验证地址发生重定向，请检查目标地址或认证页面",
   http_status: "验证接口返回非 200 状态",
   oversized: "响应超过 4096 字节，请使用只返回出口 IP 的接口",
   invalid_ip: "响应未包含单个有效 IP，需要纯文本 IP 或 JSON 的 ip/origin 字段",

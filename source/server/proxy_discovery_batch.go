@@ -62,21 +62,27 @@ func (s *Server) batchProxyDiscoveryResults(w http.ResponseWriter, r *http.Reque
 	items := make([]outcome, len(req.IDs))
 	if req.Action == "verify" {
 		var wg sync.WaitGroup
-		for i, id := range req.IDs {
-			if r.Context().Err() != nil {
-				wg.Wait()
-				return
-			}
+		jobs := make(chan int)
+		for range min(len(req.IDs), 10) {
 			wg.Add(1)
-			go func(i int, id int64) {
+			go func() {
 				defer wg.Done()
-				_, status, err := s.verifyDiscoveryCandidateWithTimeout(r.Context(), id, discoveryBatchVerifyTimeout)
-				items[i] = outcome{ID: id, OK: err == nil, Status: status}
-				if err != nil {
-					items[i].Error = err.Error()
+				for i := range jobs {
+					_, status, err := s.verifyDiscoveryCandidateWithTimeout(r.Context(), req.IDs[i], discoveryBatchVerifyTimeout)
+					items[i] = outcome{ID: req.IDs[i], OK: err == nil, Status: status}
+					if err != nil {
+						items[i].Error = err.Error()
+					}
 				}
-			}(i, id)
+			}()
 		}
+		for i := range req.IDs {
+			if r.Context().Err() != nil {
+				break
+			}
+			jobs <- i
+		}
+		close(jobs)
 		wg.Wait()
 		if r.Context().Err() != nil {
 			return

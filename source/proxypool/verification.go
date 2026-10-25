@@ -42,6 +42,15 @@ func IsVerificationTimeout(err error) bool {
 	return errors.As(err, &failure) && failure.code == "timeout"
 }
 
+// VerificationFailureCode exposes stable diagnostics without raw network errors.
+func VerificationFailureCode(err error) (stage, code string) {
+	var failure *verificationFailure
+	if errors.As(err, &failure) {
+		return failure.stage.String(), failure.code
+	}
+	return "configuration", "invalid_proxy"
+}
+
 func (e *verificationFailure) Error() string {
 	return fmt.Sprintf("[proxy_verify:%s:%s] proxy verification %s", e.stage, e.code, e.message)
 }
@@ -54,16 +63,45 @@ func Verify(ctx context.Context, upstream *url.URL, endpoint string) (string, er
 	return verifyWithTransport(ctx, upstream, endpoint, nil)
 }
 
+const (
+	VerifyExitIP       = "exit_ip"
+	VerifyConnectivity = "connectivity"
+	BaiduVerifyURL     = "https://www.baidu.com/"
+	DefaultIPVerifyURL = "https://api.ipify.org?format=json"
+)
+
+type VerificationResult struct {
+	IP         string `json:"ip,omitempty"`
+	Mode       string `json:"mode"`
+	Target     string `json:"target"`
+	HTTPStatus int    `json:"http_status,omitempty"`
+}
+
+func VerifyEndpoint(ctx context.Context, upstream *url.URL, endpoint, mode string) (VerificationResult, error) {
+	return verifyEndpointWithTransport(ctx, upstream, endpoint, mode, nil)
+}
+
 // A transport override is used only by local TLS fixtures to trust their CA.
 func verifyWithTransport(ctx context.Context, upstream *url.URL, endpoint string, tlsConfig *tls.Config) (string, error) {
+	result, err := verifyEndpointWithTransport(ctx, upstream, endpoint, VerifyExitIP, tlsConfig)
+	return result.IP, err
+}
+
+func verifyEndpointWithTransport(ctx context.Context, upstream *url.URL, endpoint, mode string, tlsConfig *tls.Config) (VerificationResult, error) {
+	result := VerificationResult{Mode: mode}
+	if mode != VerifyExitIP && mode != VerifyConnectivity {
+		return result, errors.New("unsupported verification mode")
+	}
 	if upstream == nil || upstream.Host == "" ||
 		(upstream.Scheme != "http" && upstream.Scheme != "https" && upstream.Scheme != "socks5") {
-		return "", errors.New("verification requires an HTTP, HTTPS or SOCKS5 proxy")
+		return result, errors.New("verification requires an HTTP, HTTPS or SOCKS5 proxy")
 	}
 	u, err := url.Parse(endpoint)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.User != nil || u.Host == "" {
-		return "", errors.New("configure a verification URL first")
+		return result, errors.New("configure a verification URL first")
 	}
+	// Persist the target origin, never query-string credentials or response text.
+	result.Target = u.Scheme + "://" + u.Host
 	var stage atomic.Int32
 	tr := proxyTransport(upstream)
 	tr.TLSClientConfig = tlsConfig
@@ -80,6 +118,9 @@ func verifyWithTransport(ctx context.Context, upstream *url.URL, endpoint string
 		return conn, err
 	}
 	tr.OnProxyConnectResponse = func(_ context.Context, _ *url.URL, _ *http.Request, resp *http.Response) error {
+		if resp.StatusCode != http.StatusOK {
+			result.HTTPStatus = resp.StatusCode
+		}
 		if resp.StatusCode == http.StatusProxyAuthRequired {
 			return verificationProblem(verifyHandshake, "auth", "HTTP proxy authentication required or rejected (HTTP 407)")
 		}
@@ -101,32 +142,42 @@ func verifyWithTransport(ctx context.Context, upstream *url.URL, endpoint string
 	client := &http.Client{Transport: tr, Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), "GET", u.String(), nil)
 	if err != nil {
-		return "", errors.New("invalid verification request")
+		return result, errors.New("invalid verification request")
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", verificationErrorAt(err, verificationStage(stage.Load()))
+		return result, verificationErrorAt(err, verificationStage(stage.Load()))
 	}
 	defer resp.Body.Close()
+	result.HTTPStatus = resp.StatusCode
 	if resp.StatusCode == http.StatusProxyAuthRequired {
-		return "", verificationProblem(verifyHandshake, "auth", "HTTP proxy authentication required or rejected (HTTP 407)")
+		return result, verificationProblem(verifyHandshake, "auth", "HTTP proxy authentication required or rejected (HTTP 407)")
 	}
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		return "", verificationProblem(verifyResponse, "redirect", fmt.Sprintf("endpoint redirected (HTTP %d); configure the final URL", resp.StatusCode))
+		return result, verificationProblem(verifyResponse, "redirect", fmt.Sprintf("endpoint redirected (HTTP %d); configure the final URL", resp.StatusCode))
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", verificationProblem(verifyResponse, "http_status", fmt.Sprintf("endpoint returned HTTP %d", resp.StatusCode))
+		return result, verificationProblem(verifyResponse, "http_status", fmt.Sprintf("endpoint returned HTTP %d", resp.StatusCode))
+	}
+	if mode == VerifyConnectivity {
+		// A normal web page is not an IP echo service. Bound the sample while
+		// retaining TLS verification, proxy routing, and response-read errors.
+		if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, 1024)); err != nil {
+			return result, verificationErrorAt(err, verifyBody)
+		}
+		return result, nil
 	}
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 4097))
 	if err != nil {
-		return "", verificationErrorAt(err, verifyBody)
+		return result, verificationErrorAt(err, verifyBody)
 	}
 	if len(b) > 4096 {
-		return "", verificationProblem(verifyBody, "oversized", "endpoint response exceeds 4096 bytes")
+		return result, verificationProblem(verifyBody, "oversized", "endpoint response exceeds 4096 bytes")
 	}
 	ip := strings.TrimSpace(string(b))
 	if net.ParseIP(ip) != nil {
-		return ip, nil
+		result.IP = ip
+		return result, nil
 	}
 	var payload struct {
 		IP     string `json:"ip"`
@@ -136,11 +187,12 @@ func verifyWithTransport(ctx context.Context, upstream *url.URL, endpoint string
 		for _, value := range []string{payload.IP, payload.Origin} {
 			value = strings.TrimSpace(value)
 			if net.ParseIP(value) != nil {
-				return value, nil
+				result.IP = value
+				return result, nil
 			}
 		}
 	}
-	return "", verificationProblem(verifyBody, "invalid_ip", "endpoint must return one IP address as plain text or JSON ip/origin")
+	return result, verificationProblem(verifyBody, "invalid_ip", "endpoint must return one IP address as plain text or JSON ip/origin")
 }
 
 // Raw network errors may contain credentials, endpoint secrets or untrusted

@@ -78,17 +78,8 @@ jobs:
         run: sha256sum *.zip > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
-          name: 云鲲自动化渗透控制台 v1.0.6 离线版
-          body: |
-            ## v1.0.6-offline
-
-            - FOFA / Quake 默认查询语句固定为 `service:socks5 AND country: "CN" AND response:"No authentication"`。
-            - 默认每次抓取 500 条，旧来源为空配置会自动使用新默认值。
-            - 抓取后自动验证新候选；验证通过后只进入候选区，不会自动入池或启用。
-            - 默认代理验证地址为 `https://api.ipify.org?format=json`。
-            - 更新保留 `.yunkun-local`、PostgreSQL、账号、凭据、任务和 Skills 数据。
-
-            本 Release 仅提供 Linux、Windows、macOS 三个平台包及 `SHA256SUMS` 校验文件。
+          name: 云鲲自动化渗透控制台 ${{ github.ref_name }} 离线版
+          body_path: source/docs/RELEASE_1.1.1.md
           files: |
             dist/*.zip
             dist/SHA256SUMS

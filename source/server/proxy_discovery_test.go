@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -27,9 +28,10 @@ func TestQuakeDiscoveryUsesServiceProtocol(t *testing.T) {
 		{"normalized SOCKS5", " SOCKS5 ", "socks5"},
 		{"SOCKS5 remote DNS", "socks5h", "socks5"},
 		{"HTTP proxy", "http", "http"},
-		{"TCP is not a proxy protocol", "tcp", "http"},
-		{"SOCKS4 is not SOCKS5", "socks4", "http"},
-		{"missing service", "", "http"},
+		{"HTTPS proxy", "https", "https"},
+		{"TCP is not a proxy protocol", "tcp", "unknown"},
+		{"SOCKS4 is not SOCKS5", "socks4", "unknown"},
+		{"missing service", "", "unknown"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			payload := `{"data":[{"ip":"203.0.113.7","port":1080,"transport":"tcp","service":{"name":"` + test.service + `"}}]}`
@@ -101,6 +103,51 @@ func TestDiscoveryProviderOffsets(t *testing.T) {
 				t.Fatalf("fetch: count=%d err=%v", count, err)
 			}
 		})
+	}
+}
+
+func TestFOFAQueryEncodingPreservesCustomQueryAndPaging(t *testing.T) {
+	query := `title="安全 + console" && country="CN"`
+	s := &Server{proxyDiscovery: &proxyDiscoveryService{client: &http.Client{
+		Transport: discoveryProtocolTransport(func(r *http.Request) (*http.Response, error) {
+			q := r.URL.Query()
+			decoded, err := base64.StdEncoding.DecodeString(q.Get("qbase64"))
+			if err != nil || string(decoded) != query {
+				t.Errorf("FOFA query changed: encoded=%q decoded=%q err=%v", q.Get("qbase64"), decoded, err)
+			}
+			if q.Get("page") != "3" || q.Get("size") != "100" {
+				t.Errorf("FOFA paging changed: %s", r.URL.RawQuery)
+			}
+			return &http.Response{StatusCode: http.StatusOK,
+				Body: io.NopCloser(strings.NewReader(`{"results":[]}`)), Header: make(http.Header)}, nil
+		}),
+	}}}
+	_, _, err := s.fetchFOFA(context.Background(), &db.ProxyDiscoverySource{
+		Provider: "fofa", Query: query, FetchLimit: 100, NextOffset: 200,
+	}, proxypool.Secrets{APIValue: `{"email":"fixture@example.invalid","key":"fixture-secret"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFOFAErrorPreservesParameterDiagnosticWithoutCredentials(t *testing.T) {
+	s := &Server{proxyDiscovery: &proxyDiscoveryService{client: &http.Client{
+		Transport: discoveryProtocolTransport(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK,
+				Body:   io.NopCloser(strings.NewReader(`{"error":true,"error_code":-4,"errmsg":"[-4] 参数错误 fixture-secret custom saved query"}`)),
+				Header: make(http.Header)}, nil
+		}),
+	}}}
+	_, _, err := s.fetchFOFA(context.Background(), &db.ProxyDiscoverySource{
+		Provider: "fofa", Query: `custom saved query`, FetchLimit: 100,
+	}, proxypool.Secrets{APIValue: `{"email":"fixture@example.invalid","key":"fixture-secret"}`})
+	if err == nil || !strings.Contains(err.Error(), "[-4]") || !strings.Contains(err.Error(), "参数错误") ||
+		!strings.Contains(err.Error(), "code=-4") || !strings.Contains(err.Error(), "page=1 size=100") {
+		t.Fatalf("FOFA diagnostic lost provider error: %v", err)
+	}
+	if strings.Contains(err.Error(), "fixture-secret") || strings.Contains(err.Error(), "fixture@example.invalid") ||
+		strings.Contains(err.Error(), "custom saved query") {
+		t.Fatalf("FOFA diagnostic leaked credentials: %v", err)
 	}
 }
 

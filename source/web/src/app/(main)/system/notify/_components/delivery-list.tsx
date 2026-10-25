@@ -135,6 +135,11 @@ export function DeliveryList({ channels }: { channels: NotificationChannel[] }) 
                           状态变更
                         </Badge>
                       )}
+                      {d.event_kind === "finding_verified" && (
+                        <Badge variant="outline" className="shrink-0">
+                          已验证
+                        </Badge>
+                      )}
                     </div>
                   </TableCell>
                   <TableCell className="text-sm">{d.channel_name}</TableCell>

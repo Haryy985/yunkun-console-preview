@@ -2,6 +2,17 @@ name: Unix offline package smoke test
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing candidate release tag to verify
+        required: true
+        default: v1.1.1-offline
+        type: string
+  workflow_call:
+    inputs:
+      release_tag:
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -17,9 +28,9 @@ jobs:
           - runner: ubuntu-24.04-arm
             package: linux-arm64
           - runner: macos-15-intel
-            package: macos-intel
+            package: darwin-amd64
           - runner: macos-15
-            package: macos-apple-silicon
+            package: darwin-arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 12
     steps:
@@ -30,31 +41,36 @@ jobs:
         shell: bash
         env:
           PACKAGE: ${{ matrix.package }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
-          base="https://github.com/Haryy985/yunkun-console-preview/releases/download/v1.0.3-offline"
-          archive="yunkun-v1.0.3-offline-${PACKAGE}.tar.gz"
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-offline$ ]]
+          base="https://github.com/Haryy985/yunkun-console-preview/releases/download/$RELEASE_TAG"
+          archive="yunkun-${RELEASE_TAG#v}-${PACKAGE}.zip"
           cd "$RUNNER_TEMP"
           curl --fail --location --retry 3 "$base/$archive" -o "$archive"
-          curl --fail --location --retry 3 "$base/SHA256SUMS.txt" -o SHA256SUMS.txt
+          curl --fail --location --retry 3 "$base/SHA256SUMS" -o SHA256SUMS
           python3 - "$archive" <<'PY'
           import hashlib
           import pathlib
           import sys
           name = sys.argv[1]
-          expected = dict(line.split()[::-1] for line in pathlib.Path("SHA256SUMS.txt").read_text().splitlines())[name]
-          actual = hashlib.file_digest(open(name, "rb"), "sha256").hexdigest()
+          expected = dict(line.split()[::-1] for line in pathlib.Path("SHA256SUMS").read_text().splitlines())[name]
+          actual = hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest()
           assert actual == expected, (name, actual, expected)
           print("Archive SHA-256 verified:", name)
           PY
-          tar -xzf "$archive"
+          unzip -q "$archive"
+          cd "yunkun-${RELEASE_TAG}"
+          shasum -a 256 -c FILES.sha256
       - name: Verify first startup, embedded UI, authentication and retained data
         shell: bash
         env:
           PACKAGE: ${{ matrix.package }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           python3 source/tests/unix-offline-smoke.py \
-            "$RUNNER_TEMP/yunkun-v1.0.3-offline-${PACKAGE}" \
+            "$RUNNER_TEMP/yunkun-${RELEASE_TAG}" \
             "$RUNNER_TEMP/smoke-result.json"
       - uses: actions/upload-artifact@v4
         if: always()

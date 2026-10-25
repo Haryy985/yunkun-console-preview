@@ -5,12 +5,16 @@ import {
   ActivityIcon,
   CheckCircle2Icon,
   DownloadIcon,
+  FileUpIcon,
+  FileDownIcon,
   GaugeIcon,
+  LoaderCircleIcon,
   PencilIcon,
   PlusIcon,
   RefreshCwIcon,
   SearchIcon,
   ShieldCheckIcon,
+  SquareIcon,
   Trash2Icon,
   WifiOffIcon,
   type LucideIcon,
@@ -48,6 +52,7 @@ import type {
   ProxyNodeSummary,
   ProxyEvent,
   ProxyGlobalSettings,
+  ProxyVerificationMode,
 } from "@/lib/proxy-pool-types";
 
 const initial: ProxyPoolConfig = {
@@ -70,9 +75,30 @@ const initial: ProxyPoolConfig = {
   expiry_warning_seconds: 3600,
 };
 const kinds = { fixed: "固定节点", xiaoxiang: "小象代理", generic: "通用 JSON API" };
-const selectClass = "h-9 w-full rounded-md border bg-background px-3 text-sm";
+const compactSelectClass = "h-9 max-w-full rounded-md border bg-background px-3 text-sm";
+const selectClass = `${compactSelectClass} w-full`;
 function when(value?: string) {
   return value ? new Date(value).toLocaleString() : "-";
+}
+
+function nodeEndpoint(address: string) {
+  try {
+    const url = new URL(address);
+    return { host: url.hostname, port: url.port, protocol: url.protocol.replace(":", "").toUpperCase() };
+  } catch {
+    return { host: address, port: "-", protocol: "-" };
+  }
+}
+
+function nodeOrigin(node: ProxyNode, pool: ProxyPool) {
+  if (node.origin === "fofa") return "FOFA";
+  if (node.origin === "quake") return "Quake";
+  return node.origin === "manual" || pool.config.kind === "fixed" ? "手动" : "供应商";
+}
+
+function verificationLabel(node: ProxyNode) {
+  if (node.last_verify_mode === "connectivity") return "百度连通性";
+  return node.last_verify_mode === "exit_ip" || node.verified_at ? "出口 IP" : "-";
 }
 
 function nodeStatus(node: ProxyNode, warningSeconds: number) {
@@ -118,7 +144,7 @@ export default function ProxyPoolsPage() {
   const [deleting, setDeleting] = React.useState<ProxyPool | null>(null);
   const [nodeQuery, setNodeQuery] = React.useState("");
   const [selectedNodeIDs, setSelectedNodeIDs] = React.useState<number[]>([]);
-  const [mainView, setMainView] = React.useState("overview");
+  const [mainView, setMainView] = React.useState("nodes");
   const [discoverySummary, setDiscoverySummary] = React.useState<{
     total: number;
     unapproved: number;
@@ -127,9 +153,38 @@ export default function ProxyPoolsPage() {
   const [discoveryRefresh, setDiscoveryRefresh] = React.useState(0);
   const [nodePage, setNodePage] = React.useState(1);
   const [nodePageSize, setNodePageSize] = React.useState(20);
+  const [nodeTotal, setNodeTotal] = React.useState(0);
+  const [nodeStatusFilter, setNodeStatusFilter] = React.useState("");
+  const [nodeProtocol, setNodeProtocol] = React.useState("");
+  const [nodeSort, setNodeSort] = React.useState("newest");
+  const [search, setSearch] = React.useState("");
+  const [detailLoading, setDetailLoading] = React.useState(false);
+  const [verifyMode, setVerifyMode] = React.useState<ProxyVerificationMode>("connectivity");
+  const [verifyingIDs, setVerifyingIDs] = React.useState<number[]>([]);
+  const [verification, setVerification] = React.useState<{
+    total: number;
+    done: number;
+    passed: number;
+    failed: number;
+    running: boolean;
+    canceled: boolean;
+  } | null>(null);
+  const verificationController = React.useRef<AbortController | null>(null);
+  const importInput = React.useRef<HTMLInputElement>(null);
+  const [importPending, setImportPending] = React.useState(0);
   const [globalSettings, setGlobalSettings] = React.useState<ProxyGlobalSettings>({ enabled: true });
   const detailRequest = React.useRef(0);
+  const previousPool = React.useRef(selected);
   const current = pools.find((p) => p.id === selected);
+
+  React.useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setSearch(nodeQuery.trim());
+      setNodePage(1);
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [nodeQuery]);
+  React.useEffect(() => () => verificationController.current?.abort(), []);
 
   const load = React.useCallback(async () => {
     setLoading(true);
@@ -144,24 +199,64 @@ export default function ProxyPoolsPage() {
       setLoading(false);
     }
   }, []);
-  const loadDetail = React.useCallback(async (id: number) => {
-    const request = ++detailRequest.current;
-    const results = await Promise.allSettled([api.proxyNodes(id), api.proxyEvents(id)]);
-    if (request !== detailRequest.current) return;
-    const [n, e] = results;
-    if (n.status === "fulfilled") {
-      setNodes(n.value.nodes);
-      setSummary(n.value.summary);
-    } else {
-      setNodes([]);
-      toast.error(n.reason.message);
-    }
-    if (e.status === "fulfilled") setEvents(e.value.events);
-    else {
-      setEvents([]);
-      toast.error(e.reason.message);
-    }
-  }, []);
+  const loadDetail = React.useCallback(
+    async (id: number) => {
+      const request = ++detailRequest.current;
+      setDetailLoading(true);
+      const results = await Promise.allSettled([
+        api.proxyNodes(id, {
+          page: nodePage,
+          page_size: nodePageSize,
+          q: search,
+          status: nodeStatusFilter,
+          protocol: nodeProtocol,
+          sort: nodeSort,
+        }),
+        api.proxyEvents(id),
+      ]);
+      if (request !== detailRequest.current) return;
+      setDetailLoading(false);
+      const [n, e] = results;
+      if (n.status === "fulfilled") {
+        setNodes(n.value.nodes);
+        setSummary(n.value.summary);
+        setNodeTotal(n.value.total);
+      } else {
+        setNodes([]);
+        setNodeTotal(0);
+        toast.error(n.reason.message);
+      }
+      if (e.status === "fulfilled") setEvents(e.value.events);
+      else {
+        setEvents([]);
+        toast.error(e.reason.message);
+      }
+    },
+    [nodePage, nodePageSize, search, nodeStatusFilter, nodeProtocol, nodeSort],
+  );
+
+  React.useEffect(() => {
+    if (!selected || !admin) return;
+    let canceled = false;
+    let previous = 0;
+    let timer: ReturnType<typeof setTimeout>;
+    setImportPending(0);
+    const poll = async () => {
+      try {
+        const status = await api.proxyImportStatus(selected);
+        if (canceled) return;
+        setImportPending(status.pending);
+        if (status.pending > 0 || previous > 0) await loadDetail(selected);
+        previous = status.pending;
+      } catch {
+        // Normal page loading reports connection errors.
+      } finally {
+        if (!canceled) timer = setTimeout(poll, 2000);
+      }
+    };
+    void poll();
+    return () => { canceled = true; clearTimeout(timer); };
+  }, [selected, admin, loadDetail]);
   React.useEffect(() => {
     void load();
     void api
@@ -191,11 +286,17 @@ export default function ProxyPoolsPage() {
     }
   }
   React.useEffect(() => {
+    if (previousPool.current === selected) return;
+    previousPool.current = selected;
     setNodes([]);
     setSelectedNodeIDs([]);
     setNodePage(1);
+    setNodeTotal(0);
+    setVerification(null);
     setSummary({ total: 0, available: 0, pending: 0, expiring: 0, error: 0, disabled: 0 });
     setEvents([]);
+  }, [selected]);
+  React.useEffect(() => {
     if (selected !== null && admin) void loadDetail(selected);
     return () => {
       detailRequest.current++;
@@ -263,14 +364,89 @@ export default function ProxyPoolsPage() {
     </div>
   );
 
-  const filteredNodes = nodes.filter((node) => {
-    const needle = nodeQuery.trim().toLowerCase();
-    if (!needle) return true;
-    return [node.address, node.declared_ip, node.verified_ip, node.origin, node.last_error]
-      .filter(Boolean)
-      .some((value) => value!.toLowerCase().includes(needle));
-  });
-  const pagedNodes = filteredNodes.slice((nodePage - 1) * nodePageSize, nodePage * nodePageSize);
+  const pagedNodes = nodes;
+
+  async function verifyNodes(ids: number[]) {
+    if (!current || ids.length === 0 || verificationController.current) return;
+    const poolID = current.id;
+    const queue = [...new Set(ids)];
+    const controller = new AbortController();
+    verificationController.current = controller;
+    setBusy(true);
+    setVerification({ total: queue.length, done: 0, passed: 0, failed: 0, running: true, canceled: false });
+    let index = 0;
+    try {
+      await Promise.all(
+        Array.from({ length: Math.min(4, queue.length) }, async () => {
+          while (!controller.signal.aborted && index < queue.length) {
+            const id = queue[index++];
+            setVerifyingIDs((previous) => [...previous, id]);
+            let passed = false;
+            try {
+              await api.verifyProxyNode(poolID, id, verifyMode, controller.signal);
+              passed = true;
+            } catch (error) {
+              if (!controller.signal.aborted && queue.length === 1) {
+                toast.error(proxyVerificationMessage((error as Error).message));
+              }
+            } finally {
+              setVerifyingIDs((previous) => previous.filter((value) => value !== id));
+              if (!controller.signal.aborted)
+                setVerification(
+                  (previous) =>
+                    previous && {
+                      ...previous,
+                      done: previous.done + 1,
+                      passed: previous.passed + (passed ? 1 : 0),
+                      failed: previous.failed + (passed ? 0 : 1),
+                    },
+                );
+            }
+          }
+        }),
+      );
+    } finally {
+      setVerification((previous) => previous && { ...previous, running: false, canceled: controller.signal.aborted });
+      verificationController.current = null;
+      await loadDetail(poolID);
+      setBusy(false);
+    }
+  }
+
+  async function importProxyFile(file: File) {
+    if (!current || busy) return;
+    setBusy(true);
+    try {
+      const result = await api.importProxyNodes(current.id, file);
+      toast.success(`新增 ${result.imported} 个节点，跳过 ${result.skipped} 个重复节点`);
+      setImportPending((previous) => previous + result.imported);
+      await loadDetail(current.id);
+    } catch (error) {
+      toast.error((error as Error).message || "代理节点导入失败");
+      await loadDetail(current.id);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function exportProxyFile() {
+    if (!current || busy) return;
+    setBusy(true);
+    try {
+      const blob = await api.exportProxyNodes(current.id);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `proxy-pool-${current.id}.csv`;
+      link.click();
+      URL.revokeObjectURL(url);
+      toast.success("代理节点已导出");
+    } catch (error) {
+      toast.error((error as Error).message || "代理节点导出失败");
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function updateNode(node: ProxyNode, enabled: boolean) {
     setBusy(true);
@@ -301,6 +477,10 @@ export default function ProxyPoolsPage() {
 
   async function batchNodeAction(actionName: "enable" | "disable") {
     if (!current || selectedNodeIDs.length === 0) return;
+    if (selectedNodeIDs.length > 500) {
+      toast.error("每次最多操作 500 个节点");
+      return;
+    }
     setBusy(true);
     try {
       const result = await api.batchUpdateProxyNodes(current.id, selectedNodeIDs, actionName);
@@ -315,7 +495,7 @@ export default function ProxyPoolsPage() {
   }
 
   return (
-    <main className="min-w-0 space-y-6 p-4 md:p-6">
+    <main data-content-padding="false" className="min-w-0 space-y-4 p-4 md:p-6">
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="font-semibold text-xl">代理池</h1>
@@ -328,7 +508,7 @@ export default function ProxyPoolsPage() {
             <span className="whitespace-nowrap text-muted-foreground text-xs">全局代理</span>
             <Switch
               checked={globalSettings.enabled}
-              disabled={!admin}
+              disabled={!admin || busy}
               aria-label="全局代理开关"
               onCheckedChange={(value) => {
                 if (!value && !window.confirm("关闭后只影响新任务，已有运行任务继续使用当前租约。确认关闭吗？")) return;
@@ -339,7 +519,7 @@ export default function ProxyPoolsPage() {
           <select
             className="h-9 max-w-52 rounded-md border bg-background px-3 text-sm"
             value={globalSettings.default_pool_id ?? ""}
-            disabled={!admin}
+            disabled={!admin || busy}
             aria-label="默认代理池"
             onChange={(event) =>
               void updateGlobalSettings({ default_pool_id: event.target.value ? Number(event.target.value) : 0 })
@@ -369,7 +549,7 @@ export default function ProxyPoolsPage() {
             <RefreshCwIcon className="size-4" />
           </Button>
           {admin && (
-            <Button onClick={() => edit()}>
+            <Button disabled={busy} onClick={() => edit()}>
               <PlusIcon className="mr-2 size-4" />
               添加来源
             </Button>
@@ -381,13 +561,29 @@ export default function ProxyPoolsPage() {
           {error}
         </p>
       )}
-      <Tabs value={mainView} onValueChange={setMainView} className="max-w-full overflow-x-auto">
+      <Tabs
+        value={mainView}
+        onValueChange={(view) => {
+          if (!busy) setMainView(view);
+        }}
+        className="max-w-full overflow-x-auto"
+      >
         <TabsList>
-          <TabsTrigger value="overview">总览</TabsTrigger>
-          <TabsTrigger value="nodes">代理 IP</TabsTrigger>
-          <TabsTrigger value="sources">来源管理</TabsTrigger>
-          <TabsTrigger value="discovery">FOFA / Quake 发现</TabsTrigger>
-          <TabsTrigger value="events">使用记录</TabsTrigger>
+          <TabsTrigger value="nodes" disabled={busy}>
+            代理 IP
+          </TabsTrigger>
+          <TabsTrigger value="overview" disabled={busy}>
+            总览
+          </TabsTrigger>
+          <TabsTrigger value="sources" disabled={busy}>
+            来源管理
+          </TabsTrigger>
+          <TabsTrigger value="discovery" disabled={busy}>
+            FOFA / Quake 发现
+          </TabsTrigger>
+          <TabsTrigger value="events" disabled={busy}>
+            使用记录
+          </TabsTrigger>
         </TabsList>
       </Tabs>
       {mainView === "discovery" && admin ? (
@@ -424,7 +620,7 @@ export default function ProxyPoolsPage() {
               </Button>
             </div>
           ) : null}
-          <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
+          <section className="grid grid-cols-2 border-y sm:grid-cols-3 xl:grid-cols-6">
             {(
               [
                 ["全部节点", summary.total, ActivityIcon, "text-foreground"],
@@ -435,23 +631,16 @@ export default function ProxyPoolsPage() {
                 ["已停用", summary.disabled, WifiOffIcon, "text-muted-foreground"],
               ] as [string, number, LucideIcon, string][]
             ).map(([label, value, Icon, color]) => (
-              <div key={String(label)} className="border bg-card p-4">
+              <div key={String(label)} className="flex items-center justify-between gap-3 px-3 py-2.5">
                 <div className="flex items-center justify-between gap-3">
-                  <span className="text-muted-foreground text-sm">{label}</span>
                   <Icon className={`size-4 ${color}`} />
+                  <span className="whitespace-nowrap text-muted-foreground text-xs">{label}</span>
                 </div>
-                <p className="mt-2 font-semibold text-2xl tabular-nums">{value}</p>
-                <p className="mt-1 text-muted-foreground text-xs">{current?.config.name ?? "请选择代理池"}</p>
+                <p className="font-semibold text-lg tabular-nums">{value}</p>
               </div>
             ))}
           </section>
-          <div
-            className={
-              mainView === "nodes" || mainView === "overview" || mainView === "sources"
-                ? "overflow-x-auto border-y"
-                : "hidden"
-            }
-          >
+          <div className={mainView === "overview" || mainView === "sources" ? "overflow-x-auto border-y" : "hidden"}>
             <table className="w-full min-w-[760px] text-left text-sm">
               <thead className="text-muted-foreground">
                 <tr>
@@ -470,6 +659,7 @@ export default function ProxyPoolsPage() {
                       <button
                         type="button"
                         className="break-all text-left font-medium underline-offset-4 hover:underline"
+                        disabled={busy}
                         onClick={() => setSelected(p.id)}
                       >
                         {p.config.name}
@@ -527,11 +717,102 @@ export default function ProxyPoolsPage() {
               <p className="p-10 text-center text-muted-foreground text-sm">{loading ? "加载中" : "暂无代理来源"}</p>
             )}
           </div>
+          {pools.length === 0 && mainView === "nodes" && (
+            <p className="py-12 text-center text-muted-foreground text-sm">{loading ? "加载中" : "暂无代理来源"}</p>
+          )}
           {current && admin && mainView !== "sources" && (
             <section className="space-y-4">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <h2 className="break-all font-medium">{current.config.name}</h2>
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b bg-muted/10 pb-3">
+                <div className="flex min-w-0 flex-wrap items-center gap-2">
+                  <Label htmlFor="active-pool">代理池</Label>
+                  <select
+                    id="active-pool"
+                    className={`${compactSelectClass} max-w-56`}
+                    value={selected ?? ""}
+                    disabled={busy}
+                    onChange={(event) => setSelected(Number(event.target.value))}
+                  >
+                    {pools.map((pool) => (
+                      <option key={pool.id} value={pool.id}>
+                        {pool.config.name}
+                      </option>
+                    ))}
+                  </select>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    title="编辑当前来源"
+                    aria-label="编辑当前来源"
+                    disabled={busy}
+                    onClick={() => edit(current)}
+                  >
+                    <PencilIcon className="size-4" />
+                  </Button>
+                  <span
+                    className={`text-xs ${current.config.enabled ? "text-emerald-700 dark:text-emerald-400" : "text-muted-foreground"}`}
+                  >
+                    {current.config.enabled ? "来源已启用" : "来源已停用"}
+                  </span>
+                </div>
+                {mainView !== "events" && (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Label htmlFor="node-verification-mode" className="text-xs">
+                      验证目标
+                    </Label>
+                    <select
+                      id="node-verification-mode"
+                      className={compactSelectClass}
+                      value={verifyMode}
+                      disabled={busy}
+                      onChange={(event) => setVerifyMode(event.target.value as ProxyVerificationMode)}
+                    >
+                      <option value="connectivity">百度 · www.baidu.com</option>
+                      <option value="exit_ip">出口 IP · IP 回显接口</option>
+                    </select>
+                    <Button
+                      disabled={busy || detailLoading || !current.config.enabled || pagedNodes.length === 0}
+                      onClick={() => void verifyNodes(pagedNodes.map((node) => node.id))}
+                    >
+                      <ShieldCheckIcon className="mr-2 size-4" />
+                      验证本页
+                    </Button>
+                    {selectedNodeIDs.length > 0 && (
+                      <Button
+                        variant="outline"
+                        disabled={busy || !current.config.enabled}
+                        onClick={() => void verifyNodes(selectedNodeIDs)}
+                      >
+                        <ShieldCheckIcon className="mr-2 size-4" />
+                        验证所选（{selectedNodeIDs.length}）
+                      </Button>
+                    )}
+                  </div>
+                )}
                 <div className="flex flex-wrap gap-2">
+                  <input
+                    ref={importInput}
+                    type="file"
+                    accept=".txt,.csv,text/plain,text/csv"
+                    className="hidden"
+                    onChange={(event) => {
+                      const file = event.target.files?.[0];
+                      event.target.value = "";
+                      if (file) void importProxyFile(file);
+                    }}
+                  />
+                  <Button variant="outline" disabled={busy || !current.config.enabled || current.config.kind !== "fixed"}
+                    onClick={() => importInput.current?.click()}>
+                    <FileUpIcon className="mr-2 size-4" />
+                    导入并验证
+                  </Button>
+                  <Button variant="outline" disabled={busy} onClick={() => void exportProxyFile()}>
+                    <FileDownIcon className="mr-2 size-4" />
+                    导出节点
+                  </Button>
+                  <Button variant="outline" disabled={busy} onClick={() => setMainView("discovery")}>
+                    <SearchIcon className="mr-2 size-4" />
+                    自动发现
+                  </Button>
                   {current.config.quota_supported && (
                     <Button
                       variant="outline"
@@ -570,31 +851,94 @@ export default function ProxyPoolsPage() {
                   小象暂未返回余量数据。余量查询仅适用于短效包量套餐；其他套餐可关闭余量查询，继续提取节点。
                 </p>
               )}
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="relative min-w-64 flex-1 sm:max-w-sm">
-                  <SearchIcon className="pointer-events-none absolute top-2.5 left-3 size-4 text-muted-foreground" />
-                  <Input
-                    value={nodeQuery}
+              {importPending > 0 && <p className="text-sm text-muted-foreground">导入验证中：剩余 {importPending} 个</p>}
+              {verification && (
+                <div
+                  role="status"
+                  aria-live="polite"
+                  className="flex flex-wrap items-center gap-3 border-primary border-l-2 bg-muted/30 px-3 py-2 text-sm"
+                >
+                  {verification.running && <LoaderCircleIcon className="size-4 animate-spin" />}
+                  <span>
+                    {verification.running && "验证中"}
+                    {!verification.running && (verification.canceled ? "已停止" : "验证完成")} {verification.done} /{" "}
+                    {verification.total}
+                  </span>
+                  <span className="text-emerald-700 dark:text-emerald-400">通过 {verification.passed}</span>
+                  <span className="text-destructive">失败 {verification.failed}</span>
+                  {verification.canceled && <span>未完成 {verification.total - verification.done}</span>}
+                  {verification.running && (
+                    <Button size="sm" variant="outline" onClick={() => verificationController.current?.abort()}>
+                      <SquareIcon className="mr-2 size-3" />
+                      停止验证
+                    </Button>
+                  )}
+                </div>
+              )}
+              {mainView !== "events" && (
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="relative min-w-0 basis-full sm:max-w-sm sm:flex-1 sm:basis-auto">
+                    <SearchIcon className="pointer-events-none absolute top-2.5 left-3 size-4 text-muted-foreground" />
+                    <Input
+                      value={nodeQuery}
+                      onChange={(event) => {
+                        setNodeQuery(event.target.value);
+                      }}
+                      aria-label="搜索代理节点"
+                      maxLength={200}
+                      disabled={busy}
+                      placeholder="搜索 IP、协议、出口或错误"
+                      className="pl-9"
+                    />
+                  </div>
+                  <select
+                    aria-label="筛选协议"
+                    className={compactSelectClass}
+                    value={nodeProtocol}
+                    disabled={busy}
                     onChange={(event) => {
-                      setNodeQuery(event.target.value);
+                      setNodeProtocol(event.target.value);
                       setNodePage(1);
                     }}
-                    placeholder="搜索 IP、协议、出口或错误"
-                    className="pl-9"
-                  />
+                  >
+                    <option value="">全部协议</option>
+                    <option value="http">HTTP</option>
+                    <option value="https">HTTPS</option>
+                    <option value="socks5">SOCKS5</option>
+                  </select>
+                  <select
+                    aria-label="筛选节点状态"
+                    className={compactSelectClass}
+                    value={nodeStatusFilter}
+                    disabled={busy}
+                    onChange={(event) => {
+                      setNodeStatusFilter(event.target.value);
+                      setNodePage(1);
+                    }}
+                  >
+                    <option value="">全部状态</option>
+                    <option value="available">可用</option>
+                    <option value="pending">待验证</option>
+                    <option value="expiring">即将过期</option>
+                    <option value="error">异常</option>
+                    <option value="disabled">已停用</option>
+                  </select>
+                  <select
+                    aria-label="节点排序"
+                    className={compactSelectClass}
+                    value={nodeSort}
+                    disabled={busy}
+                    onChange={(event) => {
+                      setNodeSort(event.target.value);
+                      setNodePage(1);
+                    }}
+                  >
+                    <option value="newest">最新加入</option>
+                    <option value="latency">验证耗时升序</option>
+                  </select>
+                  <span className="text-muted-foreground text-xs">共 {nodeTotal} 条</span>
                 </div>
-                <p className="text-muted-foreground text-xs">
-                  最后检查：
-                  {when(
-                    nodes.reduce<string | undefined>((latest, node) => {
-                      if (!node.last_checked_at) return latest;
-                      return !latest || Date.parse(node.last_checked_at) > Date.parse(latest)
-                        ? node.last_checked_at
-                        : latest;
-                    }, undefined),
-                  )}
-                </p>
-              </div>
+              )}
               {selectedNodeIDs.length > 0 ? (
                 <div className="flex flex-wrap items-center gap-2 border bg-muted/30 px-3 py-2">
                   <span className="text-sm">已选择 {selectedNodeIDs.length} 个节点</span>
@@ -609,18 +953,19 @@ export default function ProxyPoolsPage() {
                   </Button>
                 </div>
               ) : null}
-              <Tabs defaultValue="nodes">
-                <TabsList>
-                  <TabsTrigger value="nodes">节点</TabsTrigger>
-                  <TabsTrigger value="events">出口审计</TabsTrigger>
-                </TabsList>
+              <Tabs value={mainView === "events" ? "events" : "nodes"}>
                 <TabsContent value="nodes">
                   <div className="overflow-x-auto">
-                    <table className="w-full min-w-[780px] text-left text-sm">
-                      <thead className="border-b text-muted-foreground">
+                    <table
+                      aria-label="代理节点列表"
+                      className="w-full min-w-[1000px] text-left text-sm"
+                      aria-busy={detailLoading}
+                    >
+                      <thead className="whitespace-nowrap border-y bg-muted/40 text-muted-foreground">
                         <tr>
                           <th className="p-3">
                             <Checkbox
+                              disabled={busy || detailLoading}
                               checked={
                                 pagedNodes.length > 0 && pagedNodes.every((node) => selectedNodeIDs.includes(node.id))
                               }
@@ -634,22 +979,23 @@ export default function ProxyPoolsPage() {
                               aria-label="选择本页节点"
                             />
                           </th>
-                          <th className="p-3">代理节点</th>
+                          <th className="p-3">Host</th>
+                          <th className="p-3">Port</th>
+                          <th className="p-3">类型</th>
                           <th className="p-3">来源</th>
                           <th className="p-3">状态</th>
-                          <th className="p-3">到期时间</th>
                           <th className="p-3">验证耗时</th>
-                          <th className="p-3">声明出口</th>
-                          <th className="p-3">最近实测出口</th>
-                          <th className="p-3">成功率</th>
-                          <th className="p-3 text-right">操作</th>
+                          <th className="p-3">最近验证</th>
+                          <th className="p-3">出口 IP</th>
+                          <th className="sticky right-0 bg-background p-3 text-right">操作</th>
                         </tr>
                       </thead>
                       <tbody>
                         {pagedNodes.map((n) => (
-                          <tr key={n.id} className="border-b">
+                          <tr key={n.id} className="border-b even:bg-muted/20 hover:bg-muted/40">
                             <td className="p-3">
                               <Checkbox
+                                disabled={busy || detailLoading}
                                 checked={selectedNodeIDs.includes(n.id)}
                                 onCheckedChange={(checked) =>
                                   setSelectedNodeIDs((currentIDs) =>
@@ -659,38 +1005,54 @@ export default function ProxyPoolsPage() {
                                 aria-label={`选择节点 ${n.id}`}
                               />
                             </td>
-                            <td className="max-w-64 break-all p-3 font-mono text-xs">
-                              {n.address}
+                            <td className="max-w-52 break-all p-3 font-mono text-xs">
+                              {nodeEndpoint(n.address).host}
                               {n.last_error && (
-                                <p className="mt-1 break-words font-sans text-destructive">
+                                <p
+                                  className="mt-1 line-clamp-2 max-w-44 break-words font-sans text-destructive"
+                                  title={proxyVerificationMessage(n.last_error)}
+                                >
                                   {proxyVerificationMessage(n.last_error)}
                                 </p>
                               )}
                             </td>
-                            <td className="p-3 text-xs">
-                              {n.origin === "fofa" ? "FOFA" : n.origin === "quake" ? "Quake" : "供应商"}
-                            </td>
+                            <td className="p-3 font-mono text-xs">{nodeEndpoint(n.address).port}</td>
+                            <td className="p-3 text-xs">{nodeEndpoint(n.address).protocol}</td>
+                            <td className="p-3 text-xs">{nodeOrigin(n, current)}</td>
                             <td
                               className={`whitespace-nowrap p-3 text-xs ${nodeStatus(n, current.config.expiry_warning_seconds || 3600).className}`}
                             >
-                              {nodeStatus(n, current.config.expiry_warning_seconds || 3600).label}
-                            </td>
-                            <td
-                              className={`whitespace-nowrap p-3 text-xs ${n.expires_at && Date.parse(n.expires_at) <= Date.now() ? "text-destructive" : ""}`}
-                            >
-                              {n.expires_at ? when(n.expires_at) : "固定节点"}
+                              {verifyingIDs.includes(n.id)
+                                ? "验证中"
+                                : nodeStatus(n, current.config.expiry_warning_seconds || 3600).label}
+                              {n.expires_at && (
+                                <div className="mt-1 text-muted-foreground" title={`到期时间：${when(n.expires_at)}`}>
+                                  {new Date(n.expires_at).toLocaleDateString()}
+                                </div>
+                              )}
                             </td>
                             <td className="whitespace-nowrap p-3 text-xs">
                               {n.latency_ms != null ? `${n.latency_ms} ms` : "-"}
                             </td>
-                            <td className="p-3">{n.declared_ip || "未知"}</td>
-                            <td className="p-3">{n.verified_ip || "未验证"}</td>
-                            <td className="whitespace-nowrap p-3 text-xs">
-                              {n.success_count + n.failure_count > 0
-                                ? `${Math.round((n.success_count / (n.success_count + n.failure_count)) * 100)}%`
-                                : "暂无"}
+                            <td
+                              className="whitespace-nowrap p-3 text-xs"
+                              title={`验证通过 ${n.success_count} 次，失败 ${n.failure_count} 次`}
+                            >
+                              <div>
+                                {verificationLabel(n)}
+                                {n.last_http_status ? ` · HTTP ${n.last_http_status}` : ""}
+                              </div>
+                              <div className="mt-1 text-muted-foreground" title={n.last_verify_target}>
+                                {when(n.last_checked_at)}
+                              </div>
                             </td>
-                            <td className="p-3">
+                            <td
+                              className="whitespace-nowrap p-3 font-mono text-xs"
+                              title={n.verified_at ? `出口 IP 验证于 ${when(n.verified_at)}` : undefined}
+                            >
+                              {n.verified_ip || (n.last_verify_mode === "connectivity" ? "未检测出口 IP" : "-")}
+                            </td>
+                            <td className="sticky right-0 bg-background p-3">
                               <div className="flex items-center justify-end gap-1">
                                 <Switch
                                   checked={n.enabled}
@@ -701,12 +1063,16 @@ export default function ProxyPoolsPage() {
                                 <Button
                                   size="icon"
                                   variant="ghost"
-                                  title={current.config.verify_url ? "验证出口" : "请先配置验证 URL"}
+                                  title={verifyMode === "connectivity" ? "验证百度连通性" : "验证出口 IP"}
                                   aria-label={`验证节点 ${n.id}`}
-                                  disabled={busy || !current.config.enabled || !current.config.verify_url}
-                                  onClick={() => action(() => api.verifyProxyNode(current.id, n.id), "出口已验证")}
+                                  disabled={busy || detailLoading || !current.config.enabled}
+                                  onClick={() => void verifyNodes([n.id])}
                                 >
-                                  <ShieldCheckIcon className="size-4" />
+                                  {verifyingIDs.includes(n.id) ? (
+                                    <LoaderCircleIcon className="size-4 animate-spin" />
+                                  ) : (
+                                    <ShieldCheckIcon className="size-4" />
+                                  )}
                                 </Button>
                                 <Button
                                   size="icon"
@@ -724,22 +1090,28 @@ export default function ProxyPoolsPage() {
                         ))}
                       </tbody>
                     </table>
-                    {filteredNodes.length === 0 && (
+                    {pagedNodes.length === 0 && (
                       <p className="p-8 text-center text-muted-foreground text-sm">
-                        {nodes.length === 0 ? "暂无节点" : "没有匹配的节点"}
+                        {detailLoading ? "加载中" : "没有匹配的节点"}
                       </p>
                     )}
                   </div>
-                  <TablePagination
-                    page={nodePage}
-                    pageSize={nodePageSize}
-                    total={filteredNodes.length}
-                    onPageChange={setNodePage}
-                    onPageSizeChange={(size) => {
-                      setNodePageSize(size);
-                      setNodePage(1);
-                    }}
-                  />
+                  <fieldset disabled={busy} className="min-w-0">
+                    <TablePagination
+                      page={nodePage}
+                      pageSize={nodePageSize}
+                      total={nodeTotal}
+                      onPageChange={(page) => {
+                        if (!busy) setNodePage(page);
+                      }}
+                      pageSizeOptions={[10, 20, 50, 100]}
+                      onPageSizeChange={(size) => {
+                        if (busy) return;
+                        setNodePageSize(size);
+                        setNodePage(1);
+                      }}
+                    />
+                  </fieldset>
                 </TabsContent>
                 <TabsContent value="events">
                   <ProxyEventsTable events={events} />
@@ -927,10 +1299,11 @@ export default function ProxyPoolsPage() {
               </>
             )}
             <div className="space-y-2">
-              <Label htmlFor="pool-verify">出口验证 URL（返回纯文本 IP）</Label>
+              <Label htmlFor="pool-verify">出口 IP 验证 URL（可选，纯文本 IP 或 JSON）</Label>
               <Input
                 id="pool-verify"
                 type="url"
+                placeholder="https://api.ipify.org?format=json"
                 value={config.verify_url}
                 onChange={(e) => field("verify_url", e.target.value)}
               />
@@ -986,9 +1359,7 @@ export default function ProxyPoolsPage() {
                     )}
                   </div>
                   {config.kind === "xiaoxiang" && (
-                    <p className="text-muted-foreground text-xs">
-                      连接账号和密码同时留空时，使用 AppKey / AppSecret。
-                    </p>
+                    <p className="text-muted-foreground text-xs">连接账号和密码同时留空时，使用 AppKey / AppSecret。</p>
                   )}
                 </>
               )}

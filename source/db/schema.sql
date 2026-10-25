@@ -1454,7 +1454,7 @@ CREATE TRIGGER trg_notification_channels_upd BEFORE UPDATE ON notification_chann
 -- finding 删除后事件不级联删除：与 findings 表「任务删除仍独立留存」的语义一致。
 CREATE TABLE IF NOT EXISTS notification_events (
     id         BIGSERIAL PRIMARY KEY,
-    -- finding_created | finding_status_changed
+    -- finding_created | finding_verified | finding_status_changed
     kind       TEXT NOT NULL,
     finding_id BIGINT NOT NULL,
     snapshot   JSONB NOT NULL,
@@ -1465,6 +1465,8 @@ CREATE TABLE IF NOT EXISTS notification_events (
 );
 CREATE INDEX IF NOT EXISTS idx_notification_events_pending
     ON notification_events(id) WHERE NOT fanned_out;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_notification_events_finding_verified
+    ON notification_events(finding_id) WHERE kind='finding_verified';
 
 -- 投递任务：一条事件 × 一个启用渠道 = 一行。fan-out 在事务外做，所以渠道
 -- 后开不会补历史(与 agent_triggers 的「迟开 trigger 不补历史」语义一致，
@@ -1838,6 +1840,9 @@ ALTER TABLE proxy_nodes ADD COLUMN IF NOT EXISTS last_success_at TIMESTAMPTZ;
 ALTER TABLE proxy_nodes ADD COLUMN IF NOT EXISTS last_failure_at TIMESTAMPTZ;
 ALTER TABLE proxy_nodes ADD COLUMN IF NOT EXISTS notes TEXT NOT NULL DEFAULT '';
 ALTER TABLE proxy_nodes ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE proxy_nodes ADD COLUMN IF NOT EXISTS last_verify_mode TEXT NOT NULL DEFAULT '';
+ALTER TABLE proxy_nodes ADD COLUMN IF NOT EXISTS last_verify_target TEXT NOT NULL DEFAULT '';
+ALTER TABLE proxy_nodes ADD COLUMN IF NOT EXISTS last_http_status INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_proxy_nodes_pool_status ON proxy_nodes(pool_id, enabled, deleted_at, id DESC);
 CREATE INDEX IF NOT EXISTS idx_proxy_nodes_expiry ON proxy_nodes(expires_at) WHERE deleted_at IS NULL;
 CREATE TABLE IF NOT EXISTS task_proxy_bindings (
@@ -1851,6 +1856,10 @@ CREATE TABLE IF NOT EXISTS proxy_provider_limits (
     account_hash TEXT PRIMARY KEY,
     next_at TIMESTAMPTZ NOT NULL
 );
+ALTER TABLE proxy_nodes ADD COLUMN IF NOT EXISTS import_verify_pending BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE proxy_nodes ADD COLUMN IF NOT EXISTS import_verify_claimed_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS proxy_nodes_import_pending ON proxy_nodes(id) WHERE import_verify_pending;
+
 ALTER TABLE task_proxy_bindings ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
 ALTER TABLE task_proxy_bindings ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
 CREATE TABLE IF NOT EXISTS proxy_route_events (
@@ -1894,11 +1903,25 @@ ALTER TABLE proxy_discovery_sources ADD COLUMN IF NOT EXISTS next_offset INTEGER
 ALTER TABLE proxy_discovery_sources ADD COLUMN IF NOT EXISTS exhausted BOOLEAN NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS idx_proxy_discovery_sources_provider ON proxy_discovery_sources(provider, enabled);
 
+CREATE TABLE IF NOT EXISTS proxy_discovery_runs (
+    id BIGSERIAL PRIMARY KEY,
+    source_id BIGINT NOT NULL REFERENCES proxy_discovery_sources(id) ON DELETE CASCADE,
+    offset_start INTEGER NOT NULL,
+    requested INTEGER NOT NULL,
+    returned INTEGER NOT NULL,
+    parsed INTEGER NOT NULL,
+    inserted INTEGER NOT NULL,
+    authorized INTEGER NOT NULL,
+    unknown_protocol INTEGER NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_proxy_discovery_runs_source ON proxy_discovery_runs(source_id,id DESC);
+
 CREATE TABLE IF NOT EXISTS proxy_discovery_results (
     id BIGSERIAL PRIMARY KEY,
     source_id BIGINT NOT NULL REFERENCES proxy_discovery_sources(id) ON DELETE CASCADE,
     address TEXT NOT NULL,
-    protocol TEXT NOT NULL CHECK (protocol IN ('http','https','socks5')),
+    protocol TEXT NOT NULL CHECK (protocol IN ('http','https','socks5','unknown')),
     host TEXT NOT NULL,
     port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
     metadata JSONB NOT NULL DEFAULT '{}',
@@ -1909,8 +1932,53 @@ CREATE TABLE IF NOT EXISTS proxy_discovery_results (
     verified_at TIMESTAMPTZ,
     latency_ms INTEGER,
     last_error TEXT NOT NULL DEFAULT '',
+    last_run_id BIGINT REFERENCES proxy_discovery_runs(id) ON DELETE SET NULL,
+    first_run_id BIGINT REFERENCES proxy_discovery_runs(id) ON DELETE SET NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE(source_id, address)
 );
 CREATE INDEX IF NOT EXISTS idx_proxy_discovery_results_state ON proxy_discovery_results(source_id, state, id DESC);
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid='proxy_discovery_results'::regclass
+          AND conname='proxy_discovery_results_protocol_check'
+          AND position('unknown' IN pg_get_constraintdef(oid))=0
+    ) THEN
+        ALTER TABLE proxy_discovery_results DROP CONSTRAINT proxy_discovery_results_protocol_check;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid='proxy_discovery_results'::regclass
+          AND conname='proxy_discovery_results_protocol_check'
+    ) THEN
+        ALTER TABLE proxy_discovery_results ADD CONSTRAINT proxy_discovery_results_protocol_check
+            CHECK (protocol IN ('http','https','socks5','unknown'));
+    END IF;
+END $$;
+ALTER TABLE proxy_discovery_results ADD COLUMN IF NOT EXISTS last_run_id BIGINT REFERENCES proxy_discovery_runs(id) ON DELETE SET NULL;
+ALTER TABLE proxy_discovery_results ADD COLUMN IF NOT EXISTS first_run_id BIGINT REFERENCES proxy_discovery_runs(id) ON DELETE SET NULL;
+ALTER TABLE proxy_discovery_results ADD COLUMN IF NOT EXISTS last_verify_mode TEXT NOT NULL DEFAULT '';
+ALTER TABLE proxy_discovery_results ADD COLUMN IF NOT EXISTS last_verify_target TEXT NOT NULL DEFAULT '';
+ALTER TABLE proxy_discovery_results ADD COLUMN IF NOT EXISTS last_http_status INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE proxy_discovery_results ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_proxy_discovery_results_run ON proxy_discovery_results(last_run_id) WHERE last_run_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS proxy_discovery_verifications (
+    id BIGSERIAL PRIMARY KEY,
+    result_id BIGINT NOT NULL REFERENCES proxy_discovery_results(id) ON DELETE CASCADE,
+    run_id BIGINT REFERENCES proxy_discovery_runs(id) ON DELETE SET NULL,
+    mode TEXT NOT NULL,
+    target_origin TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('success','failure','timeout','canceled')),
+    stage TEXT NOT NULL,
+    code TEXT NOT NULL,
+    latency_ms INTEGER NOT NULL CHECK (latency_ms >= 0),
+    exit_ip TEXT NOT NULL DEFAULT '',
+    http_status INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_proxy_discovery_verifications_run ON proxy_discovery_verifications(run_id,result_id,id DESC);
+CREATE INDEX IF NOT EXISTS idx_proxy_discovery_verifications_result ON proxy_discovery_verifications(result_id,id DESC);

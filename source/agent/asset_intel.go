@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -470,13 +471,16 @@ func searchFOFA(ctx context.Context, client *http.Client, query string, page, si
 	data, status, err := intelHTTP(ctx, client, http.MethodGet, "https://fofa.info/api/v1/search/all?"+params.Encode(),
 		map[string]string{"Accept": "application/json", "User-Agent": "Yunkun-Console/asset-intel"}, nil)
 	if err != nil {
-		return nil, nil, true, err
+		return nil, nil, true, fofaAssetIntelError(query, page, size, credential, "", strconv.Itoa(status), err.Error())
 	}
 	if status == http.StatusTooManyRequests || status == http.StatusForbidden {
-		return nil, nil, true, fmt.Errorf("FOFA 限流或权限不足")
+		return nil, nil, true, fofaAssetIntelError(query, page, size, credential, "", strconv.Itoa(status), "限流或权限不足")
 	}
 	if status < 200 || status >= 300 || data["error"] == true {
-		return nil, nil, true, fmt.Errorf("FOFA 查询失败，HTTP %d", status)
+		message := intelString(data["errmsg"])
+		retry := !strings.Contains(message, "参数错误") && !strings.Contains(strings.ToLower(message), "invalid parameter")
+		return nil, nil, retry, fofaAssetIntelError(query, page, size, credential,
+			intelString(data["error_code"]), strconv.Itoa(status), intelString(data["errmsg"]))
 	}
 	raw, _ := data["results"].([]any)
 	out := make([]intelCandidate, 0, len(raw))
@@ -504,6 +508,42 @@ func searchFOFA(ctx context.Context, client *http.Client, query string, page, si
 		out = append(out, candidate)
 	}
 	return out, data["size"], false, nil
+}
+
+func fofaAssetIntelError(query string, page, size int, credential intelCredentials, code, status, message string) error {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(query)))
+	fingerprint := fmt.Sprintf("%x", sum[:4])
+	for _, secret := range []string{credential.key, credential.email} {
+		if secret != "" {
+			message = strings.ReplaceAll(message, secret, "[redacted]")
+		}
+	}
+	for _, raw := range []string{
+		query,
+		base64.StdEncoding.EncodeToString([]byte(query)),
+		base64.RawStdEncoding.EncodeToString([]byte(query)),
+	} {
+		if raw != "" {
+			message = strings.ReplaceAll(message, raw, "[query redacted]")
+		}
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "provider returned no diagnostic message"
+	}
+	if len([]rune(message)) > 180 {
+		message = string([]rune(message)[:180])
+	}
+	if numeric, err := strconv.ParseInt(code, 10, 32); err == nil {
+		code = strconv.FormatInt(numeric, 10)
+	} else {
+		code = "unknown"
+	}
+	if numeric, err := strconv.Atoi(status); err != nil || numeric < 100 || numeric > 599 {
+		status = "unknown"
+	}
+	return fmt.Errorf("FOFA 查询失败（HTTP=%s code=%s page=%d size=%d query=%s）：%s",
+		status, code, page, size, fingerprint, message)
 }
 
 func searchQuake(ctx context.Context, client *http.Client, query string, page, size int, credential intelCredentials) ([]intelCandidate, any, bool, error) {

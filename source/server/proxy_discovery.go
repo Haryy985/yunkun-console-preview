@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -34,11 +35,26 @@ const (
 	minProxyDiscoveryFetchLimit     = 100
 	maxProxyDiscoveryFetchLimit     = 1000
 	defaultProxyDiscoveryQuery      = `service:socks5 AND country: "CN" AND response:"No authentication"`
+	defaultFOFADiscoveryQuery       = `protocol="socks5" && country="CN" && banner="No authentication"`
 	defaultProxyDiscoveryVerifyURL  = "https://api.ipify.org?format=json"
 	fofaDiscoveryURL                = "https://fofa.info/api/v1/search/all"
 	quakeDiscoveryURL               = "https://quake.360.net/api/v3/search/quake_service"
 	discoveryBatchVerifyTimeout     = 3 * time.Second
+	discoveryRetryVerifyTimeout     = 8 * time.Second
 )
+
+func discoveredProxyProtocol(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "http", "http-proxy", "http_proxy":
+		return "http"
+	case "https", "https-proxy", "https_proxy":
+		return "https"
+	case "socks5", "socks5h":
+		return "socks5"
+	default:
+		return "unknown"
+	}
+}
 
 type proxyDiscoverySaveRequest struct {
 	Provider        string            `json:"provider"`
@@ -58,6 +74,11 @@ func (s *Server) initProxyDiscovery() {
 				CheckRedirect: restrictedDiscoveryRedirect,
 			}}
 		}
+		if s.m != nil && s.m.pg != nil {
+			if _, err := s.m.pg.RecoverStaleProxyDiscoveryVerifications(); err != nil {
+				log.Printf("[proxy-discovery] stale verification recovery failed: %v", err)
+			}
+		}
 	})
 }
 
@@ -72,6 +93,7 @@ func (s *Server) proxyDiscoveryReady(w http.ResponseWriter) bool {
 
 func (s *Server) proxyDiscoveryRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/proxy-discovery/sources", s.listProxyDiscoverySources)
+	mux.HandleFunc("GET /api/proxy-discovery/sources/{id}/latest-run", s.latestProxyDiscoveryRun)
 	mux.HandleFunc("POST /api/proxy-discovery/sources", s.saveProxyDiscoverySource)
 	mux.HandleFunc("PUT /api/proxy-discovery/sources/{id}", s.saveProxyDiscoverySource)
 	mux.HandleFunc("DELETE /api/proxy-discovery/sources/{id}", s.deleteProxyDiscoverySource)
@@ -79,10 +101,55 @@ func (s *Server) proxyDiscoveryRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/proxy-discovery/results/ids", s.listProxyDiscoveryResultIDs)
 	mux.HandleFunc("POST /api/proxy-discovery/sources/{id}/run", s.runProxyDiscovery)
 	mux.HandleFunc("POST /api/proxy-discovery/results/{id}/verify", s.verifyProxyDiscoveryResult)
+	mux.HandleFunc("PUT /api/proxy-discovery/results/{id}/protocol", s.confirmProxyDiscoveryProtocol)
 	mux.HandleFunc("POST /api/proxy-discovery/results/{id}/approve", s.approveProxyDiscoveryResult)
 	mux.HandleFunc("POST /api/proxy-discovery/results/{id}/ignore", s.ignoreProxyDiscoveryResult)
 	mux.HandleFunc("POST /api/proxy-discovery/results/batch", s.batchProxyDiscoveryResults)
 	mux.HandleFunc("DELETE /api/proxy-discovery/results/{id}", s.deleteProxyDiscoveryResult)
+}
+
+func (s *Server) latestProxyDiscoveryRun(w http.ResponseWriter, r *http.Request) {
+	if !s.proxyDiscoveryReady(w) {
+		return
+	}
+	id, ok := pathInt(r, "id")
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "来源 ID 无效")
+		return
+	}
+	summary, err := s.m.pg.LatestProxyDiscoveryRun(id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "读取发现批次失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"latest": summary})
+}
+
+func (s *Server) confirmProxyDiscoveryProtocol(w http.ResponseWriter, r *http.Request) {
+	if !s.proxyDiscoveryReady(w) {
+		return
+	}
+	id, ok := pathInt(r, "id")
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "候选 ID 无效")
+		return
+	}
+	var body struct {
+		Protocol string `json:"protocol"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&body); err != nil || (body.Protocol != "http" && body.Protocol != "https" && body.Protocol != "socks5") {
+		writeErr(w, http.StatusBadRequest, "请选择 HTTP、HTTPS 或 SOCKS5")
+		return
+	}
+	s.proxyDiscovery.mu.Lock()
+	defer s.proxyDiscovery.mu.Unlock()
+	if err := s.m.pg.SetProxyDiscoveryProtocol(id, body.Protocol); err != nil {
+		writeErr(w, http.StatusConflict, "协议确认失败，候选可能已变化或地址重复")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) listProxyDiscoverySources(w http.ResponseWriter, r *http.Request) {
@@ -108,14 +175,21 @@ func normalizeProxyDiscoverySource(source *db.ProxyDiscoverySource) {
 		return
 	}
 	if strings.TrimSpace(source.Query) == "" {
-		source.Query = defaultProxyDiscoveryQuery
-	}
-	if strings.TrimSpace(source.VerifyURL) == "" {
-		source.VerifyURL = defaultProxyDiscoveryVerifyURL
+		source.Query = discoveryDefaultQuery(source.Provider)
 	}
 	if source.FetchLimit < minProxyDiscoveryFetchLimit || source.FetchLimit > maxProxyDiscoveryFetchLimit {
 		source.FetchLimit = defaultProxyDiscoveryFetchLimit
 	}
+	if strings.TrimSpace(source.VerifyURL) == "" {
+		source.VerifyURL = defaultProxyDiscoveryVerifyURL
+	}
+}
+
+func discoveryDefaultQuery(provider string) string {
+	if provider == "fofa" {
+		return defaultFOFADiscoveryQuery
+	}
+	return defaultProxyDiscoveryQuery
 }
 
 func (s *Server) saveProxyDiscoverySource(w http.ResponseWriter, r *http.Request) {
@@ -136,13 +210,16 @@ func (s *Server) saveProxyDiscoverySource(w http.ResponseWriter, r *http.Request
 	req.AuthorizedScope = normalizeDiscoveryScope(req.AuthorizedScope)
 	req.VerifyURL = strings.TrimSpace(req.VerifyURL)
 	if req.Query == "" {
-		req.Query = defaultProxyDiscoveryQuery
+		req.Query = discoveryDefaultQuery(req.Provider)
+	}
+	if req.FetchLimit == 0 {
+		req.FetchLimit = defaultProxyDiscoveryFetchLimit
 	}
 	if req.VerifyURL == "" {
 		req.VerifyURL = defaultProxyDiscoveryVerifyURL
 	}
-	if req.FetchLimit == 0 {
-		req.FetchLimit = defaultProxyDiscoveryFetchLimit
+	if req.VerifyURL == "www.baidu.com" || req.VerifyURL == "www.baidu.com/" {
+		req.VerifyURL = proxypool.BaiduVerifyURL
 	}
 	if (req.Provider != "fofa" && req.Provider != "quake") || req.Name == "" || len([]rune(req.Name)) > 80 ||
 		req.Query == "" {
@@ -372,39 +449,63 @@ func (s *Server) runProxyDiscovery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	authorizedItems := authorizeDiscoveryResults(source, items)
-	newIDs, err := s.m.pg.StoreProxyDiscoveryRunWithIDs(id, authorizedItems,
-		source.NextOffset+fetched, fetched < discoveryFetchLimit(source))
+	newIDs, runID, err := s.m.pg.StoreProxyDiscoveryRunWithMetrics(id, authorizedItems,
+		source.NextOffset, discoveryFetchLimit(source), fetched, source.NextOffset+fetched, fetched < discoveryFetchLimit(source))
 	s.proxyDiscovery.mu.Unlock()
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "保存发现结果失败")
 		return
 	}
 	autoVerify := strings.TrimSpace(source.AuthorizedScope) != "" && strings.TrimSpace(source.VerifyURL) != ""
-	if autoVerify && len(newIDs) > 0 {
+	autoStarted := autoVerify && len(newIDs) > 0
+	if autoStarted {
 		go s.autoVerifyDiscoveryCandidates(newIDs)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"fetched": fetched, "candidates": len(items),
+		"run_id":         runID,
 		"new_candidates": len(newIDs), "exhausted": fetched < discoveryFetchLimit(source),
-		"auto_verify_started": autoVerify && len(newIDs) > 0, "auto_verify_total": len(newIDs),
-		"auto_verify_skipped": !autoVerify && len(newIDs) > 0})
+		"auto_verify_started": autoStarted, "auto_verify_total": len(newIDs),
+		"auto_verify_skipped": !autoStarted && len(newIDs) > 0})
 }
 
 // autoVerifyDiscoveryCandidates updates only candidate evidence. It never
 // approves a result or creates/enables a proxy-pool node.
 func (s *Server) autoVerifyDiscoveryCandidates(ids []int64) {
-	ctx := context.Background()
+	ctx := s.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	jobs := make(chan int64)
 	var wg sync.WaitGroup
+	for range min(len(ids), 10) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for id := range jobs {
+				s.verifyDiscoveryCandidateWithRetry(ctx, id, discoveryBatchVerifyTimeout, discoveryRetryVerifyTimeout)
+			}
+		}()
+	}
+enqueue:
 	for _, id := range ids {
 		if ctx.Err() != nil {
-			return
+			break
 		}
-		wg.Add(1)
-		go func(id int64) {
-			defer wg.Done()
-			_, _, _ = s.verifyDiscoveryCandidateWithTimeout(ctx, id, discoveryBatchVerifyTimeout)
-		}(id)
+		select {
+		case jobs <- id:
+		case <-ctx.Done():
+			break enqueue
+		}
 	}
+	close(jobs)
 	wg.Wait()
+}
+
+func (s *Server) verifyDiscoveryCandidateWithRetry(ctx context.Context, id int64, fast, retry time.Duration) {
+	_, status, err := s.verifyDiscoveryCandidateWithTimeout(ctx, id, fast)
+	if status == http.StatusGatewayTimeout && proxypool.IsVerificationTimeout(err) && ctx.Err() == nil {
+		_, _, _ = s.verifyDiscoveryCandidateWithTimeout(ctx, id, retry)
+	}
 }
 
 func (s *Server) fetchFOFA(ctx context.Context, source *db.ProxyDiscoverySource, secrets proxypool.Secrets) ([]db.ProxyDiscoveryResult, int, error) {
@@ -412,33 +513,62 @@ func (s *Server) fetchFOFA(ctx context.Context, source *db.ProxyDiscoverySource,
 	if err := json.Unmarshal([]byte(secrets.APIValue), &raw); err != nil || raw["email"] == "" || raw["key"] == "" {
 		return nil, 0, errors.New("FOFA 需要 email 和 key")
 	}
-	q := base64.RawStdEncoding.EncodeToString([]byte(source.Query))
-	u := fofaDiscoveryURL + "?email=" + url.QueryEscape(raw["email"]) +
-		"&key=" + url.QueryEscape(raw["key"]) + "&qbase64=" + url.QueryEscape(q) +
-		"&size=" + strconv.Itoa(discoveryFetchLimit(source)) + "&page=" + strconv.Itoa(source.NextOffset/discoveryFetchLimit(source)+1) +
-		"&fields=host,ip,port,protocol,city,region,asn,org"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	params := url.Values{}
+	params.Set("email", raw["email"])
+	params.Set("key", raw["key"])
+	params.Set("qbase64", base64.StdEncoding.EncodeToString([]byte(source.Query)))
+	params.Set("size", strconv.Itoa(discoveryFetchLimit(source)))
+	params.Set("page", strconv.Itoa(source.NextOffset/discoveryFetchLimit(source)+1))
+	params.Set("fields", "host,ip,port,protocol,city,region,asn,org")
+	u, err := url.Parse(fofaDiscoveryURL)
+	if err != nil {
+		return nil, 0, errors.New("FOFA 请求无效")
+	}
+	u.RawQuery = params.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, 0, errors.New("FOFA 请求无效")
 	}
 	resp, err := s.proxyDiscovery.client.Do(req)
 	if err != nil {
-		return nil, 0, errors.New("FOFA 请求失败")
+		return nil, 0, fmt.Errorf("FOFA 请求失败（page=%d size=%d query=%s）", fofaPage(source), discoveryFetchLimit(source), fofaQueryFingerprint(source.Query))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, 0, fmt.Errorf("FOFA 返回 HTTP %d", resp.StatusCode)
+		return nil, 0, fmt.Errorf("FOFA 返回 HTTP %d（page=%d size=%d query=%s）", resp.StatusCode, fofaPage(source), discoveryFetchLimit(source), fofaQueryFingerprint(source.Query))
 	}
 	var body struct {
 		Error   bool            `json:"error"`
 		Message string          `json:"errmsg"`
+		Code    json.RawMessage `json:"error_code"`
 		Results [][]interface{} `json:"results"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(&body); err != nil {
 		return nil, 0, errors.New("FOFA 响应无效")
 	}
 	if body.Error {
-		return nil, 0, errors.New("FOFA 查询失败: " + strings.TrimSpace(body.Message))
+		message := strings.TrimSpace(body.Message)
+		if message == "" {
+			message = strings.TrimSpace(string(body.Code))
+		}
+		if message == "" {
+			message = "provider returned an unspecified error"
+		}
+		// Preserve the provider diagnostic without treating an error number alone
+		// as a rate limit or exposing credentials and the user's query.
+		code := fofaErrorCode(body.Code)
+		for _, secret := range []string{raw["key"], raw["email"], source.Query,
+			base64.StdEncoding.EncodeToString([]byte(source.Query))} {
+			if secret != "" {
+				message = strings.ReplaceAll(message, secret, "[redacted]")
+				code = strings.ReplaceAll(code, secret, "[redacted]")
+			}
+		}
+		if len([]rune(message)) > 300 {
+			message = string([]rune(message)[:300])
+		}
+		return nil, 0, fmt.Errorf("FOFA 查询失败（page=%d size=%d query=%s code=%s）: %s",
+			fofaPage(source), discoveryFetchLimit(source), fofaQueryFingerprint(source.Query), code, message)
 	}
 	out := make([]db.ProxyDiscoveryResult, 0, len(body.Results))
 	for _, row := range body.Results {
@@ -451,13 +581,37 @@ func (s *Server) fetchFOFA(ctx context.Context, source *db.ProxyDiscoverySource,
 		if net.ParseIP(ip) == nil || port < 1 || port > 65535 {
 			continue
 		}
-		protocol := "http"
-		if len(row) > 3 && strings.Contains(strings.ToLower(fmt.Sprint(row[3])), "socks") {
-			protocol = "socks5"
+		protocol := "unknown"
+		if len(row) > 3 {
+			protocol = discoveredProxyProtocol(fmt.Sprint(row[3]))
 		}
 		out = append(out, makeDiscoveryResult(source, protocol, ip, port, map[string]any{"host": host, "raw": row}))
 	}
 	return authorizeDiscoveryResults(source, out), len(body.Results), nil
+}
+
+func fofaPage(source *db.ProxyDiscoverySource) int {
+	if source == nil {
+		return 1
+	}
+	return source.NextOffset/discoveryFetchLimit(source) + 1
+}
+
+func fofaQueryFingerprint(query string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(query)))
+	return fmt.Sprintf("%x", sum[:4])
+}
+
+func fofaErrorCode(raw json.RawMessage) string {
+	var value string
+	if json.Unmarshal(raw, &value) != nil {
+		value = strings.TrimSpace(string(raw))
+	}
+	// Error codes are numeric. Do not echo arbitrary provider-controlled JSON.
+	if code, err := strconv.ParseInt(value, 10, 32); err == nil {
+		return strconv.FormatInt(code, 10)
+	}
+	return "unknown"
 }
 
 func (s *Server) fetchQuake(ctx context.Context, source *db.ProxyDiscoverySource, secrets proxypool.Secrets) ([]db.ProxyDiscoveryResult, int, error) {
@@ -503,12 +657,7 @@ func (s *Server) fetchQuake(ctx context.Context, source *db.ProxyDiscoverySource
 func quakeDiscoveryProtocol(metadata map[string]any) string {
 	service, _ := metadata["service"].(map[string]any)
 	name, _ := service["name"].(string)
-	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "socks5", "socks5h":
-		return "socks5"
-	default:
-		return "http"
-	}
+	return discoveredProxyProtocol(name)
 }
 
 func discoveryFetchLimit(source *db.ProxyDiscoverySource) int {
@@ -737,9 +886,14 @@ func (s *Server) verifyDiscoveryCandidateWithTimeout(ctx context.Context, id int
 		s.proxyDiscovery.mu.Unlock()
 		return nil, http.StatusForbidden, errors.New("结果不在授权范围内")
 	}
-	if source.VerifyURL == "" {
+	if result.Protocol == "unknown" {
 		s.proxyDiscovery.mu.Unlock()
-		return nil, http.StatusBadRequest, errors.New("请先编辑查询，配置代理验证地址")
+		return nil, http.StatusConflict, errors.New("代理协议未知，请先人工确认 HTTP、HTTPS 或 SOCKS5")
+	}
+	endpoint, mode, targetErr := nodeVerificationTarget(source.VerifyURL, "")
+	if targetErr != nil {
+		s.proxyDiscovery.mu.Unlock()
+		return nil, http.StatusBadRequest, targetErr
 	}
 	credentials, err := s.proxyPools.vault.Open(raw)
 	if err != nil {
@@ -766,7 +920,7 @@ func (s *Server) verifyDiscoveryCandidateWithTimeout(ctx context.Context, id int
 	upstream, err := proxypool.Upstream(proxypool.Node{Address: result.Address}, proxypool.Secrets{
 		ProxyUsername: sourceSecrets["proxy_username"], ProxyPassword: sourceSecrets["proxy_password"],
 	})
-	var ip string
+	var verification proxypool.VerificationResult
 	if err == nil {
 		verifyCtx := ctx
 		if timeout > 0 {
@@ -774,7 +928,7 @@ func (s *Server) verifyDiscoveryCandidateWithTimeout(ctx context.Context, id int
 			verifyCtx, cancel = context.WithTimeout(ctx, timeout)
 			defer cancel()
 		}
-		ip, err = proxypool.Verify(verifyCtx, upstream, source.VerifyURL)
+		verification, err = proxypool.VerifyEndpoint(verifyCtx, upstream, endpoint, mode)
 	}
 	latency := int(time.Since(started).Milliseconds())
 	s.proxyDiscovery.mu.Lock()
@@ -787,6 +941,7 @@ func (s *Server) verifyDiscoveryCandidateWithTimeout(ctx context.Context, id int
 		return nil, http.StatusNotFound, errors.New("发现结果已删除")
 	}
 	latest, latestRaw, readErr := s.m.pg.ProxyDiscoverySource(result.SourceID)
+	normalizeProxyDiscoverySource(latest)
 	if readErr != nil || latest == nil || current.State != "verifying" ||
 		current.Address != result.Address || current.Host != result.Host ||
 		!latest.Enabled || latest.AuthorizedScope != source.AuthorizedScope ||
@@ -801,20 +956,30 @@ func (s *Server) verifyDiscoveryCandidateWithTimeout(ctx context.Context, id int
 		_ = s.m.pg.UpdateProxyDiscoveryResult(id, "pending", true, "", &latency, "验证已取消，请重新验证")
 		return nil, http.StatusRequestTimeout, errors.New("验证已取消，请重试")
 	}
+	target := verification.Target
+	if target == "" {
+		if parsed, parseErr := url.Parse(endpoint); parseErr == nil {
+			target = parsed.Scheme + "://" + parsed.Host
+		}
+	}
 	if err != nil {
 		state, status := "invalid", http.StatusBadGateway
+		outcome := "failure"
 		if timeout > 0 && proxypool.IsVerificationTimeout(err) {
 			state, status = "pending", http.StatusGatewayTimeout
+			outcome = "timeout"
 		}
-		if saveErr := s.m.pg.UpdateProxyDiscoveryResult(id, state, true, "", &latency, err.Error()); saveErr != nil {
+		stage, code := proxypool.VerificationFailureCode(err)
+		if saveErr := s.m.pg.CompleteProxyDiscoveryVerification(id, state, true, "", latency, err.Error(), mode, target, outcome, stage, code, verification.HTTPStatus); saveErr != nil {
 			return nil, http.StatusInternalServerError, errors.New("保存验证失败状态失败")
 		}
 		return nil, status, err
 	}
-	if err := s.m.pg.UpdateProxyDiscoveryResult(id, "verified", true, ip, &latency, ""); err != nil {
+	if err := s.m.pg.CompleteProxyDiscoveryVerification(id, "verified", true, verification.IP, latency, "", mode, target, "success", "response", "ok", verification.HTTPStatus); err != nil {
 		return nil, http.StatusInternalServerError, errors.New("保存验证结果失败")
 	}
-	return map[string]any{"ok": true, "ip": ip, "latency_ms": latency}, http.StatusOK, nil
+	return map[string]any{"ok": true, "ip": verification.IP, "latency_ms": latency,
+		"mode": verification.Mode, "target": verification.Target, "http_status": verification.HTTPStatus}, http.StatusOK, nil
 }
 
 func (s *Server) approveProxyDiscoveryResult(w http.ResponseWriter, r *http.Request) {
@@ -858,7 +1023,7 @@ func (s *Server) approveDiscoveryCandidate(ctx context.Context, id, poolID int64
 	if result == nil {
 		return 0, http.StatusNotFound, errors.New("发现结果不存在")
 	}
-	source, raw, sourceErr := s.m.pg.ProxyDiscoverySource(result.SourceID)
+	source, _, sourceErr := s.m.pg.ProxyDiscoverySource(result.SourceID)
 	if sourceErr != nil || source == nil {
 		return 0, http.StatusNotFound, errors.New("发现来源不存在")
 	}
@@ -869,8 +1034,11 @@ func (s *Server) approveDiscoveryCandidate(ctx context.Context, id, poolID int64
 	if result.State == "approved" {
 		return 0, http.StatusConflict, errors.New("该候选已入池，请在代理 IP 中管理")
 	}
-	if result.State != "verified" || net.ParseIP(result.VerifiedIP) == nil || result.VerifiedAt == nil {
+	if !result.HasSuccessfulVerification() {
 		return 0, http.StatusConflict, errors.New("该候选尚未验证通过，请先执行批量验证，再选择验证通过的候选入池")
+	}
+	if !result.Authorized {
+		return 0, http.StatusForbidden, errors.New("候选尚未在授权范围内通过验证，请重新验证")
 	}
 	pool, err := s.m.pg.ProxyPool(poolID)
 	if err != nil {
@@ -883,41 +1051,33 @@ func (s *Server) approveDiscoveryCandidate(ctx context.Context, id, poolID int64
 	if err != nil {
 		return 0, http.StatusServiceUnavailable, errors.New("目标代理池凭据不可用")
 	}
-	sourceCredentials, err := s.proxyPools.vault.Open(raw)
-	if err != nil {
-		return 0, http.StatusServiceUnavailable, errors.New("发现来源凭据不可用")
-	}
-	var sourceSecrets map[string]string
-	if err := json.Unmarshal([]byte(sourceCredentials.APIValue), &sourceSecrets); err != nil {
-		return 0, http.StatusServiceUnavailable, errors.New("发现来源凭据格式无效")
-	}
-	var proof *db.ProxyDiscoveryAdmissionProof
 	upstream, err := pool.Config.Upstream(proxypool.Node{Address: result.Address}, poolSecrets)
 	if err != nil {
 		return 0, http.StatusBadGateway, errors.New("目标代理池连接配置无效")
 	}
-	var poolUser, poolPassword string
-	if upstream.User != nil {
-		poolUser = upstream.User.Username()
-		poolPassword, _ = upstream.User.Password()
+	// The pool's credentials and verification target are authoritative at
+	// runtime. Always re-check with the destination pool before admission;
+	// source-side evidence alone can be stale or was collected with different
+	// credentials/endpoint settings.
+	endpoint := strings.TrimSpace(pool.Config.VerifyURL)
+	if endpoint == "" {
+		endpoint = strings.TrimSpace(source.VerifyURL)
 	}
-	// The pool's credentials are used at runtime. Evidence collected using
-	// different credentials or a different target cannot prove that route works.
-	if poolUser != sourceSecrets["proxy_username"] ||
-		poolPassword != sourceSecrets["proxy_password"] ||
-		(pool.Config.VerifyURL != "" && pool.Config.VerifyURL != source.VerifyURL) {
-		endpoint := pool.Config.VerifyURL
-		if endpoint == "" {
-			endpoint = source.VerifyURL
-		}
-		started := time.Now()
-		ip, verifyErr := proxypool.Verify(ctx, upstream, endpoint)
-		if verifyErr != nil {
-			return 0, http.StatusBadGateway, fmt.Errorf("目标代理池配置复验失败：%w", verifyErr)
-		}
-		proof = &db.ProxyDiscoveryAdmissionProof{IP: ip, CheckedAt: time.Now().UTC(),
-			LatencyMS: int(time.Since(started).Milliseconds())}
+	if endpoint == "" {
+		endpoint = defaultProxyDiscoveryVerifyURL
 	}
+	endpoint, mode, targetErr := nodeVerificationTarget(endpoint, "")
+	if targetErr != nil {
+		return 0, http.StatusBadRequest, targetErr
+	}
+	started := time.Now()
+	verification, verifyErr := proxypool.VerifyEndpoint(ctx, upstream, endpoint, mode)
+	if verifyErr != nil {
+		return 0, http.StatusBadGateway, fmt.Errorf("目标代理池配置复验失败：%w", verifyErr)
+	}
+	proof := &db.ProxyDiscoveryAdmissionProof{IP: verification.IP, Mode: verification.Mode,
+		Target: verification.Target, HTTPStatus: verification.HTTPStatus,
+		CheckedAt: time.Now().UTC(), LatencyMS: int(time.Since(started).Milliseconds())}
 	if ctx.Err() != nil {
 		return 0, http.StatusRequestTimeout, errors.New("入池已取消")
 	}

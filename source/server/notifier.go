@@ -259,6 +259,10 @@ func (n *Notifier) stepDigest(ctx context.Context, ch *db.NotificationChannel, a
 // 那么第 K+1 条起必须留到下一批，而不是跟着一起被标记成功。否则被截掉的
 // 那些漏洞既不在消息里、也不在失败列表里，彻底消失。
 func (n *Notifier) send(ctx context.Context, channel notify.Channel, cfg map[string]any, msg notify.Message, deliveries []*db.NotificationDelivery) {
+	if updateInProgress() {
+		_ = n.pg.DeferDeliveries(ctx, deliveryIDs(deliveries), "正在更新，稍后继续发送")
+		return
+	}
 	// 单次投递设上限，避免某个渠道卡住把这一轮剩余渠道全部拖住。
 	sendCtx, cancel := context.WithTimeout(ctx, notifySendTimeout)
 	defer cancel()
@@ -432,6 +436,8 @@ func (n *Notifier) itemFor(ctx context.Context, snap notify.Snapshot, baseURL st
 	}
 	item := notify.Item{
 		FindingID:  snap.FindingID,
+		TaskID:     snap.TaskID,
+		Kind:       snap.Kind,
 		Name:       snap.Name,
 		VulnClass:  snap.VulnClass,
 		Severity:   snap.Severity,

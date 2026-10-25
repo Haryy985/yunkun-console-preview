@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -20,8 +23,8 @@ func TestProxyDiscoveryAdmissionStateErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	sourceID, err := s.m.pg.SaveProxyDiscoverySource(
-		0, "quake", "admission fixture", "port:8080", "203.0.113.0/24",
-		"http://127.0.0.1:9/ip", cipher, 100,
+		0, "quake", "admission fixture", "port:8080", "127.0.0.1",
+		"http://check.invalid/ip", cipher, 100,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -29,9 +32,14 @@ func TestProxyDiscoveryAdmissionStateErrors(t *testing.T) {
 	poolID := createTestPool(t, s, "http://127.0.0.1:9997")
 	var candidates []db.ProxyDiscoveryResult
 	for i := 10; i <= 15; i++ {
-		host := fmt.Sprintf("203.0.113.%d", i)
+		proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, "198.51.100.10")
+		}))
+		t.Cleanup(proxy.Close)
+		u, _ := url.Parse(proxy.URL)
+		port, _ := strconv.Atoi(u.Port())
 		candidates = append(candidates, db.ProxyDiscoveryResult{
-			Address: "http://" + host + ":8080", Protocol: "http", Host: host, Port: 8080,
+			Address: proxy.URL, Protocol: "http", Host: u.Hostname(), Port: port,
 			Metadata: map[string]any{},
 		})
 	}
@@ -42,9 +50,13 @@ func TestProxyDiscoveryAdmissionStateErrors(t *testing.T) {
 	if err != nil || len(results) != len(candidates) {
 		t.Fatalf("results: %v %#v", err, results)
 	}
-	ids := map[string]int64{}
+	idsByAddress := map[string]int64{}
 	for _, result := range results {
-		ids[result.Host] = result.ID
+		idsByAddress[result.Address] = result.ID
+	}
+	ids := map[string]int64{}
+	for i, candidate := range candidates {
+		ids[fmt.Sprintf("203.0.113.%d", i+10)] = idsByAddress[candidate.Address]
 	}
 	for _, change := range []struct {
 		host, state, ip string

@@ -60,7 +60,8 @@ tested AS (
 // it carries neither the fact-anchor union nor the tested set — it is pure "in
 // declared scope", independent of what has already been touched. Used by the
 // agent's list_assets so a query returns the task's relevant assets, not the
-// whole shared库.
+// whole shared库. Explicit task asset associations are also authorized targets,
+// even when an asset has no matching company/domain scope rule.
 const scopeTargetCTE = `
 context_tasks AS (
   SELECT t.id AS task_id
@@ -86,6 +87,10 @@ target AS (
        ))
   )
   JOIN context_tasks ctx ON ctx.task_id=ts.task_id
+	UNION
+	SELECT link.asset_id
+	FROM task_asset_links link
+	JOIN context_tasks ctx ON ctx.task_id=link.task_id
 )`
 
 // ListTaskScopeWithSources returns the current task's scope followed by the

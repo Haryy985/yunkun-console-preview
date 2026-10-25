@@ -164,12 +164,12 @@ func TestDiscoveryVerifyPromoteAndConfigurationChange(t *testing.T) {
 		t.Fatal("missing scope caused a network request")
 	}
 	if _, err := s.m.pg.SaveProxyDiscoverySource(sourceID, "quake", "workflow", "fixture", "127.0.0.1",
-		"", cipher, 100); err != nil {
+		"file://invalid", cipher, 100); err != nil {
 		t.Fatal(err)
 	}
 	verify(http.StatusBadRequest)
 	if requests != 1 {
-		t.Fatal("missing verification URL caused a network request")
+		t.Fatal("invalid verification URL caused a network request")
 	}
 	if _, err := s.m.pg.SaveProxyDiscoverySource(sourceID, "quake", "workflow", "fixture", "127.0.0.1",
 		"http://check.example/ip", cipher, 100); err != nil {

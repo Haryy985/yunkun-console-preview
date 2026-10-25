@@ -19,6 +19,7 @@ import (
 
 	"yunkun/console/agent"
 	"yunkun/console/config"
+	"yunkun/console/selfupdate"
 	"yunkun/console/server"
 )
 
@@ -43,12 +44,29 @@ func main() {
 
 func run() int {
 	var (
-		addr        = flag.String("addr", ":8787", "HTTP listen address")
-		dataDir     = flag.String("data", filepath.Join(config.BaseDir(), "data"), "data directory for SQLite stores (default: data/ next to the executable)")
-		proxy       = flag.String("proxy", "127.0.0.1:8788", "traffic recording proxy address (empty to disable)")
-		showVersion = flag.Bool("version", false, "print build version and exit")
+		addr             = flag.String("addr", ":8787", "HTTP listen address")
+		dataDir          = flag.String("data", filepath.Join(config.BaseDir(), "data"), "data directory for SQLite stores (default: data/ next to the executable)")
+		proxy            = flag.String("proxy", "127.0.0.1:8788", "traffic recording proxy address (empty to disable)")
+		showVersion      = flag.Bool("version", false, "print build version and exit")
+		updateJob        = flag.String("offline-files", "", "private offline update job")
+		updateOperation  = flag.String("file-operation", "", "private update file operation")
+		offlineWorkerJob = flag.String("offline-worker", "", "private Linux offline update supervisor")
 	)
 	flag.Parse()
+	if *offlineWorkerJob != "" {
+		if err := selfupdate.RunOfflineWorker(*offlineWorkerJob); err != nil {
+			log.Print(err)
+			return 1
+		}
+		return 0
+	}
+	if *updateJob != "" {
+		if err := selfupdate.OfflineFiles(*updateJob, *updateOperation); err != nil {
+			log.Print(err)
+			return 1
+		}
+		return 0
+	}
 	if *showVersion {
 		fmt.Println(version)
 		return 0
@@ -63,8 +81,6 @@ func run() int {
 	// capture backend logs into the in-memory sink (still to stderr) so the /logs
 	// page can show a live log stream. Do this first, to catch startup logs too.
 	server.StartLogCapture()
-
-	// In-app binary replacement remains disabled; clients can still check GitHub Releases.
 
 	// surface which config file the binary reads (absolute, so `go run`'s relative
 	// "config.json" — resolved against the CWD — is unambiguous).
@@ -118,6 +134,12 @@ func run() int {
 	}
 	defer mgr.Close()
 
+	if os.Getenv("YUNKUN_UPDATE_PROBE") == "1" {
+		startup.SetReady(server.UpdateProbeHandler(mgr))
+		<-ctx.Done()
+		return 0
+	}
+
 	if count, err := mgr.PG().RecoverRAGIngestionJobs(); err != nil {
 		log.Printf("recover RAG ingestion jobs: %v", err)
 		return 1
@@ -134,12 +156,19 @@ func run() int {
 	startup.SetReady(srv.Handler())
 	log.Printf("Yunkun %s backend ready on %s (data=%s, workers=%d)", version, *addr, *dataDir, mgr.Workers())
 
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+	case <-server.RestartRequested():
+		shutdown(agent.AbortShutdown)
+	}
 
 	log.Println("shutting down...")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
+	if selfupdate.OfflineActive(selfupdate.OfflineStatus(os.Getenv("YUNKUN_OFFLINE_ROOT")).Phase) {
+		log.Println("update supervisor will restart the console after the verified backup")
+	}
 	return 0
 }
 

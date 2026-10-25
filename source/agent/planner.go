@@ -7,13 +7,13 @@ import (
 	"strings"
 	"sync"
 
-	"yunkun/console/db"
-	"yunkun/console/intercept"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
+	"yunkun/console/db"
+	"yunkun/console/intercept"
 )
 
 // Planner is the event-driven LLM planner (docs §4.3): each time the asset or
@@ -373,7 +373,8 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// 领域工具 + 基础默认工具集（Read/Write/Edit/MultiEdit/LS/Glob/Grep/Bash）
 	// 资产覆盖度功能关闭时剔除 add_task_scope/list_untested_assets（不入 prompt）。
 	base := append(tsx.DropCoverageTools(tsx.PlannerTools()), actool.DefaultTools()...)
-	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), AgentID: "planner"})
+	trace := NewActivityRunTrace("planner", emit)
+	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), AgentID: "planner", Trace: trace})
 	tools, def, cleanup := AugmentTools(ctx, "planner", base)
 	defer cleanup()
 	// 关键态势（刚完成的意图 + 预取的完整图）改放【本轮 user 输入】(见下方 input)，system
@@ -462,12 +463,13 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		renderPlannerTodos(opts.Todos.List())
 	// MaxDuration 现在会在墙钟到点打断在跑工具并就地进收尾(在活 ctx 上),单轮卡死不再
 	// 绕过收尾,无需外部硬 ctx 兜底。ctx 只承载 pause / kill / shutdown。
-	_, _, err = captureRun(ctx, opts, input,
+	_, terminalReason, runErr := captureRun(ctx, opts, input,
 		func(r db.Activity) {
 			if emit != nil {
 				r.Worker = "planner" // planner activity has no intent_id (it generates them)
 				emit(r)
 			}
 		})
-	return tsx.GoalMet, tsx.Reason, err
+	trace.Finish(terminalReason, runErr)
+	return tsx.GoalMet, tsx.Reason, runErr
 }

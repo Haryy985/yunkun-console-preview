@@ -9,6 +9,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# A PowerShell 7 parent can pass incompatible built-in module paths to 5.1.
+if ($PSVersionTable.PSEdition -eq 'Desktop') {
+    $env:PSModulePath = (Join-Path $PSHOME 'Modules') + ';' +
+        (Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules')
+}
 $script:DatabasePortExplicit = $PSBoundParameters.ContainsKey('DatabasePort')
 
 function Get-SafePath([string]$Root, [string]$Child) {
@@ -200,6 +205,14 @@ function Invoke-OfflineSetup {
     $configPath = Get-SafePath $script:LocalHome (Join-Path $script:LocalHome 'config.json')
     $statePath = Get-SafePath $script:LocalHome (Join-Path $script:LocalHome 'installation.json')
     $runPath = Get-SafePath $script:LocalHome (Join-Path $script:LocalHome 'process.json')
+    $updateState = Join-Path $script:LocalHome 'update-state.json'
+    if (Test-Path -LiteralPath $updateState) {
+        $update = Get-Content -LiteralPath $updateState -Raw | ConvertFrom-Json
+        if ($update.phase -in @('waiting', 'backing_up', 'installing', 'starting', 'rolling_back', 'recovery_required') -and
+            $env:YUNKUN_UPDATE_JOB -ne $update.job) {
+            throw 'An update or recovery is pending. Inspect .yunkun-local\update-state.json; do not initialize or overwrite data.'
+        }
+    }
 
     foreach ($required in @(
         (Join-Path $pgBin 'pg_ctl.exe'),
@@ -338,6 +351,10 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'yunkun') \gexec
     $env:YUNKUN_CONFIG = $configPath
     $env:YUNKUN_PG_DSN = $null
     $env:YUNKUN_SKILL_DIR = Join-Path $root 'skills'
+    $env:NORMA_RIPGREP_NO_INSTALL = '1'
+    $env:YUNKUN_OFFLINE_ROOT = $root
+    $env:YUNKUN_OFFLINE_CONSOLE_PORT = "$ConsolePort"
+    $env:YUNKUN_OFFLINE_PUBLIC = if ($Public) { '1' } else { '0' }
     $listenAddress = if ($Public) { '0.0.0.0' } else { '127.0.0.1' }
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $process = Start-Process -FilePath $app -WorkingDirectory $script:LocalHome -WindowStyle Hidden -PassThru `

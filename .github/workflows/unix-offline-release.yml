@@ -1,153 +1,19 @@
-name: Build and publish full Unix offline packages
+name: Native Unix offline release acceptance
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/unix-offline-release.yml"
-      - "source/**"
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing candidate release tag to verify
+        required: true
+        default: v1.1.1-offline
+        type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build-test:
-    name: Build and test ${{ matrix.platform }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux-amd64
-            runner: ubuntu-24.04
-            goos: linux
-            goarch: amd64
-            runtime_archive: yunkun-v1.0.3-offline-linux-amd64.tar.gz
-            runtime_root: yunkun-v1.0.3-offline-linux-amd64
-            runtime_sha256: c351a41602006e4f560e0391dc29be7c3aa84636757566e05f399f1696c30168
-          - platform: darwin-arm64
-            runner: macos-15
-            goos: darwin
-            goarch: arm64
-            runtime_archive: yunkun-v1.0.3-offline-macos-apple-silicon.tar.gz
-            runtime_root: yunkun-v1.0.3-offline-macos-apple-silicon
-            runtime_sha256: 435d205d86ca4fe228a25ef784b11adf7f0820939baa077e06113cebbd71c389
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 35
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: source/web/package-lock.json
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.26"
-          cache-dependency-path: source/go.sum
-      - name: Build embedded frontend
-        working-directory: source/web
-        run: |
-          npm ci
-          npm run build:static
-      - name: Download and verify PostgreSQL runtime
-        env:
-          RUNTIME_ARCHIVE: ${{ matrix.runtime_archive }}
-          RUNTIME_SHA256: ${{ matrix.runtime_sha256 }}
-        run: |
-          set -euo pipefail
-          runtime_url="https://github.com/Haryy985/yunkun-console-preview/releases/download/v1.0.3-offline/${RUNTIME_ARCHIVE}"
-          curl --fail --location --retry 3 "$runtime_url" -o "$RUNNER_TEMP/$RUNTIME_ARCHIVE"
-          python3 - "$RUNNER_TEMP/$RUNTIME_ARCHIVE" "$RUNTIME_SHA256" <<'PY'
-          import hashlib
-          import pathlib
-          import sys
-          actual = hashlib.file_digest(pathlib.Path(sys.argv[1]).open("rb"), "sha256").hexdigest()
-          if actual != sys.argv[2]:
-              raise SystemExit(f"PostgreSQL runtime checksum mismatch: {actual}")
-          PY
-          mkdir -p "$RUNNER_TEMP/runtime-source"
-          tar -xzf "$RUNNER_TEMP/$RUNTIME_ARCHIVE" -C "$RUNNER_TEMP/runtime-source"
-      - name: Assemble full offline package
-        working-directory: source
-        env:
-          GOOS_TARGET: ${{ matrix.goos }}
-          GOARCH_TARGET: ${{ matrix.goarch }}
-          RUNTIME_ROOT: ${{ matrix.runtime_root }}
-        run: |
-          set -euo pipefail
-          version="$(tr -d '\r\n' < VERSION)"
-          test "$version" = "v1.0.6-offline"
-          mkdir -p server/webui/current "dist/yunkun-1.0.6-offline-${GOOS_TARGET}-${GOARCH_TARGET}/bin"
-          rsync -a --delete web/out/ server/webui/current/
-          root="dist/yunkun-1.0.6-offline-${GOOS_TARGET}-${GOARCH_TARGET}"
-          GOOS="$GOOS_TARGET" GOARCH="$GOARCH_TARGET" CGO_ENABLED=0 \
-            go build -tags embedui -trimpath \
-            -ldflags "-s -w -buildid= -X main.version=$version" \
-            -o "$root/bin/yunkun" ./cmd/yunkun
-          GOOS="$GOOS_TARGET" GOARCH="$GOARCH_TARGET" CGO_ENABLED=0 \
-            go build -trimpath -ldflags "-s -w -buildid=" \
-            -o "$root/bin/yunkun-offline" ./cmd/yunkun-offline
-          cp -a "$RUNNER_TEMP/runtime-source/$RUNTIME_ROOT/runtime" "$root/runtime"
-          cp -a skills "$root/skills"
-          cp LICENSE YUNKUN_AUTHORIZATION.md "$root/"
-          cp "$RUNNER_TEMP/runtime-source/$RUNTIME_ROOT/POSTGRESQL_LICENSE.txt" "$root/"
-          cp "$RUNNER_TEMP/runtime-source/$RUNTIME_ROOT/THIRD_PARTY_NOTICES.txt" "$root/"
-          printf '%s\n' \
-            'Yunkun Console v1.0.6 Offline Package' \
-            '' \
-            'Run ./start.sh from this directory as a regular user. The console listens on 127.0.0.1:5173.' \
-            'Use Ctrl+C or ./stop.sh to stop it. Local database and user data are retained in .yunkun-local/.' \
-            'This package includes PostgreSQL and does not require Go, Node.js, Docker, or network downloads.' \
-            'The database and personal data are created on first run and are not included in this package.' \
-            > "$root/README.txt"
-          cp VERSION "$root/VERSION"
-          cp scripts/offline-unix-start.sh "$root/start.sh"
-          cp scripts/offline-unix-stop.sh "$root/stop.sh"
-          chmod +x "$root/start.sh" "$root/stop.sh" "$root/bin/yunkun" "$root/bin/yunkun-offline"
-          mkdir -p dist
-          (cd dist && zip -q -r -9 "yunkun-1.0.6-offline-${GOOS_TARGET}-${GOARCH_TARGET}.zip" \
-            "yunkun-1.0.6-offline-${GOOS_TARGET}-${GOARCH_TARGET}")
-      - name: Verify fresh offline install, authentication, data retention and restart
-        env:
-          PACKAGE: yunkun-1.0.6-offline-${{ matrix.goos }}-${{ matrix.goarch }}
-        run: |
-          python3 source/tests/unix-offline-smoke.py \
-            "$GITHUB_WORKSPACE/source/dist/$PACKAGE" \
-            "$RUNNER_TEMP/smoke-result.json"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: full-offline-${{ matrix.platform }}
-          path: source/dist/yunkun-1.0.6-offline-${{ matrix.goos }}-${{ matrix.goarch }}.zip
-          if-no-files-found: error
-          retention-days: 7
-
-  publish:
-    needs: build-test
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: full-offline-*
-          merge-multiple: true
-          path: dist
-      - name: Preserve Windows checksum and generate updated checksums
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          mkdir existing
-          gh release download v1.0.6-offline \
-            --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir existing
-          grep -E '  yunkun-1\.0\.6-offline-windows-amd64\.zip$' existing/SHA256SUMS > dist/SHA256SUMS
-          cd dist
-          sha256sum yunkun-1.0.6-offline-linux-amd64.zip yunkun-1.0.6-offline-darwin-arm64.zip >> SHA256SUMS
-      - name: Replace only Linux/macOS packages and checksum file
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload v1.0.6-offline \
-            dist/yunkun-1.0.6-offline-linux-amd64.zip \
-            dist/yunkun-1.0.6-offline-darwin-arm64.zip \
-            dist/SHA256SUMS \
-            --clobber --repo "$GITHUB_REPOSITORY"
+  acceptance:
+    uses: ./.github/workflows/unix-offline-smoke.yml
+    with:
+      release_tag: ${{ inputs.release_tag }}

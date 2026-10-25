@@ -24,6 +24,7 @@ const (
 // 事件类型，对应 notification_events.kind。
 const (
 	EventFindingCreated       = "finding_created"
+	EventFindingVerified      = "finding_verified"
 	EventFindingStatusChanged = "finding_status_changed"
 )
 

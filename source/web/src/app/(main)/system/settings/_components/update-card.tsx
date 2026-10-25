@@ -8,6 +8,7 @@ import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { UpdateAction } from "@/components/update-action";
 import { api } from "@/lib/api";
 import type { UpdateCheck } from "@/lib/types";
 
@@ -62,7 +63,7 @@ export function UpdateCard() {
           <DownloadIcon className="size-4" />
           版本与更新
         </CardTitle>
-        <CardDescription>检查云鲲控制台的正式版本，并按发布说明手动更新。</CardDescription>
+        <CardDescription>版本、发布说明与安装状态</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="flex flex-wrap items-center gap-2 text-sm">
@@ -118,9 +119,7 @@ export function UpdateCard() {
           <div className="space-y-2">
             <p className="text-muted-foreground text-xs">
               可下载 <span className="font-mono">{info.asset}</span>
-              {info.size ? `（${humanSize(info.size)}）` : ""}。请先备份数据，按 Release 说明更新，不要删除
-              <span className="font-mono"> .yunkun-local </span>
-              数据目录。
+              {info.size ? `（${humanSize(info.size)}）` : ""}。
             </p>
             {info.notes ? (
               <div className="max-h-56 overflow-y-auto whitespace-pre-wrap rounded-md border bg-muted/30 p-3 text-muted-foreground text-xs leading-5">
@@ -147,10 +146,7 @@ export function UpdateCard() {
             打开发布页
           </Button>
         </div>
-
-        <p className="text-muted-foreground text-xs">
-          更新由维护者发布到固定的云鲲 GitHub 仓库。当前版本只提醒并打开下载页，不会在后台替换程序，也不会删除用户数据。
-        </p>
+        <UpdateAction info={info} />
       </CardContent>
     </Card>
   );

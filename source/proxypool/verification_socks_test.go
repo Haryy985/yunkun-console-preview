@@ -168,7 +168,11 @@ func TestVerificationHTTPSViaProxies(t *testing.T) {
 		if r.Header.Get("Proxy-Authorization") != "" {
 			t.Error("proxy credentials reached the verification endpoint")
 		}
-		_, _ = io.WriteString(w, `{"ip":"198.51.100.42"}`)
+		if r.URL.Path == "/page" {
+			_, _ = io.WriteString(w, "<html>"+strings.Repeat("page", 2048)+"</html>")
+		} else {
+			_, _ = io.WriteString(w, `{"ip":"198.51.100.42"}`)
+		}
 	}))
 	defer target.Close()
 	roots := x509.NewCertPool()
@@ -176,83 +180,101 @@ func TestVerificationHTTPSViaProxies(t *testing.T) {
 	targetURL, _ := url.Parse(target.URL)
 
 	for _, protocol := range []string{"http", "socks5"} {
-		t.Run(protocol, func(t *testing.T) {
-			listener, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer listener.Close()
-			done := make(chan error, 1)
-			go func() {
-				done <- func() error {
-					conn, err := listener.Accept()
-					if err != nil {
-						return err
-					}
-					defer conn.Close()
-					_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
-					reader := bufio.NewReader(conn)
-					if protocol == "http" {
-						req, err := http.ReadRequest(reader)
+		for _, mode := range []string{VerifyExitIP, VerifyConnectivity, "untrusted-certificate"} {
+			t.Run(protocol+"/"+mode, func(t *testing.T) {
+				listener, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer listener.Close()
+				done := make(chan error, 1)
+				go func() {
+					done <- func() error {
+						conn, err := listener.Accept()
 						if err != nil {
 							return err
 						}
-						defer req.Body.Close()
-						if req.Method != http.MethodConnect || req.Host != targetURL.Host {
-							return errors.New("incorrect CONNECT destination")
+						defer conn.Close()
+						_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
+						reader := bufio.NewReader(conn)
+						if protocol == "http" {
+							req, err := http.ReadRequest(reader)
+							if err != nil {
+								return err
+							}
+							defer req.Body.Close()
+							if req.Method != http.MethodConnect || req.Host != targetURL.Host {
+								return errors.New("incorrect CONNECT destination")
+							}
+						} else {
+							head := make([]byte, 2)
+							if _, err := io.ReadFull(reader, head); err != nil {
+								return err
+							}
+							methods := make([]byte, int(head[1]))
+							if _, err := io.ReadFull(reader, methods); err != nil {
+								return err
+							}
+							if _, err := conn.Write([]byte{5, 0}); err != nil {
+								return err
+							}
+							request := make([]byte, 10) // IPv4 + port for the local TLS fixture.
+							if _, err := io.ReadFull(reader, request); err != nil {
+								return err
+							}
+							if request[0] != 5 || request[1] != 1 || request[3] != 1 ||
+								net.IP(request[4:8]).String() != targetURL.Hostname() ||
+								fmt.Sprint(int(request[8])<<8|int(request[9])) != targetURL.Port() {
+								return errors.New("incorrect SOCKS5 destination")
+							}
 						}
-					} else {
-						head := make([]byte, 2)
-						if _, err := io.ReadFull(reader, head); err != nil {
+						up, err := net.DialTimeout("tcp", targetURL.Host, time.Second)
+						if err != nil {
 							return err
 						}
-						methods := make([]byte, int(head[1]))
-						if _, err := io.ReadFull(reader, methods); err != nil {
+						defer up.Close()
+						if protocol == "http" {
+							_, err = io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
+						} else {
+							_, err = conn.Write([]byte{5, 0, 0, 1, 127, 0, 0, 1, 0, 0})
+						}
+						if err != nil {
 							return err
 						}
-						if _, err := conn.Write([]byte{5, 0}); err != nil {
-							return err
-						}
-						request := make([]byte, 10) // IPv4 + port for the local TLS fixture.
-						if _, err := io.ReadFull(reader, request); err != nil {
-							return err
-						}
-						if request[0] != 5 || request[1] != 1 || request[3] != 1 ||
-							net.IP(request[4:8]).String() != targetURL.Hostname() ||
-							fmt.Sprint(int(request[8])<<8|int(request[9])) != targetURL.Port() {
-							return errors.New("incorrect SOCKS5 destination")
-						}
-					}
-					up, err := net.DialTimeout("tcp", targetURL.Host, time.Second)
-					if err != nil {
-						return err
-					}
-					defer up.Close()
-					if protocol == "http" {
-						_, err = io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
-					} else {
-						_, err = conn.Write([]byte{5, 0, 0, 1, 127, 0, 0, 1, 0, 0})
-					}
-					if err != nil {
-						return err
-					}
-					copied := make(chan struct{})
-					go func() { _, _ = io.Copy(up, reader); _ = up.Close(); close(copied) }()
-					_, _ = io.Copy(conn, up)
-					_ = conn.Close()
-					<-copied
-					return nil
+						copied := make(chan struct{})
+						go func() { _, _ = io.Copy(up, reader); _ = up.Close(); close(copied) }()
+						_, _ = io.Copy(conn, up)
+						_ = conn.Close()
+						<-copied
+						return nil
+					}()
 				}()
-			}()
-			upstream, _ := url.Parse(protocol + "://" + listener.Addr().String())
-			ip, err := verifyWithTransport(context.Background(), upstream, target.URL, &tls.Config{RootCAs: roots})
-			if fixtureErr := <-done; fixtureErr != nil {
-				t.Fatal(fixtureErr)
-			}
-			if err != nil || ip != "198.51.100.42" {
-				t.Fatalf("HTTPS verification via %s failed: %q %v", protocol, ip, err)
-			}
-		})
+				upstream, _ := url.Parse(protocol + "://" + listener.Addr().String())
+				endpoint := target.URL
+				config := &tls.Config{RootCAs: roots}
+				verifyMode := mode
+				if mode != VerifyExitIP {
+					endpoint += "/page"
+				}
+				if mode == "untrusted-certificate" {
+					config = nil
+					verifyMode = VerifyConnectivity
+				}
+				result, err := verifyEndpointWithTransport(context.Background(), upstream, endpoint, verifyMode, config)
+				if fixtureErr := <-done; fixtureErr != nil {
+					t.Fatal(fixtureErr)
+				}
+				if mode == "untrusted-certificate" {
+					if err == nil || !strings.Contains(err.Error(), "tls:certificate") {
+						t.Fatalf("untrusted TLS accepted: %v", err)
+					}
+					return
+				}
+				if err != nil || result.HTTPStatus != 200 || (mode == VerifyExitIP && result.IP != "198.51.100.42") || (mode == VerifyConnectivity && result.IP != "") {
+					t.Fatalf("HTTPS verification via %s failed: %+v %v", protocol, result, err)
+				}
+			})
+		}
 	}
 }
 

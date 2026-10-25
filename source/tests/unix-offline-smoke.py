@@ -89,6 +89,10 @@ try:
                      "runtime/bin/initdb", "runtime/bin/pg_ctl", "runtime/bin/postgres"):
         assert os.access(root / relative, os.X_OK), relative
     checks.append("clean archive and executable permissions")
+    preflight = subprocess.run([str(root / "check.sh")], capture_output=True, text=True, timeout=60)
+    assert preflight.returncode == 0, preflight.stdout + preflight.stderr
+    assert not (root / ".yunkun-local").exists(), "dependency check created private data"
+    checks.append("offline dependency preflight creates no installation data")
     start()
     checks.append("bundled PostgreSQL initialized and health ready")
     html = request("/login/").decode()
@@ -113,12 +117,18 @@ try:
     stop()
     assert (root / ".yunkun-local" / "postgres-data" / "PG_VERSION").is_file()
     checks.append("stop.sh stops both listeners and preserves database")
+    config_path = root / ".yunkun-local" / "config.json"
+    config = json.loads(config_path.read_text())
+    config["customer_setting"] = {"offline_smoke": True}
+    config_path.write_text(json.dumps(config, indent=2) + "\n")
+    config_hash = hashlib.sha256(config_path.read_bytes()).hexdigest()
     start()
     assert hashlib.sha256(state_path.read_bytes()).hexdigest() == state_hash
+    assert hashlib.sha256(config_path.read_bytes()).hexdigest() == config_hash, "customer config overwritten"
     api("/api/auth/login", {"username": "yunkun", "password": password})["token"]
     retained = api("/api/rag/knowledge-bases", token=token)
     assert "unix-smoke-synthetic" in json.dumps(retained)
-    checks.append("restart retains credentials, session and synthetic data")
+    checks.append("restart retains configuration, credentials, session and synthetic data")
     stop()
     result = {"ok": True, "checks": checks}
     result_path.write_text(json.dumps(result, indent=2) + "\n")
@@ -133,5 +143,6 @@ finally:
             process.wait(timeout=30)
         except (ProcessLookupError, subprocess.TimeoutExpired):
             process.kill()
+            process.wait(timeout=10)
         if output is not None:
             output.close()

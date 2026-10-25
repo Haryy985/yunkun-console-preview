@@ -299,10 +299,24 @@ func IsQuotaExhaustedMessage(message string) bool {
 	if strings.Contains(message, "status 403") && subscriptionNotFound.MatchString(message) {
 		return true
 	}
-	// Authentication/authorization and provider-side 5xx failures never rotate,
-	// even when a gateway happens to echo a quota-looking phrase in the body.
+	// Do not reinterpret authentication or server failures as quota exhaustion
+	// just because their body contains a quoted upstream quota diagnostic.
 	if nonFailoverHTTPStatus.MatchString(message) {
 		return false
+	}
+	// Some gateways label a hard daily platform cap as rate_limit_exceeded.
+	// The explicit daily-exhaustion wording must win over that generic type,
+	// otherwise task-LLM retries spend time on a quota that cannot recover now.
+	for _, marker := range []string{
+		"daily usage quota exhausted",
+		"daily quota exhausted",
+		"daily limit exhausted",
+		"每日额度已用尽",
+		"每日用量已耗尽",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
 	}
 	// Provider APIs frequently describe an ordinary rate limit as "quota
 	// exceeded", especially Google-style responses containing a quota metric.

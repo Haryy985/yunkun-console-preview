@@ -14,13 +14,13 @@ import (
 	"sync"
 	"time"
 
+	actool "github.com/Autumn-27/norma/tool"
 	"yunkun/console/agent"
 	pgdb "yunkun/console/db"
 	"yunkun/console/enrich"
 	"yunkun/console/guard"
 	"yunkun/console/intercept"
 	"yunkun/console/traffic"
-	actool "github.com/Autumn-27/norma/tool"
 )
 
 // Task is one engagement: a description + goal + its own exploration store,
@@ -231,13 +231,16 @@ type Manager struct {
 	// taskStateMu preserves commit order between PostgreSQL lifecycle writes and
 	// their in-memory mirrors. lifecycleMu makes snapshots race-free, but without
 	// this outer write lock an older request could commit first and publish last.
-	taskStateMu sync.Mutex
-	mu          sync.RWMutex
-	shutdowns   []func()
-	tasks       map[string]*Task
-	active      string
-	trafficOn   bool // 流量捕获开关（默认关；settings.traffic_capture）
-	llmRecOn    bool // LLM 录制开关（默认关；settings.llm_record）
+	taskStateMu   sync.Mutex
+	mu            sync.RWMutex
+	workersMu     sync.Mutex
+	workersValue  int
+	workersReadAt time.Time
+	shutdowns     []func()
+	tasks         map[string]*Task
+	active        string
+	trafficOn     bool // 流量捕获开关（默认关；settings.traffic_capture）
+	llmRecOn      bool // LLM 录制开关（默认关；settings.llm_record）
 	// 联网搜索开关与来源（默认关；settings.web_search_*）。brave-free 需要 braveKey；tavily 需要 tavilyKey。
 	// webSearchProxy 是独立出口代理(http/https/socks5)，与记录流量的 MITM 代理无关。
 	webSearchOn      bool
@@ -319,18 +322,30 @@ func (m *Manager) SetConcurrency(enabled bool, limit int) error {
 	return m.pg.SetSetting(settingConcurrencyOn, strconv.FormatBool(enabled))
 }
 
-// Workers returns the configured concurrent work-agent count (default 3). Read
-// per-task at engine.Run, so a change applies to tasks started afterwards.
+// Workers returns the current configured concurrent work-agent count (default 3).
 func (m *Manager) Workers() int {
+	m.workersMu.Lock()
+	defer m.workersMu.Unlock()
+	if m.workersValue > 0 && time.Since(m.workersReadAt) < time.Second {
+		return m.workersValue
+	}
 	v, ok, err := m.pg.GetSetting(settingWorkers)
-	if err != nil || !ok {
+	m.workersReadAt = time.Now()
+	if err != nil {
+		if m.workersValue > 0 {
+			return m.workersValue
+		}
 		return defaultWorkers
+	}
+	m.workersValue = defaultWorkers
+	if !ok {
+		return m.workersValue
 	}
 	n, err := strconv.Atoi(strings.TrimSpace(v))
-	if err != nil || n <= 0 {
-		return defaultWorkers
+	if err == nil && n > 0 {
+		m.workersValue = n
 	}
-	return n
+	return m.workersValue
 }
 
 // SetWorkers persists the concurrent work-agent count. Values <=0 are rejected.
@@ -338,7 +353,13 @@ func (m *Manager) SetWorkers(n int) error {
 	if n <= 0 {
 		return fmt.Errorf("workers 必须 >0")
 	}
-	return m.pg.SetSetting(settingWorkers, strconv.Itoa(n))
+	m.workersMu.Lock()
+	defer m.workersMu.Unlock()
+	if err := m.pg.SetSetting(settingWorkers, strconv.Itoa(n)); err != nil {
+		return err
+	}
+	m.workersValue, m.workersReadAt = n, time.Now()
+	return nil
 }
 
 // Enrich returns the asset auto-completion engine (may be nil if init failed).

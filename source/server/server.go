@@ -44,6 +44,7 @@ var resumeTasksOnStartup = true
 // Server exposes the backend over a JSON HTTP API for the shadcn/ui
 // frontend.
 type Server struct {
+	loginLimiter       authLoginLimiter
 	proxyPools         *proxyPoolService
 	proxyDiscovery     *proxyDiscoveryService
 	proxyDiscoveryInit sync.Once
@@ -164,6 +165,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		log.Printf("[proxy-pools] initialization failed; pool tasks disabled")
 	}
 	s.initProxyDiscovery()
+	if s.proxyPools != nil {
+		s.runProxyImports()
+	}
 	if len(gatewayAddr) > 0 {
 		if err := s.SetProxyGatewayAddress(gatewayAddr[0]); err != nil {
 			log.Printf("[proxy-pools] gateway address unavailable; pool tasks disabled")
@@ -720,12 +724,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/logs/history", s.getLogsHistory)
 	mux.HandleFunc("GET /api/logs/stream", s.streamLogs)
 
-	// Version checks use a fixed, trusted release feed. Applying a release
-	// remains disabled until the offline-package restart flow is wired.
+	// Only managed offline installations can apply a verified release.
 	mux.HandleFunc("GET /api/update/check", s.updateCheck)
-	mux.HandleFunc("POST /api/update/apply", updateUnavailable)
+	mux.HandleFunc("POST /api/update/apply", s.updateApply)
 	mux.HandleFunc("POST /api/update/rollback", updateUnavailable)
-	mux.HandleFunc("GET /api/update/stream", updateUnavailable)
+	mux.HandleFunc("GET /api/update/stream", s.updateStream)
+	mux.HandleFunc("GET /api/update/status", s.updateStatus)
 
 	mux.HandleFunc("GET /api/tasks", s.listTasks)
 	mux.HandleFunc("POST /api/tasks", s.createTask)
@@ -1024,7 +1028,7 @@ func (s *Server) Handler() http.Handler {
 	// /api/* goes through CORS + JWT; everything else is served by the embedded
 	// frontend (public — auth is enforced client-side and on the API). With the
 	// no-embed build the webui handler just 404s (run `next dev` separately).
-	api := cors(s.requireAuth(mux))
+	api := cors(s.requireAuth(s.updateMaintenance(mux)))
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
 	root.Handle("/", s.webuiHandler())
@@ -3494,7 +3498,7 @@ func (s *Server) settingsPayload() map[string]any {
 		"web_search_proxy":         proxy,                       // 独立出口代理(http/https/socks5)，空=直连
 		"global_proxy":             s.m.GlobalProxy(),           // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
 		"python_interpreter":       strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
-		"workers":                  s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
+		"workers":                  s.m.Workers(),               // 并发工作 agent 数(默认3)；已有任务动态调整
 		"task_concurrency_enabled": concOn,                      // 任务并发上限开关(默认关)
 		"task_concurrency_limit":   concLimit,                   // 同时运行任务上限(开启后默认5)
 		// LLM 轮询(故障转移)。默认关；开启后走全局激活配置的 agent 在当前配置不可用时
@@ -3566,7 +3570,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		WebSearchProxy   *string `json:"web_search_proxy"`   // 独立出口代理(http/https/socks5)；null=不改，""=清空
 		GlobalProxy      *string `json:"global_proxy"`       // 全局出口代理(http/https/socks5)；null=不改，""=清空(直连)
 		PythonInterp     *string `json:"python_interpreter"` // 自定义脚本工具的 python 解释器路径
-		Workers          *int    `json:"workers"`            // 并发工作 agent 数(>0)；对之后启动的任务生效
+		Workers          *int    `json:"workers"`            // 并发工作 agent 数(>0)；已有任务动态调整
 		// 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
 		ConcurrencyEnabled *bool `json:"task_concurrency_enabled"`
 		ConcurrencyLimit   *int  `json:"task_concurrency_limit"`
@@ -4089,12 +4093,10 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 		evidenceError(w, err)
 		return
 	}
-	counts := map[string]int{}
-	for _, ty := range []string{"root_domain", "ip", "subdomain", "app", "service", "endpoint"} {
-		ns, _ := s.m.Assets().QueryByType(ty, 100000, 0)
-		if len(ns) > 0 {
-			counts[ty] = len(ns)
-		}
+	counts, err := s.m.Assets().CountsByTypeForTask(taskID)
+	if err != nil {
+		writeErr(w, 500, "读取任务资产统计失败")
+		return
 	}
 	md := report.Markdown(report.Input{
 		Title: t.Description, Goal: t.Goal, GeneratedAt: time.Now(),

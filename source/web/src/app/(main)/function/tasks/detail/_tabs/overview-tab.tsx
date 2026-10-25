@@ -28,6 +28,7 @@ import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
 import { api } from "@/lib/api";
+import { formatTokens } from "@/lib/token-format";
 import type {
   AssetInterceptKind,
   AssetInterceptRule,
@@ -43,9 +44,7 @@ import type {
 
 // 紧凑格式化 token 数（12345 → 12.3k，2000000 → 2M）。
 function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1) + "M";
-  if (n >= 1000) return (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k";
-  return String(n);
+  return formatTokens(n);
 }
 
 // 缓存命中率 = 缓存读 / 输入（InputTokens 已含 cache_read 子集，故比值在 0–100%）。
@@ -776,6 +775,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                     <tr className="text-muted-foreground border-b text-left text-xs">
                       <th className="py-1.5 pr-3 font-medium">模型</th>
                       <th className="py-1.5 pr-3 text-right font-medium">调用</th>
+                      <th className="py-1.5 pr-3 text-right font-medium">用量未知</th>
                       <th className="py-1.5 pr-3 text-right font-medium">输入</th>
                       <th className="py-1.5 pr-3 text-right font-medium">输出</th>
                       <th className="py-1.5 pr-3 text-right font-medium">缓存读</th>
@@ -789,6 +789,9 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                           {m.model}
                         </td>
                         <td className="py-1.5 pr-3 text-right tabular-nums">{m.calls}</td>
+                        <td className="py-1.5 pr-3 text-right tabular-nums">
+                          {m.unknown_calls > 0 ? `${m.unknown_calls} 次` : "0"}
+                        </td>
                         <td className="py-1.5 pr-3 text-right tabular-nums">{fmtTokens(m.input_tokens)}</td>
                         <td className="py-1.5 pr-3 text-right tabular-nums">{fmtTokens(m.output_tokens)}</td>
                         <td className="py-1.5 pr-3 text-right tabular-nums">{fmtTokens(m.cache_read_tokens)}</td>
@@ -800,6 +803,11 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                   </tbody>
                 </table>
               </div>
+              {modelTokens.some((m) => m.unknown_calls > 0) && (
+                <p className="text-muted-foreground text-xs">
+                  用量未知表示模型服务未返回 Token 计数；汇总值不包含这些调用，不能当作 0 Token。
+                </p>
+              )}
             </>
           ) : (
             <p className="text-muted-foreground text-sm">暂无 LLM 用量（任务尚未产生调用，或记录仍在写入）。</p>

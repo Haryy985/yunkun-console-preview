@@ -133,6 +133,30 @@ func TestTaskReportIncludesPersistedFindingAndTrafficReferences(t *testing.T) {
 	}
 }
 
+func TestTaskReportOnlyCountsCurrentTaskAssets(t *testing.T) {
+	s, finding, request := trafficEvidenceServer(t)
+	approveFormalReportFixture(t, s, finding, "Approved report fixture")
+	row, err := s.m.pg.GetFinding(finding.FindingID)
+	if err != nil || row.TaskID == nil {
+		t.Fatalf("finding: %+v, %v", row, err)
+	}
+	domain := fmt.Sprintf("report-task-%d.example.test", *row.TaskID)
+	t.Cleanup(func() { _, _ = s.m.pg.Exec(`DELETE FROM assets WHERE domain=$1 OR ip=$2`, domain, "192.0.2.197") })
+	if _, err := s.m.pg.Exec(`INSERT INTO assets(type,domain,task_ids) VALUES('root_domain',$1,ARRAY[$2]::bigint[])`, domain, *row.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.m.pg.Exec(`INSERT INTO assets(type,ip,task_ids) VALUES('ip',$1,ARRAY[$2]::bigint[])`, "192.0.2.197", *row.TaskID+1000000); err != nil {
+		t.Fatal(err)
+	}
+	response := request("GET", fmt.Sprintf("/api/report?task=%d", *row.TaskID), "")
+	if response.Code != 200 {
+		t.Fatalf("export: %d %s", response.Code, response.Body)
+	}
+	if !strings.Contains(response.Body.String(), "root_domain 1") || strings.Contains(response.Body.String(), "ip 1") {
+		t.Fatalf("report included unrelated assets: %s", response.Body.String())
+	}
+}
+
 func TestTaskReportBlocksUnregisteredFindingsBeyondFirstThousand(t *testing.T) {
 	s, finding, request := trafficEvidenceServer(t)
 	row, err := s.m.pg.GetFinding(finding.FindingID)

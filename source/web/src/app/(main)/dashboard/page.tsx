@@ -29,6 +29,7 @@ import { type ChartConfig, ChartContainer, ChartTooltip, ChartTooltipContent } f
 import { Progress } from "@/components/ui/progress";
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { api } from "@/lib/api";
+import { formatTokens } from "@/lib/token-format";
 import type {
   Activity,
   Agent,
@@ -71,9 +72,7 @@ function fmtRel(ts?: string | number): string {
 }
 
 function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
-  if (n >= 1000) return (n / 1000).toFixed(1) + "k";
-  return String(n);
+  return formatTokens(n);
 }
 
 const ASSET_TYPE_LABELS: Record<string, string> = {
@@ -340,7 +339,7 @@ export default function DashboardPage() {
   const defaultProfileId = activeProfile ? Number(activeProfile.id) : null;
 
   // 数据源开关：旧版 = activity（task.tokens + 会话），新版 = llm_usage 计量账本。
-  const [tokenVersion, setTokenVersion] = React.useState<"old" | "new">("old");
+  const [tokenVersion, setTokenVersion] = React.useState<"old" | "new">("new");
   // selected profile tab: "all" = 全部; number = specific profile id
   const [tokenTab, setTokenTab] = React.useState<number | null | "all">("all");
   // day range for the daily bar chart
@@ -353,19 +352,20 @@ export default function DashboardPage() {
     return m;
   }, [llmProfiles]);
 
-  type Bucket = { input: number; output: number; cacheRead: number; cacheWrite: number; taskCount: number };
+  type Bucket = { input: number; output: number; cacheRead: number; cacheWrite: number; taskCount: number; unknownCalls: number };
 
   // 旧版：按 profile 归桶（来自 activity 的 task.tokens + 会话用量）。
   const tokenByProfileOld = React.useMemo<Map<number | null, Bucket>>(() => {
     const m = new Map<number | null, Bucket>();
     const fold = (key: number | null, inp: number, out: number, cr: number, cw: number, addTask: boolean) => {
-      const prev = m.get(key) ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, taskCount: 0 };
+      const prev = m.get(key) ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, taskCount: 0, unknownCalls: 0 };
       m.set(key, {
         input: prev.input + inp,
         output: prev.output + out,
         cacheRead: prev.cacheRead + cr,
         cacheWrite: prev.cacheWrite + cw,
         taskCount: prev.taskCount + (addTask ? 1 : 0),
+        unknownCalls: prev.unknownCalls,
       });
     };
     for (const t of tasks) {
@@ -391,19 +391,20 @@ export default function DashboardPage() {
     return m;
   }, [tasks, convTokens, defaultProfileId]);
 
-  // 新版：按 profile 归桶（来自 llm_usage 全局聚合，逐次调用精确）。
+  // 新版：按 profile 归桶，汇总 llm_usage 中服务商实际返回的用量。
   const tokenByProfileNew = React.useMemo<Map<number | null, Bucket>>(() => {
     const m = new Map<number | null, Bucket>();
     for (const p of usageStats?.by_profile ?? []) {
       // 未匹配到现有 profile（改名/删除/空名）→ 落到默认桶，仍计入「全部」。
       const key = profileIdByName.get(p.profile_name) ?? defaultProfileId;
-      const prev = m.get(key) ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, taskCount: 0 };
+      const prev = m.get(key) ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, taskCount: 0, unknownCalls: 0 };
       m.set(key, {
         input: prev.input + p.input_tokens,
         output: prev.output + p.output_tokens,
         cacheRead: prev.cacheRead + p.cache_read_tokens,
         cacheWrite: prev.cacheWrite + p.cache_write_tokens,
         taskCount: prev.taskCount + p.tasks,
+        unknownCalls: prev.unknownCalls + p.unknown_calls,
       });
     }
     return m;
@@ -417,20 +418,22 @@ export default function DashboardPage() {
         output = 0,
         cacheRead = 0,
         cacheWrite = 0,
-        taskCount = 0;
+        taskCount = 0,
+        unknownCalls = 0;
       for (const v of tokenByProfile.values()) {
         input += v.input;
         output += v.output;
         cacheRead += v.cacheRead;
         cacheWrite += v.cacheWrite;
         taskCount += v.taskCount;
+        unknownCalls += v.unknownCalls;
       }
-      return { input, output, cacheRead, cacheWrite, taskCount };
+      return { input, output, cacheRead, cacheWrite, taskCount, unknownCalls };
     }
     const v = tokenByProfile.get(tokenTab as number | null);
     return v
-      ? { input: v.input, output: v.output, cacheRead: v.cacheRead, cacheWrite: v.cacheWrite, taskCount: v.taskCount }
-      : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, taskCount: 0 };
+      ? { input: v.input, output: v.output, cacheRead: v.cacheRead, cacheWrite: v.cacheWrite, taskCount: v.taskCount, unknownCalls: v.unknownCalls }
+      : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, taskCount: 0, unknownCalls: 0 };
   }, [tokenTab, tokenByProfile]);
 
   // 旧版每日：把任务/会话的总量按其创建日期归桶（近似，非真实每日消耗）。
@@ -487,6 +490,7 @@ export default function DashboardPage() {
     if (a.kind === "tool_result") return `工具返回 · ${a.tool ?? "未命名"}`;
     if (a.kind === "intercept_request") return "等待审批";
     if (a.kind === "llm_failover") return "模型切换";
+    if (a.kind === "agent_run") return "Agent / Skill 执行记录";
     if (a.kind === "result") return "执行结果";
     return a.kind === "text" ? "Agent 更新" : a.kind;
   }
@@ -557,9 +561,11 @@ export default function DashboardPage() {
         {/* LLM 用量 */}
         <div className="min-w-0 pr-3 lg:pl-5">
           <div className="flex items-center justify-between gap-1 text-xs text-muted-foreground">Token 用量 <ZapIcon className="size-4" /></div>
-          <div className="mt-2 text-3xl font-semibold tabular-nums">{fmtTokens(displayedTokens.input + displayedTokens.output)}</div>
+          <div className="mt-2 text-3xl font-semibold tabular-nums">{formatTokens(displayedTokens.input + displayedTokens.output, false)}</div>
+          <div className="break-all text-xs tabular-nums text-muted-foreground">{(displayedTokens.input + displayedTokens.output).toLocaleString("en-US")} tokens</div>
           <div className="mt-2 text-[10px] text-muted-foreground">
             入 {fmtTokens(displayedTokens.input)}（含缓存 {fmtTokens(displayedTokens.cacheRead)}）· 出 {fmtTokens(displayedTokens.output)}
+            {tokenVersion === "new" && displayedTokens.unknownCalls > 0 && ` · 未知用量 ${displayedTokens.unknownCalls} 次`}
           </div>
         </div>
       </div>
@@ -586,7 +592,7 @@ export default function DashboardPage() {
                   onClick={() => setTokenVersion(v)}
                   title={
                     v === "new"
-                      ? "新版：来自 llm_usage 计量账本，逐次调用精确、含中断消耗；仅覆盖启用后的数据"
+                      ? "新版：逐次记录服务商返回的用量；中断仅计已收到部分，未返回用量标为未知；仅覆盖启用后的数据"
                       : "旧版：来自 activity 统计（含历史任务），中断消耗不计、无法精确到模型"
                   }
                   className={cn(
@@ -661,10 +667,14 @@ export default function DashboardPage() {
             {/* Total */}
             <div>
               <div className="text-[10px] text-muted-foreground">合计 (输入+输出)</div>
-              <div className="mt-0.5 text-3xl font-bold tabular-nums tracking-tight">
-                {fmtTokens(displayedTokens.input + displayedTokens.output) || "—"}
+              <div className="mt-0.5 text-3xl font-bold tabular-nums">
+                {formatTokens(displayedTokens.input + displayedTokens.output, false)}
               </div>
-              <div className="mt-0.5 text-[10px] text-muted-foreground">{displayedTokens.taskCount} 个任务</div>
+              <div className="break-all text-xs tabular-nums text-muted-foreground">{(displayedTokens.input + displayedTokens.output).toLocaleString("en-US")} tokens</div>
+              <div className="mt-0.5 text-[10px] text-muted-foreground">
+                {displayedTokens.taskCount} 个任务
+                {tokenVersion === "new" && displayedTokens.unknownCalls > 0 && ` · ${displayedTokens.unknownCalls} 次用量未知`}
+              </div>
             </div>
 
             {/* Per-type bars */}

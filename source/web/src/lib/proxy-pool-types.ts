@@ -67,6 +67,29 @@ export type ProxyNode = {
   last_failure_at?: string;
   notes?: string;
   deleted_at?: string;
+  last_verify_mode?: ProxyVerificationMode;
+  last_verify_target?: string;
+  last_http_status?: number;
+};
+
+export type ProxyVerificationMode = "connectivity" | "exit_ip";
+
+export type ProxyVerificationResult = {
+  ip?: string;
+  mode: ProxyVerificationMode;
+  target: string;
+  http_status?: number;
+  latency_ms: number;
+  checked_at: string;
+};
+
+export type ProxyNodeQuery = {
+  page: number;
+  page_size: number;
+  q?: string;
+  status?: string;
+  protocol?: string;
+  sort?: string;
 };
 
 export type ProxyNodeSummary = {
@@ -126,17 +149,40 @@ export type ProxyDiscoveryResult = {
   id: number;
   source_id: number;
   address: string;
-  protocol: "http" | "https" | "socks5";
+  protocol: "http" | "https" | "socks5" | "unknown";
   host: string;
   port: number;
   metadata: Record<string, unknown>;
   state: "pending" | "verifying" | "verified" | "approved" | "ignored" | "invalid";
   authorized: boolean;
   authorization_status?: "allowed" | "unconfigured" | "out_of_scope";
+  last_verify_mode?: ProxyVerificationMode;
+  last_verify_target?: string;
+  last_http_status?: number;
+  last_checked_at?: string;
   verified_ip?: string;
   verified_at?: string;
   latency_ms?: number;
   last_error?: string;
   created_at: string;
   updated_at: string;
+};
+
+export type ProxyDiscoveryRunSummary = {
+  run: {
+    id: number;
+    source_id: number;
+    offset_start: number;
+    requested: number;
+    returned: number;
+    parsed: number;
+    inserted: number;
+    authorized: number;
+    unknown_protocol: number;
+    created_at: string;
+  };
+  attempted: number;
+  succeeded: number;
+  states: Record<string, number>;
+  failures: { stage: string; code: string; count: number }[];
 };

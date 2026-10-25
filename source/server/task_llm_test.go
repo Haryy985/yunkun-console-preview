@@ -121,6 +121,7 @@ func TestIsQuotaExhaustedError(t *testing.T) {
 		`HTTP status 402 Payment Required`,
 		`账户余额不足，请充值`,
 		`credit balance is too low`,
+		`openai-responses: status 429: {"error":{"message":"Daily usage quota exhausted for this platform.","type":"rate_limit_exceeded"}}`,
 	}
 	for _, message := range positive {
 		if !isQuotaExhaustedError(errors.New(message)) {
@@ -570,6 +571,34 @@ func TestTaskLLMStreamDoesNotRetryDeterministicRejection(t *testing.T) {
 	}
 	if provider.calls != 1 {
 		t.Fatalf("deterministic 4xx must not be retried: provider calls=%d, want 1", provider.calls)
+	}
+}
+
+func TestTaskLLMStreamDoesNotRetryDailyQuotaExhaustion(t *testing.T) {
+	defer withZeroRetryBackoff()()
+	provider := &flakyThenOKProvider{
+		failCount: 99,
+		failErr:   errors.New(`openai-responses: status 429: {"error":{"message":"Daily usage quota exhausted for this platform.","type":"rate_limit_exceeded"}}`),
+	}
+	exhausted := 0
+	hooks := taskLLMStreamHooks{
+		current: func() (taskLLMSelection, error) {
+			return taskLLMSelection{profileID: 11, provider: provider}, nil
+		},
+		exhaust: func(taskLLMSelection, error) (db.TaskLLMTransition, error) {
+			exhausted++
+			return db.TaskLLMTransition{ChainExhausted: true}, nil
+		},
+	}
+	_, err := collectTaskLLMStream(streamTaskLLM(context.Background(), "7", llm.CompletionRequest{}, hooks))
+	if err == nil {
+		t.Fatal("daily quota exhaustion must surface after the profile is marked exhausted")
+	}
+	if provider.calls != 1 {
+		t.Fatalf("daily quota must not be retried on the same provider: calls=%d, want 1", provider.calls)
+	}
+	if exhausted != 1 {
+		t.Fatalf("daily quota must advance profile exhaustion once: got %d calls, want 1", exhausted)
 	}
 }
 

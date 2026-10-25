@@ -17,7 +17,7 @@ import (
 	"yunkun/console/notify"
 )
 
-// 本文件覆盖推送功能的端到端行为：漏洞落库 → 事件 → 分派 → 真发 HTTP。
+// 本文件覆盖推送功能的端到端行为：漏洞审核通过 → 事件 → 分派 → 真发 HTTP。
 //
 // 一个安全上的注意点：这些用例**不调用全局的 Notifier.step()**，只对自己创建的
 // 渠道调用 stepRealtime/stepDigest。原因是 step() 会遍历库里所有启用渠道——
@@ -92,8 +92,8 @@ func newNotifyFixture(t *testing.T) *notifyFixture {
 	return f
 }
 
-// record 走真实的证据写入路径落一条漏洞，返回 finding id。
-// 这条路会在**同一事务**里登记推送事件——正是本功能的挂点。
+// record 走真实的证据写入路径落一条漏洞，再完成质量审核。
+// 未通过审核的低危线索不会产生漏洞通知。
 func (f *notifyFixture) record(t *testing.T, vulnclass, severity string) int64 {
 	t.Helper()
 	out, err := f.s.evidenceStore().Record(context.Background(), db.RecordFindingInput{
@@ -108,6 +108,24 @@ func (f *notifyFixture) record(t *testing.T, vulnclass, severity string) int64 {
 	}, nil)
 	if err != nil {
 		t.Fatalf("记录漏洞失败: %v", err)
+	}
+	if severity != "low" {
+		quality, err := f.pg.GetFindingQuality(out.FindingID)
+		if err != nil || quality == nil {
+			t.Fatalf("读取质量状态失败: %v", err)
+		}
+		quality.QualityStatus = db.FindingQualityPass
+		quality.Reviewer = "notify-test-reviewer"
+		quality.VerificationType = "controlled_reproduction"
+		quality.ProofEvidence = "local proof"
+		quality.VerificationEvidence = "local verification"
+		quality.VerificationRationale = "baseline compared against controlled request"
+		quality.ReproductionCount = 3
+		quality.SuccessCount = 3
+		quality.EvidenceIntegrity = "verified"
+		if err := f.pg.SetFindingQuality(context.Background(), *quality); err != nil {
+			t.Fatalf("审核漏洞失败: %v", err)
+		}
 	}
 	return out.FindingID
 }
@@ -483,7 +501,7 @@ func TestNotifyStatusChangeDelivery(t *testing.T) {
 	}
 	f.deliver(t, chID, "")
 
-	// 应有两条：fixed 那一条是状态变更；finding_created 那条也可能在同一轮发出。
+	// 应有两条：fixed 那一条是状态变更；finding_verified 那条也可能在同一轮发出。
 	// 状态变更的实际上更晚创建，但不依赖顺序，全量找。
 	found := false
 	for i := 0; i < hook.count(); i++ {

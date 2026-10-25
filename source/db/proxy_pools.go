@@ -91,10 +91,25 @@ type ProxyDiscoveryResult struct {
 	AuthorizationStatus string         `json:"authorization_status,omitempty"`
 	VerifiedIP          string         `json:"verified_ip,omitempty"`
 	VerifiedAt          *time.Time     `json:"verified_at,omitempty"`
+	LastVerifyMode      string         `json:"last_verify_mode,omitempty"`
+	LastVerifyTarget    string         `json:"last_verify_target,omitempty"`
+	LastHTTPStatus      int            `json:"last_http_status,omitempty"`
+	LastCheckedAt       *time.Time     `json:"last_checked_at,omitempty"`
 	LatencyMS           *int           `json:"latency_ms,omitempty"`
 	LastError           string         `json:"last_error,omitempty"`
 	CreatedAt           time.Time      `json:"created_at"`
 	UpdatedAt           time.Time      `json:"updated_at"`
+}
+
+func (r *ProxyDiscoveryResult) HasSuccessfulVerification() bool {
+	if r == nil || r.State != "verified" || r.LastError != "" {
+		return false
+	}
+	if r.LastVerifyMode == proxypool.VerifyConnectivity {
+		return r.LastCheckedAt != nil && r.LastHTTPStatus == 200
+	}
+	return (r.LastVerifyMode == "" || r.LastVerifyMode == proxypool.VerifyExitIP) &&
+		net.ParseIP(r.VerifiedIP) != nil && r.VerifiedAt != nil
 }
 
 func scanProxyPool(row interface{ Scan(...any) error }) (*ProxyPool, error) {
@@ -226,7 +241,8 @@ func (d *DB) StoreProxyNodes(poolID int64, nodes []proxypool.Node) error {
 		// never silently extends an existing task's lease.
 		_, err = tx.Exec(`INSERT INTO proxy_nodes(pool_id,address,declared_ip,expires_at,origin) VALUES($1,$2,$3,$4,'provider')
 ON CONFLICT(pool_id,address) DO UPDATE SET declared_ip=EXCLUDED.declared_ip,expires_at=EXCLUDED.expires_at,
-verified_ip='',verified_at=NULL,last_error='',last_checked_at=NULL,latency_ms=NULL`,
+verified_ip='',verified_at=NULL,last_error='',last_checked_at=NULL,latency_ms=NULL,
+last_verify_mode='',last_verify_target='',last_http_status=0`,
 			poolID, n.Address, n.DeclaredIP, n.ExpiresAt)
 		if err != nil {
 			return err
@@ -235,9 +251,56 @@ verified_ip='',verified_at=NULL,last_error='',last_checked_at=NULL,latency_ms=NU
 	return tx.Commit()
 }
 
+func (d *DB) ImportProxyNodes(poolID int64, nodes []proxypool.Node) ([]int64, error) {
+	tx, err := d.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	ids := make([]int64, 0, len(nodes))
+	for _, node := range nodes {
+		var id int64
+		err := tx.QueryRow(`INSERT INTO proxy_nodes(pool_id,address,origin,enabled,import_verify_pending)
+VALUES($1,$2,'manual',false,true) ON CONFLICT(pool_id,address) DO NOTHING
+RETURNING id`, poolID, node.Address).Scan(&id)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+func (d *DB) ProxyNodesForExport(poolID int64) ([]proxypool.Node, error) {
+	rows, err := d.Query(`SELECT id,pool_id,address,enabled,last_error,latency_ms,
+last_verify_mode,last_verify_target,last_http_status
+FROM proxy_nodes WHERE pool_id=$1 AND deleted_at IS NULL ORDER BY id`, poolID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]proxypool.Node, 0)
+	for rows.Next() {
+		var node proxypool.Node
+		if err := rows.Scan(&node.ID, &node.PoolID, &node.Address, &node.Enabled, &node.LastError,
+			&node.LatencyMS, &node.LastVerifyMode, &node.LastVerifyTarget, &node.LastHTTPStatus); err != nil {
+			return nil, err
+		}
+		out = append(out, node)
+	}
+	return out, rows.Err()
+}
+
 func (d *DB) ProxyNodes(poolID int64) ([]proxypool.Node, error) {
 	rows, err := d.Query(`SELECT id,pool_id,address,declared_ip,expires_at,verified_ip,verified_at,last_error,
-enabled,origin,last_checked_at,latency_ms,success_count,failure_count,last_success_at,last_failure_at,notes,deleted_at
+enabled,origin,last_checked_at,latency_ms,success_count,failure_count,last_success_at,last_failure_at,notes,deleted_at,
+last_verify_mode,last_verify_target,last_http_status
 FROM proxy_nodes WHERE pool_id=$1 AND deleted_at IS NULL ORDER BY id DESC LIMIT 500`, poolID)
 	if err != nil {
 		return nil, err
@@ -248,7 +311,8 @@ FROM proxy_nodes WHERE pool_id=$1 AND deleted_at IS NULL ORDER BY id DESC LIMIT 
 		var n proxypool.Node
 		if err := rows.Scan(&n.ID, &n.PoolID, &n.Address, &n.DeclaredIP, &n.ExpiresAt, &n.VerifiedIP, &n.VerifiedAt, &n.LastError,
 			&n.Enabled, &n.Origin, &n.LastCheckedAt, &n.LatencyMS, &n.SuccessCount, &n.FailureCount,
-			&n.LastSuccessAt, &n.LastFailureAt, &n.Notes, &n.DeletedAt); err != nil {
+			&n.LastSuccessAt, &n.LastFailureAt, &n.Notes, &n.DeletedAt,
+			&n.LastVerifyMode, &n.LastVerifyTarget, &n.LastHTTPStatus); err != nil {
 			return nil, err
 		}
 		out = append(out, n)
@@ -259,11 +323,13 @@ FROM proxy_nodes WHERE pool_id=$1 AND deleted_at IS NULL ORDER BY id DESC LIMIT 
 func (d *DB) ProxyNode(poolID, nodeID int64) (*proxypool.Node, error) {
 	var n proxypool.Node
 	err := d.QueryRow(`SELECT id,pool_id,address,declared_ip,expires_at,verified_ip,verified_at,last_error,
-enabled,origin,last_checked_at,latency_ms,success_count,failure_count,last_success_at,last_failure_at,notes,deleted_at
+enabled,origin,last_checked_at,latency_ms,success_count,failure_count,last_success_at,last_failure_at,notes,deleted_at,
+last_verify_mode,last_verify_target,last_http_status
 FROM proxy_nodes WHERE pool_id=$1 AND id=$2 AND deleted_at IS NULL`, poolID, nodeID).
 		Scan(&n.ID, &n.PoolID, &n.Address, &n.DeclaredIP, &n.ExpiresAt, &n.VerifiedIP, &n.VerifiedAt, &n.LastError,
 			&n.Enabled, &n.Origin, &n.LastCheckedAt, &n.LatencyMS, &n.SuccessCount, &n.FailureCount,
-			&n.LastSuccessAt, &n.LastFailureAt, &n.Notes, &n.DeletedAt)
+			&n.LastSuccessAt, &n.LastFailureAt, &n.Notes, &n.DeletedAt,
+			&n.LastVerifyMode, &n.LastVerifyTarget, &n.LastHTTPStatus)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -294,6 +360,9 @@ func (d *DB) ReassignProxyLease(taskID int64) error {
 	var nodeID int64
 	if err := tx.QueryRow(`SELECT id FROM proxy_nodes WHERE pool_id=$1 AND enabled=true AND deleted_at IS NULL
 AND (expires_at IS NULL OR expires_at>now()+make_interval(secs=>$2))
+AND (origin NOT IN ('fofa','quake') OR (((last_verify_mode='connectivity' AND last_http_status=200 AND last_success_at>now()-interval '15 minutes')
+OR (last_verify_mode IN ('','exit_ip') AND verified_at>now()-interval '15 minutes' AND verified_ip<>''))
+AND last_error='' AND (last_failure_at IS NULL OR last_success_at>=last_failure_at)))
 ORDER BY (SELECT count(*) FROM task_proxy_bindings b WHERE b.node_id=proxy_nodes.id),id DESC LIMIT 1`, poolID, p.Config.SafetySeconds).Scan(&nodeID); err != nil {
 		return errors.New("no valid nodes; fetch nodes first")
 	}
@@ -322,8 +391,30 @@ last_success_at=now(),success_count=success_count+1,last_error='',latency_ms=$3 
 	return err
 }
 
+// Connectivity checks update health without inventing or erasing IP evidence.
+func (d *DB) RecordProxyNodeVerification(poolID, nodeID int64, result proxypool.VerificationResult, problem string, latencyMS int) error {
+	res, err := d.Exec(`UPDATE proxy_nodes SET
+last_verify_mode=$3,last_verify_target=$4,last_http_status=$5,
+last_checked_at=now(),latency_ms=$6,last_error=$7,
+last_success_at=CASE WHEN $7='' THEN now() ELSE last_success_at END,
+last_failure_at=CASE WHEN $7<>'' THEN now() ELSE last_failure_at END,
+success_count=success_count+CASE WHEN $7='' THEN 1 ELSE 0 END,
+failure_count=failure_count+CASE WHEN $7<>'' THEN 1 ELSE 0 END,
+verified_ip=CASE WHEN $7='' AND $8<>'' THEN $8 ELSE verified_ip END,
+verified_at=CASE WHEN $7='' AND $8<>'' THEN now() ELSE verified_at END
+WHERE pool_id=$1 AND id=$2 AND deleted_at IS NULL`,
+		poolID, nodeID, result.Mode, result.Target, result.HTTPStatus, latencyMS, problem, result.IP)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (d *DB) SetProxyNodeEnabled(poolID, nodeID int64, enabled bool) error {
-	res, err := d.Exec(`UPDATE proxy_nodes SET enabled=$3 WHERE pool_id=$1 AND id=$2 AND deleted_at IS NULL`,
+	res, err := d.Exec(`UPDATE proxy_nodes SET enabled=$3,import_verify_pending=false WHERE pool_id=$1 AND id=$2 AND deleted_at IS NULL`,
 		poolID, nodeID, enabled)
 	if err != nil {
 		return err
@@ -335,7 +426,7 @@ func (d *DB) SetProxyNodeEnabled(poolID, nodeID int64, enabled bool) error {
 }
 
 func (d *DB) SoftDeleteProxyNode(poolID, nodeID int64) error {
-	res, err := d.Exec(`UPDATE proxy_nodes SET enabled=false,deleted_at=now()
+	res, err := d.Exec(`UPDATE proxy_nodes SET enabled=false,import_verify_pending=false,deleted_at=now()
 WHERE pool_id=$1 AND id=$2 AND deleted_at IS NULL
 AND NOT EXISTS (SELECT 1 FROM task_proxy_bindings WHERE node_id=$2)`, poolID, nodeID)
 	if err != nil {
@@ -356,7 +447,7 @@ func (d *DB) BatchSetProxyNodes(poolID int64, nodeIDs []int64, enabled bool) (in
 		return 0, err
 	}
 	defer tx.Rollback()
-	res, err := tx.Exec(`UPDATE proxy_nodes SET enabled=$3
+	res, err := tx.Exec(`UPDATE proxy_nodes SET enabled=$3,import_verify_pending=false
 WHERE pool_id=$1 AND id=ANY($2) AND deleted_at IS NULL
 `, poolID, nodeIDs, enabled)
 	if err != nil {
@@ -477,45 +568,86 @@ func (d *DB) StoreProxyDiscoveryRun(sourceID int64, results []ProxyDiscoveryResu
 // and also returns IDs that were newly inserted during this run. Existing
 // candidates are refreshed without being re-queued for automatic verification.
 func (d *DB) StoreProxyDiscoveryRunWithIDs(sourceID int64, results []ProxyDiscoveryResult, nextOffset int, exhausted bool) ([]int64, error) {
-	tx, err := d.Begin()
-	if err != nil {
+	var current, requested int
+	if err := d.QueryRow(`SELECT next_offset,fetch_limit FROM proxy_discovery_sources WHERE id=$1`, sourceID).Scan(&current, &requested); err != nil {
 		return nil, err
 	}
+	ids, _, err := d.StoreProxyDiscoveryRunWithMetrics(sourceID, results, current, requested, nextOffset-current, nextOffset, exhausted)
+	return ids, err
+}
+
+// StoreProxyDiscoveryRunWithMetrics stores a fetched page, its candidates and
+// the cursor in one transaction; a failed write never skips a provider page.
+func (d *DB) StoreProxyDiscoveryRunWithMetrics(sourceID int64, results []ProxyDiscoveryResult, offsetStart, requested, returned, nextOffset int, exhausted bool) ([]int64, int64, error) {
+	tx, err := d.Begin()
+	if err != nil {
+		return nil, 0, err
+	}
 	defer tx.Rollback()
+	var current int
+	if err := tx.QueryRow(`SELECT next_offset FROM proxy_discovery_sources WHERE id=$1 FOR UPDATE`, sourceID).Scan(&current); err != nil {
+		return nil, 0, err
+	}
+	if offsetStart != current || requested < 1 || returned < 0 || returned > requested || nextOffset-current != returned {
+		return nil, 0, errors.New("discovery cursor changed; retry the current page")
+	}
+	var runID int64
+	if err := tx.QueryRow(`INSERT INTO proxy_discovery_runs(source_id,offset_start,requested,returned,parsed,inserted,authorized,unknown_protocol)
+VALUES($1,$2,$3,$4,$5,0,0,0) RETURNING id`, sourceID, offsetStart, requested, returned, len(results)).Scan(&runID); err != nil {
+		return nil, 0, err
+	}
 	newIDs := make([]int64, 0, len(results))
+	var authorized, unknown int
+	seen := make(map[string]bool, len(results))
 	for _, item := range results {
 		raw, err := json.Marshal(item.Metadata)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
+		}
+		if !seen[item.Address] {
+			seen[item.Address] = true
+			if item.Authorized {
+				authorized++
+			}
+			if item.Protocol == "unknown" {
+				unknown++
+			}
 		}
 		var id int64
 		var inserted bool
 		err = tx.QueryRow(`WITH existing AS MATERIALIZED (
 SELECT id FROM proxy_discovery_results WHERE source_id=$1 AND address=$2
 ), upserted AS (
-INSERT INTO proxy_discovery_results(source_id,address,protocol,host,port,metadata,authorized)
-VALUES($1,$2,$3,$4,$5,$6,$7)
+INSERT INTO proxy_discovery_results(source_id,address,protocol,host,port,metadata,authorized,last_run_id,first_run_id)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$8)
 ON CONFLICT(source_id,address) DO UPDATE SET protocol=EXCLUDED.protocol,host=EXCLUDED.host,
-port=EXCLUDED.port,metadata=EXCLUDED.metadata,authorized=EXCLUDED.authorized,updated_at=now()
+port=EXCLUDED.port,metadata=EXCLUDED.metadata,authorized=EXCLUDED.authorized,last_run_id=EXCLUDED.last_run_id,updated_at=now()
 RETURNING id
 )
 SELECT upserted.id, NOT EXISTS (SELECT 1 FROM existing) FROM upserted`,
-			sourceID, item.Address, item.Protocol, item.Host, item.Port, string(raw), item.Authorized).Scan(&id, &inserted)
+			sourceID, item.Address, item.Protocol, item.Host, item.Port, string(raw), item.Authorized, runID).Scan(&id, &inserted)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		if inserted {
 			newIDs = append(newIDs, id)
 		}
 	}
-	if _, err = tx.Exec(`UPDATE proxy_discovery_sources SET next_offset=$2,exhausted=$3,
-last_run_at=now(),last_error='',updated_at=now() WHERE id=$1`, sourceID, nextOffset, exhausted); err != nil {
-		return nil, err
+	if _, err = tx.Exec(`UPDATE proxy_discovery_runs SET inserted=$2,authorized=$3,unknown_protocol=$4 WHERE id=$1`, runID, len(newIDs), authorized, unknown); err != nil {
+		return nil, 0, err
+	}
+	result, err := tx.Exec(`UPDATE proxy_discovery_sources SET next_offset=$2,exhausted=$3,
+last_run_at=now(),last_error='',updated_at=now() WHERE id=$1 AND next_offset=$4`, sourceID, nextOffset, exhausted, current)
+	if err != nil {
+		return nil, 0, err
+	}
+	if n, err := result.RowsAffected(); err != nil || n != 1 {
+		return nil, 0, errors.New("discovery cursor changed; retry the current page")
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return newIDs, nil
+	return newIDs, runID, nil
 }
 
 func (d *DB) UpsertProxyDiscoveryResults(sourceID int64, results []ProxyDiscoveryResult) error {
@@ -591,14 +723,16 @@ FROM proxy_discovery_results WHERE ($1::bigint=0 OR source_id=$1)`, sourceID).
 }
 
 const proxyDiscoveryResultColumns = `id,source_id,address,protocol,host,port,metadata,state,authorized,
-verified_ip,verified_at,latency_ms,last_error,created_at,updated_at`
+verified_ip,verified_at,latency_ms,last_error,created_at,updated_at,
+last_verify_mode,last_verify_target,last_http_status,last_checked_at`
 
 func scanProxyDiscoveryResult(row interface{ Scan(...any) error }) (*ProxyDiscoveryResult, error) {
 	var item ProxyDiscoveryResult
 	var raw []byte
 	err := row.Scan(&item.ID, &item.SourceID, &item.Address, &item.Protocol, &item.Host, &item.Port,
 		&raw, &item.State, &item.Authorized, &item.VerifiedIP, &item.VerifiedAt, &item.LatencyMS,
-		&item.LastError, &item.CreatedAt, &item.UpdatedAt)
+		&item.LastError, &item.CreatedAt, &item.UpdatedAt,
+		&item.LastVerifyMode, &item.LastVerifyTarget, &item.LastHTTPStatus, &item.LastCheckedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -648,8 +782,7 @@ WHERE source_id=$1 AND state<>'approved' AND ($2::text='' OR state=$2) ORDER BY 
 }
 
 func (d *DB) FilteredProxyDiscoveryResultsPage(sourceID int64, state string, limit, offset int) ([]ProxyDiscoveryResult, error) {
-	rows, err := d.Query(`SELECT id,source_id,address,protocol,host,port,metadata,state,authorized,
-verified_ip,verified_at,latency_ms,last_error,created_at,updated_at
+	rows, err := d.Query(`SELECT `+proxyDiscoveryResultColumns+`
 FROM proxy_discovery_results WHERE ($1::bigint=0 OR source_id=$1) AND ($2::text='' OR state=$2)
 ORDER BY id DESC LIMIT $3 OFFSET $4`, sourceID, state, limit, offset)
 	if err != nil {
@@ -684,15 +817,19 @@ func (d *DB) DeleteProxyDiscoveryResult(id int64) error {
 
 func (d *DB) UpdateProxyDiscoveryResult(id int64, state string, authorized bool, ip string, latencyMS *int, problem string) error {
 	_, err := d.Exec(`UPDATE proxy_discovery_results SET state=$2,authorized=$3,verified_ip=$4,
-verified_at=CASE WHEN $4<>'' THEN now() ELSE NULL END,latency_ms=$5,last_error=$6,updated_at=now()
+verified_at=CASE WHEN $4<>'' THEN now() ELSE NULL END,latency_ms=$5,last_error=$6,updated_at=now(),
+last_verify_mode='',last_verify_target='',last_http_status=0,last_checked_at=NULL
 WHERE id=$1`, id, state, authorized, ip, latencyMS, problem)
 	return err
 }
 
 type ProxyDiscoveryAdmissionProof struct {
-	IP        string
-	CheckedAt time.Time
-	LatencyMS int
+	IP         string
+	Mode       string
+	Target     string
+	HTTPStatus int
+	CheckedAt  time.Time
+	LatencyMS  int
 }
 
 func (d *DB) PromoteProxyDiscoveryResult(resultID, poolID int64, origin string, enabled bool, proof *ProxyDiscoveryAdmissionProof) (int64, error) {
@@ -702,14 +839,17 @@ func (d *DB) PromoteProxyDiscoveryResult(resultID, poolID int64, origin string, 
 	}
 	defer tx.Rollback()
 	var nodeID int64
-	var address, protocol, host, state, verifiedIP string
-	var verifiedAt *time.Time
+	var address, protocol, host, state, verifiedIP, mode, target, problem string
+	var verifiedAt, checkedAt *time.Time
 	var latencyMS *int
 	var port int
+	var httpStatus int
 	var authorized bool
-	err = tx.QueryRow(`SELECT id,address,protocol,host,port,authorized,state,verified_ip,verified_at,latency_ms
+	err = tx.QueryRow(`SELECT id,address,protocol,host,port,authorized,state,verified_ip,verified_at,latency_ms,
+last_verify_mode,last_verify_target,last_http_status,last_checked_at,last_error
 FROM proxy_discovery_results WHERE id=$1 FOR UPDATE`, resultID).
-		Scan(&resultID, &address, &protocol, &host, &port, &authorized, &state, &verifiedIP, &verifiedAt, &latencyMS)
+		Scan(&resultID, &address, &protocol, &host, &port, &authorized, &state, &verifiedIP, &verifiedAt, &latencyMS,
+			&mode, &target, &httpStatus, &checkedAt, &problem)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, ErrProxyDiscoveryNotFound
 	}
@@ -719,17 +859,36 @@ FROM proxy_discovery_results WHERE id=$1 FOR UPDATE`, resultID).
 	if state == "approved" {
 		return 0, ErrProxyDiscoveryAlreadyApproved
 	}
-	if state != "verified" || net.ParseIP(verifiedIP) == nil || verifiedAt == nil {
+	candidate := &ProxyDiscoveryResult{State: state, VerifiedIP: verifiedIP, VerifiedAt: verifiedAt,
+		LastVerifyMode: mode, LastHTTPStatus: httpStatus, LastCheckedAt: checkedAt, LastError: problem}
+	if !candidate.HasSuccessfulVerification() {
 		return 0, ErrProxyDiscoveryNotVerified
 	}
 	if !authorized {
 		return 0, ErrProxyDiscoveryOutOfScope
 	}
+	if mode == "" {
+		mode = proxypool.VerifyExitIP
+	}
+	if checkedAt == nil {
+		checkedAt = verifiedAt
+	}
 	if proof != nil {
-		if net.ParseIP(proof.IP) == nil || proof.CheckedAt.IsZero() || proof.LatencyMS < 0 {
+		mode = proof.Mode
+		if mode == "" {
+			mode = "exit_ip"
+		}
+		if (mode != "exit_ip" && mode != "connectivity") ||
+			(mode == "exit_ip" && net.ParseIP(proof.IP) == nil) ||
+			(mode == "connectivity" && (proof.IP != "" || proof.HTTPStatus != 200)) ||
+			proof.CheckedAt.IsZero() || proof.LatencyMS < 0 {
 			return 0, ErrProxyDiscoveryNotVerified
 		}
-		verifiedIP, verifiedAt, latencyMS = proof.IP, &proof.CheckedAt, &proof.LatencyMS
+		if mode == "exit_ip" {
+			verifiedIP, verifiedAt = proof.IP, &proof.CheckedAt
+		}
+		latencyMS = &proof.LatencyMS
+		checkedAt, target, httpStatus = &proof.CheckedAt, proof.Target, proof.HTTPStatus
 	}
 	var targetPoolID int64
 	err = tx.QueryRow(`SELECT id FROM proxy_pools WHERE id=$1 FOR KEY SHARE`, poolID).Scan(&targetPoolID)
@@ -741,13 +900,16 @@ FROM proxy_discovery_results WHERE id=$1 FOR UPDATE`, resultID).
 	}
 	address = protocol + "://" + net.JoinHostPort(host, strconv.Itoa(port))
 	err = tx.QueryRow(`INSERT INTO proxy_nodes(pool_id,address,origin,enabled,verified_ip,verified_at,
-last_checked_at,last_success_at,latency_ms,success_count)
-VALUES($1,$2,$3,$4,$5,$6,$6,$6,$7,1)
+last_checked_at,last_success_at,latency_ms,success_count,last_verify_mode,last_verify_target,last_http_status)
+VALUES($1,$2,$3,$4,$5,$6,$7,$7,$8,1,$9,$10,$11)
 ON CONFLICT(pool_id,address) DO UPDATE SET enabled=$4,deleted_at=NULL,
-verified_ip=EXCLUDED.verified_ip,verified_at=EXCLUDED.verified_at,last_checked_at=EXCLUDED.last_checked_at,
+verified_ip=CASE WHEN EXCLUDED.verified_ip<>'' THEN EXCLUDED.verified_ip ELSE proxy_nodes.verified_ip END,
+verified_at=CASE WHEN EXCLUDED.verified_ip<>'' THEN EXCLUDED.verified_at ELSE proxy_nodes.verified_at END,
+last_checked_at=EXCLUDED.last_checked_at,
 last_success_at=EXCLUDED.last_success_at,latency_ms=EXCLUDED.latency_ms,last_error='',
+last_verify_mode=EXCLUDED.last_verify_mode,last_verify_target=EXCLUDED.last_verify_target,last_http_status=EXCLUDED.last_http_status,
 success_count=proxy_nodes.success_count+1
-RETURNING id`, poolID, address, origin, enabled, verifiedIP, verifiedAt, latencyMS).Scan(&nodeID)
+RETURNING id`, poolID, address, origin, enabled, verifiedIP, verifiedAt, checkedAt, latencyMS, mode, target, httpStatus).Scan(&nodeID)
 	if err != nil {
 		return 0, err
 	}
@@ -802,11 +964,17 @@ func insertTaskProxyBinding(tx *sql.Tx, taskID int64, poolID *int64, nodeID *int
 	var selectedNodeID int64
 	if nodeID != nil {
 		err = tx.QueryRow(`SELECT id FROM proxy_nodes WHERE id=$1 AND pool_id=$2 AND enabled=true
-AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at>now()+make_interval(secs=>$3))`,
+AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at>now()+make_interval(secs=>$3))
+AND (origin NOT IN ('fofa','quake') OR (((last_verify_mode='connectivity' AND last_http_status=200 AND last_success_at>now()-interval '15 minutes')
+OR (last_verify_mode IN ('','exit_ip') AND verified_at>now()-interval '15 minutes' AND verified_ip<>''))
+AND last_error='' AND (last_failure_at IS NULL OR last_success_at>=last_failure_at)))`,
 			*nodeID, *poolID, p.Config.SafetySeconds).Scan(&selectedNodeID)
 	} else {
 		err = tx.QueryRow(`SELECT id FROM proxy_nodes WHERE pool_id=$1 AND enabled=true AND deleted_at IS NULL
 AND (expires_at IS NULL OR expires_at>now()+make_interval(secs=>$2))
+AND (origin NOT IN ('fofa','quake') OR (((last_verify_mode='connectivity' AND last_http_status=200 AND last_success_at>now()-interval '15 minutes')
+OR (last_verify_mode IN ('','exit_ip') AND verified_at>now()-interval '15 minutes' AND verified_ip<>''))
+AND last_error='' AND (last_failure_at IS NULL OR last_success_at>=last_failure_at)))
 ORDER BY (SELECT count(*) FROM task_proxy_bindings b WHERE b.node_id=proxy_nodes.id),id LIMIT 1`,
 			*poolID, p.Config.SafetySeconds).Scan(&selectedNodeID)
 	}

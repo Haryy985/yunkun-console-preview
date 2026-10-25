@@ -6,14 +6,14 @@ import (
 	"path/filepath"
 	"time"
 
-	"yunkun/console/db"
-	"yunkun/console/guard"
-	"yunkun/console/intercept"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
+	"yunkun/console/db"
+	"yunkun/console/guard"
+	"yunkun/console/intercept"
 )
 
 // ChatAgent is the generic, task-independent conversational runner behind the chat
@@ -189,11 +189,12 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	// re-unlock skill-gated MCPs from prior Skill() calls in the reloaded history so
 	// revealed tools stay callable across the fresh session.
 	seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
-	text, _, err := captureRunSession(ctx, s, message, func(r db.Activity) {
+	text, reason, err := captureRunSession(ctx, s, message, func(r db.Activity) {
 		if emit != nil {
 			r.Worker = agentKey
 			emit(r)
 		}
 	})
+	ri.Trace.Finish(reason, err)
 	return text, err
 }

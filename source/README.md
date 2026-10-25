@@ -4,7 +4,7 @@
 
 # 云鲲自动化渗透控制台
 
-v1.0.3 源码 · Windows x64 离线版另见 Releases
+v1.1.1 源码 · Windows x64 离线版另见 Releases
 
 对话与任务 · 执行流水 · RAG 知识库 · 代理资源 · HTTP 证据
 
@@ -20,10 +20,10 @@ Rowan / 云鲲安全
 Windows 用户可双击 `setup-and-start.bat`，首次联网下载依赖、编译并启动。
 需自行构建时参考 [原生部署手册](docs/DEPLOYMENT.md)；先生成前端并同步到
 `server/webui/current`，再以 `-tags embedui` 编译，避免得到没有页面的开发二进制。
-源码启动器读取 `VERSION`，本次为 `v1.0.3-offline`。
+源码启动器读取 `VERSION`，本次为 `v1.1.1-offline`。
 
-完整变更见 [1.0.3 更新说明](docs/RELEASE_1.0.3.md)，
-测试范围见 [验收记录](docs/RELEASE_1.0.3_ACCEPTANCE.md)。
+本次变更见 [1.1.1 更新说明](docs/RELEASE_1.1.1.md)，
+既往版本记录仍见 [1.0.3 更新说明](docs/RELEASE_1.0.3.md)。
 源码随附公开工作流和规则资料，不包含维护者的账号、密钥、数据库或日志。
 
 ## 下载离线包后启动
@@ -83,7 +83,7 @@ RAG 知识库和代理池是云鲲安全在原始源码基础上后续新增的�
 
 离线 ZIP 包含已编译程序、静态前端和 PostgreSQL 运行时，不包含源码；可审计源码在 GitHub 仓库的 `source/` 目录。首次离线安装和已有安装更新见 [`docs/OFFLINE_UPDATE.md`](docs/OFFLINE_UPDATE.md)；源码自行编译另见 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)。来源与授权说明见 [`NOTICE.md`](NOTICE.md)，许可证见 [`LICENSE`](LICENSE)。
 
-管理员登录后可在顶部检查新版。更新不会覆盖运行中的程序或清除本机数据；按离线更新手册核对下载哈希、停止旧实例，再在新目录运行 `upgrade-offline.ps1` 备份与迁移。
+管理员登录后可在“系统设置 → 版本与更新”检查新版并执行一键更新。Windows x64 标准离线安装会下载校验、停止服务、完整备份、安装并重启；启动检查失败会恢复匹配的旧程序和数据库。1.0.6 等旧客户端仍需按离线更新手册手动升级一次，才能获得此按钮。Linux 标准离线安装已接入同一套受管更新流程，但本版本的 Linux 真机升级验收仍需在原生 Linux 环境完成；其他平台或外部数据库安装继续使用手动升级。
 
 此次 Agent 稳定性修复的范围和未完成验证见 [`docs/agent-reliability-2026-10-16.md`](docs/agent-reliability-2026-10-16.md)。发布压缩包与 SHA-256 校验值以 GitHub Release 附件为准，不要将仓库的源码快照当成离线安装包。
 

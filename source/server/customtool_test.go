@@ -36,6 +36,19 @@ func TestRenderTemplateHTTP(t *testing.T) {
 	}
 }
 
+func TestRenderTemplateDoesNotExpandInsertedPlaceholders(t *testing.T) {
+	for _, params := range []map[string]any{
+		{"a": "{b}", "b": "$(echo AUDIT_MARKER)"},
+		{"b": "$(echo AUDIT_MARKER)", "a": "{b}"},
+	} {
+		got := renderTemplate("echo {a} {b}", params, shellQuote)
+		want := "echo '{b}' '$(echo AUDIT_MARKER)'"
+		if got != want {
+			t.Fatalf("rendered %q, want %q", got, want)
+		}
+	}
+}
+
 func TestScalarStr(t *testing.T) {
 	cases := []struct {
 		v    any

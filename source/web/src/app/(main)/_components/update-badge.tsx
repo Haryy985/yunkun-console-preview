@@ -2,6 +2,8 @@
 
 import * as React from "react";
 
+import { useRouter } from "next/navigation";
+
 import { ArrowUpCircleIcon } from "lucide-react";
 
 import {
@@ -19,6 +21,7 @@ import { api } from "@/lib/api";
 const RELEASES_URL = "https://github.com/Haryy985/yunkun-console-preview/releases";
 
 export function UpdateBadge({ showTrigger = true }: { showTrigger?: boolean }) {
+  const router = useRouter();
   const [info, setInfo] = React.useState<Awaited<ReturnType<typeof api.checkUpdate>> | null>(null);
   const [open, setOpen] = React.useState(false);
 
@@ -78,7 +81,7 @@ export function UpdateBadge({ showTrigger = true }: { showTrigger?: boolean }) {
           <AlertDialogHeader>
             <AlertDialogTitle>发现云鲲控制台新版本</AlertDialogTitle>
             <AlertDialogDescription>
-              当前版本 {info.current}，最新版本 {info.latest}。查看发布说明后，可下载对应平台的更新包。
+              当前版本 {info.current}，最新版本 {info.latest}。
             </AlertDialogDescription>
           </AlertDialogHeader>
           {info.notes ? (
@@ -86,12 +89,20 @@ export function UpdateBadge({ showTrigger = true }: { showTrigger?: boolean }) {
               {info.notes.slice(0, 6000)}
             </div>
           ) : null}
-          <p className="text-muted-foreground text-xs">
-            更新包请按发布说明安装。不要覆盖或删除本机的 .yunkun-local 数据目录。
-          </p>
+          <p className="text-muted-foreground text-xs">更新前保留数据备份；可在版本与更新页面查看安装进度。</p>
           <AlertDialogFooter>
             <AlertDialogCancel onClick={dismiss}>稍后</AlertDialogCancel>
-            <Button onClick={openReleases}>查看更新与下载</Button>
+            <Button variant="outline" onClick={openReleases}>
+              发布说明
+            </Button>
+            <Button
+              onClick={() => {
+                dismiss();
+                router.push("/system/settings/");
+              }}
+            >
+              前往更新
+            </Button>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

@@ -74,9 +74,37 @@ func TestDiscoveryFastTimeoutRemainsPendingAndCanRetry(t *testing.T) {
 	if err != nil || candidate.State != "pending" || candidate.VerifiedAt != nil || candidate.VerifiedIP != "" {
 		t.Fatalf("timeout must not establish invalid or verified state: %#v %v", candidate, err)
 	}
+	var attempts int
+	if err := s.m.pg.QueryRow(`SELECT count(*) FROM proxy_discovery_verifications WHERE result_id=$1 AND outcome='timeout' AND code='timeout'`, ids[0]).Scan(&attempts); err != nil || attempts != 1 {
+		t.Fatalf("timeout evidence not recorded: count=%d err=%v", attempts, err)
+	}
 	_, status, err = s.verifyDiscoveryCandidate(context.Background(), ids[0])
 	if status != http.StatusOK || err != nil {
 		t.Fatalf("single-item retry failed: %d %v", status, err)
+	}
+}
+
+func TestDiscoveryAutomaticRetryIsBoundedAndPersistsBothAttempts(t *testing.T) {
+	s := newProxyFixture(t)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(120 * time.Millisecond):
+			fmt.Fprint(w, "198.51.100.7")
+		}
+	}))
+	defer proxy.Close()
+	_, ids, _ := discoveryVerifyFixture(t, s, []string{proxy.URL})
+	s.verifyDiscoveryCandidateWithRetry(context.Background(), ids[0], 20*time.Millisecond, time.Second)
+	var attempts, timeouts int
+	if err := s.m.pg.QueryRow(`SELECT count(*),count(*) FILTER (WHERE outcome='timeout')
+FROM proxy_discovery_verifications WHERE result_id=$1`, ids[0]).Scan(&attempts, &timeouts); err != nil || attempts != 2 || timeouts != 1 {
+		t.Fatalf("retry evidence: attempts=%d timeouts=%d err=%v", attempts, timeouts, err)
+	}
+	result, err := s.m.pg.ProxyDiscoveryResult(ids[0])
+	if err != nil || result.State != "verified" {
+		t.Fatalf("bounded retry failed: %+v %v", result, err)
 	}
 }
 

@@ -84,3 +84,16 @@ func TestFOFAAdapterParsesOnlyNormalizedCandidateFields(t *testing.T) {
 		t.Fatalf("unexpected normalized result: %+v", rows[0])
 	}
 }
+
+func TestFOFAParameterFailureDoesNotRetryAccountsOrLeakSecrets(t *testing.T) {
+	client := &http.Client{Transport: intelRoundTripper(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(`{"error":true,"error_code":-4,"errmsg":"[-4] 参数错误 secret-fixture custom-query"}`))}, nil
+	})}
+	_, _, retry, err := searchFOFA(context.Background(), client, "custom-query", 3, 100,
+		intelCredentials{key: "secret-fixture"})
+	if err == nil || retry || !strings.Contains(err.Error(), "参数错误") ||
+		strings.Contains(err.Error(), "secret-fixture") || strings.Contains(err.Error(), "custom-query") {
+		t.Fatalf("unsafe or retryable parameter failure: retry=%v err=%v", retry, err)
+	}
+}

@@ -129,7 +129,8 @@ function groupSteps(steps: Activity[], chat: boolean): Group[] {
   return out;
 }
 
-const kindLabel = (k: string) => (k === "thinking" ? "推理" : k === "result" ? "总结" : "说明");
+const kindLabel = (k: string) =>
+  k === "thinking" ? "推理" : k === "result" ? "总结" : k === "agent_run" ? "Agent 执行记录" : "说明";
 
 function ActivityTime({ ts }: { ts: string }) {
   const date = new Date(ts);

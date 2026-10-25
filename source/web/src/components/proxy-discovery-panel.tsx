@@ -13,18 +13,21 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import type { ProxyDiscoveryResult, ProxyDiscoverySource, ProxyPool } from "@/lib/proxy-pool-types";
+import type { ProxyDiscoveryResult, ProxyDiscoveryRunSummary, ProxyDiscoverySource, ProxyPool } from "@/lib/proxy-pool-types";
 import { proxyVerificationMessage } from "@/lib/proxy-verification";
 
 const providerLabels = { fofa: "FOFA", quake: "Quake" } as const;
-const defaultDiscoveryQuery = 'service:socks5 AND country: "CN" AND response:"No authentication"';
+const defaultDiscoveryQueries = {
+  fofa: 'protocol="socks5" && country="CN" && banner="No authentication"',
+  quake: 'service:socks5 AND country: "CN" AND response:"No authentication"',
+} as const;
 const defaultDiscoveryVerifyURL = "https://api.ipify.org?format=json";
 
 function emptyDiscoveryForm() {
   return {
     provider: "fofa" as "fofa" | "quake",
     name: "",
-    query: defaultDiscoveryQuery,
+    query: defaultDiscoveryQueries.fofa as string,
     authorized_scope: "",
     verify_url: defaultDiscoveryVerifyURL,
     fetch_limit: 500,
@@ -42,6 +45,7 @@ function hasGlobalScope(scope: string) {
 }
 
 function resultLabel(result: ProxyDiscoveryResult) {
+	if (result.protocol === "unknown") return "协议待确认";
   if (result.state === "verified") return "已验证";
   if (result.state === "approved") return "已入池";
   if (result.state === "ignored") return "已忽略";
@@ -63,6 +67,7 @@ export function ProxyDiscoveryPanel({
 }) {
   const [sources, setSources] = React.useState<ProxyDiscoverySource[]>([]);
   const [results, setResults] = React.useState<ProxyDiscoveryResult[]>([]);
+  const [latestRun, setLatestRun] = React.useState<ProxyDiscoveryRunSummary | null>(null);
   const [pools, setPools] = React.useState<ProxyPool[]>([]);
   const [selectedSource, setSelectedSource] = React.useState<number | null>(null);
   const [loading, setLoading] = React.useState(true);
@@ -164,6 +169,17 @@ export function ProxyDiscoveryPanel({
   }, [selectedSource, page, pageSize, revision, stateFilter]);
 
   React.useEffect(() => {
+    let active = true;
+    setLatestRun(null);
+    if (selectedSource) {
+      void api.proxyDiscoveryLatestRun(selectedSource)
+        .then(({ latest }) => { if (active) setLatestRun(latest); })
+        .catch(() => { if (active) setLatestRun(null); });
+    }
+    return () => { active = false; };
+  }, [selectedSource, revision]);
+
+  React.useEffect(() => {
     selectionRequest.current++;
     setSelectedIds(new Set());
     setSelectingAll(false);
@@ -174,7 +190,7 @@ export function ProxyDiscoveryPanel({
     setForm({
       provider: source?.provider ?? "fofa",
       name: source?.name ?? "",
-      query: source?.query?.trim() || defaultDiscoveryQuery,
+      query: source?.query?.trim() || defaultDiscoveryQueries[source?.provider ?? "fofa"],
       authorized_scope: source?.authorized_scope ?? "",
       verify_url: source?.verify_url?.trim() || defaultDiscoveryVerifyURL,
       fetch_limit: source?.fetch_limit || 500,
@@ -219,6 +235,19 @@ export function ProxyDiscoveryPanel({
       onChanged();
     } catch (error) {
       toast.error((error as Error).message || "保存发现来源失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function confirmProtocol(result: ProxyDiscoveryResult, protocol: "http" | "https" | "socks5") {
+    setBusy(true);
+    try {
+      await api.confirmProxyDiscoveryProtocol(result.id, protocol);
+      toast.success("协议已确认，请重新验证");
+      setRevision((value) => value + 1);
+    } catch (error) {
+      toast.error((error as Error).message || "协议确认失败");
     } finally {
       setBusy(false);
     }
@@ -398,7 +427,7 @@ export function ProxyDiscoveryPanel({
     const failures: string[] = [];
     let done = 0;
     try {
-      // Admission can also reverify when the destination pool uses different credentials.
+      // Admission always rechecks with the destination pool configuration.
       if (action === "verify") {
         let next = 0;
         await Promise.all(
@@ -602,11 +631,36 @@ export function ProxyDiscoveryPanel({
             </div>
           ) : null}
 
+          {latestRun ? (
+            <div className="space-y-2 border-y py-3 text-sm" role="status">
+              <div className="flex flex-wrap items-baseline justify-between gap-2">
+                <p className="font-medium">最近一批 · {formatTime(latestRun.run.created_at)}</p>
+                <span className="text-muted-foreground text-xs">第 {latestRun.run.offset_start + 1} 条起 · 请求 {latestRun.run.requested} 条</span>
+              </div>
+              <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs sm:grid-cols-3 lg:grid-cols-6">
+                <span>平台返回 <strong>{latestRun.run.returned}</strong></span>
+                <span>解析候选 <strong>{latestRun.run.parsed}</strong></span>
+                <span>本次新增 <strong>{latestRun.run.inserted}</strong></span>
+                <span>已尝试 <strong>{latestRun.attempted}</strong></span>
+                <span>验证通过 <strong className="text-emerald-700 dark:text-emerald-400">{latestRun.succeeded}</strong></span>
+                <span>协议待确认 <strong>{latestRun.run.unknown_protocol}</strong></span>
+                <span>待验证 <strong>{latestRun.states.pending ?? 0}</strong></span>
+                <span>验证中 <strong>{latestRun.states.verifying ?? 0}</strong></span>
+                <span>验证失败 <strong>{latestRun.states.invalid ?? 0}</strong></span>
+                <span>已入池 <strong>{latestRun.states.approved ?? 0}</strong></span>
+              </div>
+              <p className="text-muted-foreground text-xs">
+                本批新增中尚无验证记录 {Math.max(0, latestRun.run.inserted - latestRun.attempted)} 条。
+                {latestRun.failures.length ? ` 最近结果：${latestRun.failures.map(({ stage, code, count }) => `${stage}/${code} ${count}`).join(" · ")}` : ""}
+              </p>
+            </div>
+          ) : null}
+
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <p className="font-medium">候选代理</p>
               <p className="mt-1 text-muted-foreground text-xs">
-                抓取后会自动验证；验证通过的候选不会自动入库，需手动选择后入池。
+                设置授权范围与验证地址后，新增候选会自动验证；入池仍需人工确认。
               </p>
               {autoVerification?.sourceID === selectedSource ? (
                 <p className="mt-1 text-amber-700 text-xs dark:text-amber-400" role="status">
@@ -772,6 +826,20 @@ export function ProxyDiscoveryPanel({
                     </td>
                     <td className="max-w-64 p-3 font-mono text-xs">
                       <span className="whitespace-nowrap">{result.address}</span>
+                      {result.protocol === "unknown" && result.state !== "approved" ? (
+                        <select
+                          aria-label={`确认候选 ${result.id} 的代理协议`}
+                          className="mt-1 block h-8 max-w-full rounded-md border bg-background px-2 font-sans text-xs"
+                          value="unknown"
+                          disabled={busy}
+                          onChange={(event) => void confirmProtocol(result, event.target.value as "http" | "https" | "socks5")}
+                        >
+                          <option value="unknown">确认协议</option>
+                          <option value="http">HTTP</option>
+                          <option value="https">HTTPS</option>
+                          <option value="socks5">SOCKS5</option>
+                        </select>
+                      ) : null}
                       {result.last_error ? (
                         <p className="mt-1 break-words font-sans text-destructive">
                           {proxyVerificationMessage(result.last_error)}
@@ -797,6 +865,11 @@ export function ProxyDiscoveryPanel({
                       <span className={result.state === "verified" ? "text-emerald-700" : "text-muted-foreground"}>
                         {resultLabel(result)}
                       </span>
+                      {result.last_verify_mode ? (
+                        <span className="ml-2 text-xs text-muted-foreground" title={result.last_verify_target}>
+                          {result.last_verify_mode === "connectivity" ? "百度连通性" : "出口 IP"}
+                        </span>
+                      ) : null}
                     </td>
                     <td className="whitespace-nowrap p-3 text-xs">
                       {result.latency_ms != null ? `${result.latency_ms} ms` : "-"}
@@ -819,6 +892,7 @@ export function ProxyDiscoveryPanel({
                             busy ||
                             verifyBlocked ||
                             !result.authorized ||
+                            result.protocol === "unknown" ||
                             result.state === "approved" ||
                             result.state === "ignored"
                           }
@@ -909,7 +983,16 @@ export function ProxyDiscoveryPanel({
                   className="h-9 w-full rounded-md border bg-background px-3 text-sm"
                   value={form.provider}
                   disabled={!!editing}
-                  onChange={(event) => setForm({ ...form, provider: event.target.value as "fofa" | "quake" })}
+                  onChange={(event) => {
+                    const provider = event.target.value as "fofa" | "quake";
+                    setForm((current) => ({
+                      ...current,
+                      provider,
+                      query: !current.query.trim() || current.query === defaultDiscoveryQueries[current.provider]
+                        ? defaultDiscoveryQueries[provider]
+                        : current.query,
+                    }));
+                  }}
                 >
                   <option value="fofa">FOFA</option>
                   <option value="quake">Quake</option>

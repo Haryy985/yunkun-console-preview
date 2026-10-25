@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -20,11 +22,14 @@ import (
 )
 
 type proxyPoolService struct {
-	mu       sync.Mutex
-	vault    *proxypool.Vault
-	provider *proxypool.Provider
-	gateway  *proxypool.Gateway
-	baseURL  string
+	mu          sync.Mutex
+	vault       *proxypool.Vault
+	provider    *proxypool.Provider
+	gateway     *proxypool.Gateway
+	baseURL     string
+	verifyMu    sync.Mutex
+	verifying   map[int64]bool
+	verifySlots chan struct{}
 }
 
 func (s *Server) initProxyPools(keyDir string) error {
@@ -35,7 +40,8 @@ func (s *Server) initProxyPools(keyDir string) error {
 	if _, err := s.m.pg.RepairQuakeDiscoveryProtocols(); err != nil {
 		return fmt.Errorf("repair Quake discovery protocols: %w", err)
 	}
-	s.proxyPools = &proxyPoolService{vault: vault, provider: proxypool.NewProvider()}
+	s.proxyPools = &proxyPoolService{vault: vault, provider: proxypool.NewProvider(),
+		verifying: make(map[int64]bool), verifySlots: make(chan struct{}, 8)}
 	s.proxyPools.gateway = &proxypool.Gateway{Key: s.jwtKey, Context: s.ctx, Resolve: s.resolveProxyRoute,
 		Audit: func(r proxypool.Route, target, result string) error {
 			return s.m.pg.AddProxyRouteEvent(r.TaskID, r.PoolID, r.Node.ID, target, result)
@@ -85,6 +91,9 @@ func (s *Server) proxyPoolRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/proxy-pools/{id}", s.saveProxyPool)
 	mux.HandleFunc("DELETE /api/proxy-pools/{id}", s.deleteProxyPool)
 	mux.HandleFunc("GET /api/proxy-pools/{id}/nodes", s.listProxyNodes)
+	mux.HandleFunc("POST /api/proxy-pools/{id}/nodes/import", s.importProxyNodes)
+	mux.HandleFunc("GET /api/proxy-pools/{id}/nodes/export", s.exportProxyNodes)
+	mux.HandleFunc("GET /api/proxy-pools/{id}/nodes/import-status", s.proxyImportStatus)
 	mux.HandleFunc("PATCH /api/proxy-pools/{id}/nodes/{node}", s.updateProxyNode)
 	mux.HandleFunc("POST /api/proxy-pools/{id}/nodes/batch", s.batchUpdateProxyNodes)
 	mux.HandleFunc("DELETE /api/proxy-pools/{id}/nodes/{node}", s.deleteProxyNode)
@@ -94,6 +103,145 @@ func (s *Server) proxyPoolRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/proxy-pools/{id}/events", s.proxyPoolEvents)
 	mux.HandleFunc("GET /api/tasks/{id}/network", s.taskNetworkStatus)
 	mux.HandleFunc("POST /api/tasks/{id}/network/lease", s.reassignTaskProxyLease)
+}
+
+func (s *Server) importProxyNodes(w http.ResponseWriter, r *http.Request) {
+	p, _, ok := s.poolForRequest(w, r)
+	if !ok {
+		return
+	}
+	if !p.Config.Enabled || p.Config.Kind != "fixed" {
+		writeErr(w, http.StatusConflict, "仅启用中的固定代理池支持手动导入")
+		return
+	}
+	var data []byte
+	var err error
+	if strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "multipart/form-data") {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			writeErr(w, http.StatusBadRequest, "导入文件格式无效或超过 1 MB")
+			return
+		}
+		defer r.MultipartForm.RemoveAll()
+		file, _, err := r.FormFile("file")
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "缺少导入文件")
+			return
+		}
+		defer file.Close()
+		data, err = io.ReadAll(io.LimitReader(file, (1<<20)+1))
+	} else {
+		data, err = io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	}
+	if err != nil {
+		writeErr(w, http.StatusRequestEntityTooLarge, "导入文件超过 1 MB")
+		return
+	}
+	if len(data) > 1<<20 {
+		writeErr(w, http.StatusRequestEntityTooLarge, "导入文件超过 1 MB")
+		return
+	}
+	addresses, err := parseProxyImport(data, p.Config.Protocol)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(addresses) == 0 || len(addresses) > 500 {
+		writeErr(w, http.StatusBadRequest, "每次导入需包含 1 到 500 个有效节点")
+		return
+	}
+	nodes := make([]proxypool.Node, 0, len(addresses))
+	for _, address := range addresses {
+		nodes = append(nodes, proxypool.Node{Address: address, Origin: "manual", Enabled: false})
+	}
+	ids, err := s.m.pg.ImportProxyNodes(p.ID, nodes)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "导入代理节点失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"node_ids": ids, "imported": len(ids), "skipped": len(nodes) - len(ids)})
+}
+
+func parseProxyImport(data []byte, defaultProtocol string) ([]string, error) {
+	text := strings.TrimSpace(strings.TrimPrefix(string(data), "\ufeff"))
+	if text == "" {
+		return nil, errors.New("导入内容为空")
+	}
+	reader := csv.NewReader(strings.NewReader(text))
+	reader.FieldsPerRecord = -1
+	reader.TrimLeadingSpace = true
+	reader.Comment = '#'
+	seen := make(map[string]bool)
+	addresses := make([]string, 0)
+	for {
+		row, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, errors.New("CSV 格式无效")
+		}
+		index, _ := reader.FieldPos(0)
+		line := strings.TrimSpace(row[0])
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.EqualFold(line, "address") || strings.EqualFold(line, "proxy") {
+			continue
+		}
+		if !strings.Contains(line, "://") {
+			line = defaultProtocol + "://" + line
+		}
+		u, err := proxypool.ParseAddress(line)
+		if err != nil {
+			return nil, fmt.Errorf("第 %d 行地址无效: %s", index, err.Error())
+		}
+		u.Host = strings.ToLower(u.Host)
+		address := u.String()
+		if !seen[address] {
+			seen[address] = true
+			addresses = append(addresses, address)
+			if len(addresses) > 500 {
+				return nil, errors.New("每次最多导入 500 个不同节点")
+			}
+		}
+	}
+	return addresses, nil
+}
+
+func (s *Server) exportProxyNodes(w http.ResponseWriter, r *http.Request) {
+	p, _, ok := s.poolForRequest(w, r)
+	if !ok {
+		return
+	}
+	nodes, err := s.m.pg.ProxyNodesForExport(p.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "导出代理节点失败")
+		return
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=proxy-pool-%d.csv", p.ID))
+	cw := csv.NewWriter(w)
+	_ = cw.Write([]string{"address", "enabled", "last_verify_mode", "last_verify_target", "last_http_status", "latency_ms", "last_error"})
+	cell := func(value string) string {
+		trimmed := strings.TrimLeft(value, " \t\r\n")
+		if strings.HasPrefix(trimmed, "=") || strings.HasPrefix(trimmed, "+") ||
+			strings.HasPrefix(trimmed, "-") || strings.HasPrefix(trimmed, "@") {
+			return "'" + value
+		}
+		return value
+	}
+	for _, n := range nodes {
+		latency, status := "", strconv.Itoa(n.LastHTTPStatus)
+		if n.LatencyMS != nil {
+			latency = strconv.Itoa(*n.LatencyMS)
+		}
+		_ = cw.Write([]string{cell(n.Address), strconv.FormatBool(n.Enabled), cell(n.LastVerifyMode), cell(n.LastVerifyTarget), status, latency, cell(n.LastError)})
+	}
+	cw.Flush()
+	if err := cw.Error(); err != nil {
+		return
+	}
 }
 
 const (
@@ -316,7 +464,34 @@ func (s *Server) listProxyNodes(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	nodes, err := s.m.pg.ProxyNodes(p.ID)
+	var nodes []proxypool.Node
+	var err error
+	var total int
+	page, size := 1, 20
+	q := r.URL.Query()
+	paged := q.Has("page") || q.Has("page_size")
+	if paged {
+		if q.Has("page") {
+			page, err = strconv.Atoi(q.Get("page"))
+		}
+		if err == nil && q.Has("page_size") {
+			size, err = strconv.Atoi(q.Get("page_size"))
+		}
+		status, protocol, sort := q.Get("status"), q.Get("protocol"), q.Get("sort")
+		if err != nil || page < 1 || page > 1000000 || size < 1 || size > 100 || len(q.Get("q")) > 200 ||
+			(status != "" && status != "available" && status != "pending" && status != "expiring" && status != "error" && status != "disabled") ||
+			(protocol != "" && protocol != "http" && protocol != "https" && protocol != "socks5") ||
+			(sort != "" && sort != "newest" && sort != "latency") {
+			writeErr(w, 400, "节点分页或筛选参数无效")
+			return
+		}
+		nodes, total, err = s.m.pg.ProxyNodesPage(p.ID, page, size, db.ProxyNodeFilter{
+			Query: q.Get("q"), Status: status, Protocol: protocol, Sort: sort, WarningSeconds: p.Config.ExpiryWarningSeconds,
+		})
+	} else {
+		nodes, err = s.m.pg.ProxyNodes(p.ID)
+		total = len(nodes)
+	}
 	if err != nil {
 		writeErr(w, 500, "读取节点失败")
 		return
@@ -330,7 +505,7 @@ func (s *Server) listProxyNodes(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "读取节点状态失败")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"nodes": nodes, "summary": summary})
+	writeJSON(w, 200, map[string]any{"nodes": nodes, "summary": summary, "total": total, "page": page, "page_size": size})
 }
 
 func (s *Server) updateProxyNode(w http.ResponseWriter, r *http.Request) {
@@ -509,7 +684,7 @@ func (s *Server) verifyProxyNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	nodeID, valid := pathInt(r, "node")
-	if !valid {
+	if !valid || nodeID <= 0 {
 		writeErr(w, 400, "节点 ID 无效")
 		return
 	}
@@ -517,40 +692,123 @@ func (s *Server) verifyProxyNode(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "来源已禁用")
 		return
 	}
-	nodes, err := s.m.pg.ProxyNodes(p.ID)
+	var req struct {
+		Mode string `json:"mode"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil && err != io.EOF {
+		writeErr(w, 400, "验证请求无效")
+		return
+	}
+	endpoint, mode, err := nodeVerificationTarget(p.Config.VerifyURL, req.Mode)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	n, err := s.m.pg.ProxyNode(p.ID, nodeID)
 	if err != nil {
 		writeErr(w, 500, "读取节点失败")
 		return
 	}
-	for _, n := range nodes {
-		if n.ID != nodeID {
-			continue
-		}
-		if n.ExpiresAt != nil && !n.ExpiresAt.After(time.Now().Add(time.Duration(p.Config.SafetySeconds)*time.Second)) {
-			writeErr(w, 409, "节点已过期或临近到期")
-			return
-		}
-		upstream, err := p.Config.Upstream(n, secrets)
-		var ip string
-		started := time.Now()
-		if err == nil {
-			ip, err = proxypool.Verify(r.Context(), upstream, p.Config.VerifyURL)
-		}
-		if err != nil {
-			latency := int(time.Since(started).Milliseconds())
-			_ = s.m.pg.VerifyProxyNodeWithLatency(n.ID, "", err.Error(), &latency)
-			writeErr(w, 502, err.Error())
-			return
-		}
-		latency := int(time.Since(started).Milliseconds())
-		if err := s.m.pg.VerifyProxyNodeWithLatency(n.ID, ip, "", &latency); err != nil {
-			writeErr(w, 500, "验证完成但保存失败")
-			return
-		}
-		writeJSON(w, 200, map[string]any{"ip": ip, "checked_at": time.Now().UTC()})
+	if n == nil {
+		writeErr(w, 404, "节点不存在")
 		return
 	}
-	writeErr(w, 404, "节点不存在")
+	if n.ExpiresAt != nil && !n.ExpiresAt.After(time.Now().Add(time.Duration(p.Config.SafetySeconds)*time.Second)) {
+		writeErr(w, 409, "节点已过期或临近到期")
+		return
+	}
+	result, latency, verifyErr := s.checkProxyNode(r.Context(), p, secrets, n, endpoint, mode)
+	if r.Context().Err() != nil {
+		return
+	}
+	if errors.Is(verifyErr, errProxyVerifyDuplicate) {
+		writeErr(w, 409, "此节点正在验证")
+		return
+	}
+	if errors.Is(verifyErr, errProxyVerifyBusy) {
+		w.Header().Set("Retry-After", "2")
+		writeErr(w, 429, "验证任务较多，请稍后重试")
+		return
+	}
+	if verifyErr != nil {
+		writeErr(w, 502, verifyErr.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ip": result.IP, "mode": result.Mode, "target": result.Target,
+		"http_status": result.HTTPStatus, "latency_ms": latency, "checked_at": time.Now().UTC()})
+}
+
+var errProxyVerifyBusy = errors.New("proxy verification busy")
+var errProxyVerifyDuplicate = errors.New("proxy node verification already running")
+var errProxyVerifyStore = errors.New("验证完成但保存失败")
+
+func (s *Server) checkProxyNode(ctx context.Context, p *db.ProxyPool, secrets proxypool.Secrets, n *proxypool.Node, endpoint, mode string) (proxypool.VerificationResult, int, error) {
+	s.proxyPools.verifyMu.Lock()
+	if s.proxyPools.verifying[n.ID] {
+		s.proxyPools.verifyMu.Unlock()
+		return proxypool.VerificationResult{}, 0, errProxyVerifyDuplicate
+	}
+	select {
+	case s.proxyPools.verifySlots <- struct{}{}:
+		s.proxyPools.verifying[n.ID] = true
+		s.proxyPools.verifyMu.Unlock()
+	default:
+		s.proxyPools.verifyMu.Unlock()
+		return proxypool.VerificationResult{}, 0, errProxyVerifyBusy
+	}
+	defer func() {
+		s.proxyPools.verifyMu.Lock()
+		delete(s.proxyPools.verifying, n.ID)
+		<-s.proxyPools.verifySlots
+		s.proxyPools.verifyMu.Unlock()
+	}()
+	upstream, err := p.Config.Upstream(*n, secrets)
+	if err != nil {
+		return proxypool.VerificationResult{}, 0, err
+	}
+	started := time.Now()
+	result, verifyErr := proxypool.VerifyEndpoint(ctx, upstream, endpoint, mode)
+	if ctx.Err() != nil {
+		return result, 0, ctx.Err()
+	}
+	latency := int(time.Since(started).Milliseconds())
+	problem := ""
+	if verifyErr != nil {
+		problem = verifyErr.Error()
+	}
+	if err := s.m.pg.RecordProxyNodeVerification(p.ID, n.ID, result, problem, latency); err != nil {
+		return result, latency, errProxyVerifyStore
+	}
+	return result, latency, verifyErr
+}
+
+func nodeVerificationTarget(configuredURL, mode string) (string, string, error) {
+	endpoint := strings.TrimSpace(configuredURL)
+	baidu := endpoint == "www.baidu.com" || endpoint == "www.baidu.com/" ||
+		endpoint == "https://www.baidu.com" || endpoint == proxypool.BaiduVerifyURL ||
+		endpoint == "http://www.baidu.com" || endpoint == "http://www.baidu.com/"
+	if mode == "" {
+		mode = proxypool.VerifyExitIP
+		if endpoint == "" || baidu {
+			mode = proxypool.VerifyConnectivity
+		}
+	}
+	switch mode {
+	case proxypool.VerifyConnectivity:
+		return proxypool.BaiduVerifyURL, mode, nil
+	case proxypool.VerifyExitIP:
+		if endpoint == "" || baidu {
+			endpoint = proxypool.DefaultIPVerifyURL
+		}
+		if err := validateDiscoveryVerifyURL(endpoint); err != nil {
+			return "", "", err
+		}
+		return endpoint, mode, nil
+	default:
+		return "", "", errors.New("验证方式无效")
+	}
 }
 
 func (s *Server) resolveProxyRoute(ctx context.Context, taskID int64) (proxypool.Route, error) {
@@ -587,6 +845,10 @@ func (s *Server) resolveProxyRoute(ctx context.Context, taskID int64) (proxypool
 	}
 	if !n.Enabled {
 		return route, errors.New("proxy node disabled")
+	}
+	if (n.Origin == "fofa" || n.Origin == "quake") &&
+		!n.HasFreshVerification(time.Now()) {
+		return route, errors.New("discovered proxy evidence expired or unhealthy; reverify before routing")
 	}
 	margin := time.Now().Add(time.Duration(p.Config.SafetySeconds) * time.Second)
 	if (b.ExpiresAt != nil && !b.ExpiresAt.After(margin)) || (n.ExpiresAt != nil && !n.ExpiresAt.After(margin)) {

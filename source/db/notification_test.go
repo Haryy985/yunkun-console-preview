@@ -538,13 +538,13 @@ func TestSetFindingStatusWithNotifyOnlyEmitsOnRealChange(t *testing.T) {
 	}
 	t.Cleanup(func() { d.Exec(`DELETE FROM notification_events WHERE finding_id=$1`, f.FindingID) })
 
-	// 落库时已登记一条 finding_created 事件，先把它数出来作为基线。
+	// 未审核的漏洞不能产生正式漏洞通知。
 	var base int
 	if err := d.QueryRow(`SELECT count(*) FROM notification_events WHERE finding_id=$1`, f.FindingID).Scan(&base); err != nil {
 		t.Fatal(err)
 	}
-	if base < 1 {
-		t.Fatal("漏洞落库应在同一事务里登记一条推送事件")
+	if base != 0 {
+		t.Fatal("未审核漏洞不应登记通知事件")
 	}
 
 	// 改成同一个状态：不该产生事件（避免重复提交刷出推送噪音）。

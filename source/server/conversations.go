@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -16,6 +17,7 @@ import (
 	"yunkun/console/agent"
 	"yunkun/console/db"
 	"yunkun/console/intercept"
+	"yunkun/console/llmrec"
 	"yunkun/console/sidequestion"
 )
 
@@ -566,6 +568,46 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 		webSearch = a.WebSearch
 	}
 	sessionID := s.convBusyKey(c.ID) // "conv-<id>" transcript session
+	ri := agent.RunInfoFrom(ctx)
+	ri.SessionID, ri.AgentID = sessionID, c.AgentKey
+	ri.Trace = agent.NewRunTrace(c.AgentKey, func(event agent.RunTraceEvent) {
+		detail, _ := json.Marshal(event)
+		tool, summary := "run", "Agent 配置已解析"
+		switch event.Kind {
+		case "configured":
+			if len(event.LoadedSkills) == 0 {
+				summary = fmt.Sprintf("Agent %s 已启动，未加载 Skill", c.AgentKey)
+			} else {
+				summary = fmt.Sprintf("Agent %s 已启动，可调用 Skill：%s", c.AgentKey, strings.Join(event.LoadedSkills, ", "))
+			}
+		case "skill_call":
+			tool = "Skill"
+			state := "失败"
+			if event.Success {
+				state = "成功"
+			}
+			summary = fmt.Sprintf("Agent %s 调用 Skill %s：%s", c.AgentKey, event.Skill, state)
+			if !event.Found {
+				summary += "（未找到）"
+			}
+		case "finished":
+			state := "失败"
+			if event.Status == "completed" {
+				state = "完成"
+			}
+			summary = fmt.Sprintf("Agent %s 执行%s", c.AgentKey, state)
+		}
+		if _, err := pg.AppendConvActivity(c.ID, db.Activity{
+			Worker: c.AgentKey, Kind: "agent_run", Tool: tool, Summary: summary, Detail: string(detail),
+		}); err != nil {
+			log.Printf("[conv %d] append agent run trace failed: %v", c.ID, err)
+		}
+	})
+	ctx = agent.WithRunInfo(ctx, ri)
+	if ri.TaskID > 0 {
+		ctx = llmrec.WithTaskID(ctx, strconv.FormatInt(ri.TaskID, 10))
+	}
+	ctx = llmrec.WithWorker(ctx, c.AgentKey)
 	emit := func(rec db.Activity) {
 		if _, err := pg.AppendConvActivity(c.ID, rec); err != nil {
 			log.Printf("[conv %d] append activity failed: %v", c.ID, err)
@@ -575,12 +617,14 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 	// step, so skip the raw-error entry — only surface genuine failures.
 	if _, err := ca.Chat(ctx, c.AgentKey, sessionID, msg, maxTurns, maxDuration, webSearch, emit); err != nil {
 		finishReason = err.Error()
+		ri.Trace.Complete("failed")
 		if ctx.Err() == nil {
 			_, _ = pg.AppendConvActivity(c.ID, db.Activity{Worker: c.AgentKey, Kind: "text", IsError: true,
 				Summary: "（出错：" + err.Error() + "）", Detail: err.Error()})
 		}
 	} else {
 		finishStatus, finishReason = "completed", ""
+		ri.Trace.Complete("completed")
 	}
 	_ = pg.TouchConversation(c.ID)
 }
