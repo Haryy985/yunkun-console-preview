@@ -88,3 +88,4 @@ jobs:
             ${{ runner.temp }}/yunkun-native-result/source-sha256.json
             ${{ runner.temp }}/yunkun-native-result/fresh-install.json
             ${{ runner.temp }}/yunkun-native-result/upgrade-rollback.json
+            ${{ runner.temp }}/yunkun-native-result/failure-diagnostics.json

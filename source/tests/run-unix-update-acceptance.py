@@ -101,8 +101,21 @@ def main():
 
     def run(command, timeout=900, extra=None):
         with log_path.open("ab") as log:
-            subprocess.run([str(a) for a in command], cwd=source, env=env | (extra or {}),
-                           stdout=log, stderr=subprocess.STDOUT, check=True, timeout=timeout)
+            try:
+                subprocess.run([str(a) for a in command], cwd=source, env=env | (extra or {}),
+                               stdout=log, stderr=subprocess.STDOUT, check=True, timeout=timeout)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                # All fixtures are synthetic. Export only exception class and source
+                # locations; raw launcher/worker logs may include generated secrets.
+                lines = log_path.read_text(errors="replace").splitlines()
+                clues = [line.strip()[:500] for line in lines[-100:]
+                         if line.lstrip().startswith(('Traceback', 'File "', 'RuntimeError:',
+                                                       'AssertionError', 'OSError:',
+                                                       'PermissionError:', 'FileNotFoundError:'))]
+                diagnostic = {"stage": report["stages"][-1] if report["stages"] else "setup",
+                              "exceptions": clues[-12:]}
+                (output / "failure-diagnostics.json").write_text(json.dumps(diagnostic, indent=2))
+                raise
 
     try:
         template = output / "clean-template"
