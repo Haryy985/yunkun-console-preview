@@ -51,27 +51,29 @@ type Secrets struct {
 }
 
 type Node struct {
-	ID               int64      `json:"id"`
-	PoolID           int64      `json:"pool_id"`
-	Address          string     `json:"address"`
-	DeclaredIP       string     `json:"declared_ip,omitempty"`
-	ExpiresAt        *time.Time `json:"expires_at,omitempty"`
-	VerifiedIP       string     `json:"verified_ip,omitempty"`
-	VerifiedAt       *time.Time `json:"verified_at,omitempty"`
-	LastError        string     `json:"last_error,omitempty"`
-	Enabled          bool       `json:"enabled"`
-	Origin           string     `json:"origin,omitempty"`
-	LastCheckedAt    *time.Time `json:"last_checked_at,omitempty"`
-	LatencyMS        *int       `json:"latency_ms,omitempty"`
-	SuccessCount     int64      `json:"success_count"`
-	FailureCount     int64      `json:"failure_count"`
-	LastSuccessAt    *time.Time `json:"last_success_at,omitempty"`
-	LastFailureAt    *time.Time `json:"last_failure_at,omitempty"`
-	Notes            string     `json:"notes,omitempty"`
-	DeletedAt        *time.Time `json:"deleted_at,omitempty"`
-	LastVerifyMode   string     `json:"last_verify_mode,omitempty"`
-	LastVerifyTarget string     `json:"last_verify_target,omitempty"`
-	LastHTTPStatus   int        `json:"last_http_status,omitempty"`
+	RuntimeCooldownUntil *time.Time `json:"runtime_cooldown_until,omitempty"`
+	RuntimeError         string     `json:"runtime_error,omitempty"`
+	ID                   int64      `json:"id"`
+	PoolID               int64      `json:"pool_id"`
+	Address              string     `json:"address"`
+	DeclaredIP           string     `json:"declared_ip,omitempty"`
+	ExpiresAt            *time.Time `json:"expires_at,omitempty"`
+	VerifiedIP           string     `json:"verified_ip,omitempty"`
+	VerifiedAt           *time.Time `json:"verified_at,omitempty"`
+	LastError            string     `json:"last_error,omitempty"`
+	Enabled              bool       `json:"enabled"`
+	Origin               string     `json:"origin,omitempty"`
+	LastCheckedAt        *time.Time `json:"last_checked_at,omitempty"`
+	LatencyMS            *int       `json:"latency_ms,omitempty"`
+	SuccessCount         int64      `json:"success_count"`
+	FailureCount         int64      `json:"failure_count"`
+	LastSuccessAt        *time.Time `json:"last_success_at,omitempty"`
+	LastFailureAt        *time.Time `json:"last_failure_at,omitempty"`
+	Notes                string     `json:"notes,omitempty"`
+	DeletedAt            *time.Time `json:"deleted_at,omitempty"`
+	LastVerifyMode       string     `json:"last_verify_mode,omitempty"`
+	LastVerifyTarget     string     `json:"last_verify_target,omitempty"`
+	LastHTTPStatus       int        `json:"last_http_status,omitempty"`
 }
 
 type Quota struct {

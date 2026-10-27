@@ -7,6 +7,7 @@ import { auth } from "@/lib/auth";
 import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
+import { requireReportResponse } from "@/lib/report-request";
 import type {
   ProxyDiscoveryResult,
   ProxyDiscoveryRunSummary,
@@ -276,6 +277,9 @@ export const api = {
       ? put<{ id: number }>(`/proxy-pools/${id}`, { config, secrets })
       : post<{ id: number }>("/proxy-pools", { config, secrets }),
   deleteProxyPool: (id: number) => http<{ ok: boolean }>(`/proxy-pools/${id}`, { method: "DELETE" }),
+  recoverProxyCredentials: (id: number, secrets: ProxySecrets, noAuth: boolean) =>
+    post<{ ok: boolean; requires_reverification: boolean }>(`/proxy-pools/${id}/credentials/recover`,
+      { confirm: true, secrets, no_auth: noAuth }),
   proxyNodes: (id: number, query?: ProxyNodeQuery) => {
     const params = new URLSearchParams();
     if (query) for (const [key, value] of Object.entries(query)) params.set(key, String(value));
@@ -378,6 +382,8 @@ export const api = {
     }),
   taskNetwork: (id: string) => get<TaskNetwork>(`/tasks/${encodeURIComponent(id)}/network`),
   reassignTaskProxyLease: (id: string) => post<{ ok: boolean }>(`/tasks/${encodeURIComponent(id)}/network/lease`),
+  setTaskProxyRouting: (id: string, strategy: "round_robin" | "fixed", nodeID?: number) =>
+    put<{ ok: boolean }>(`/tasks/${encodeURIComponent(id)}/network/routing`, { strategy, node_id: nodeID }),
   // 后端应用版本号（release 时由 ldflags 注入，默认 "dev"）。
   health: () => get<{ ok: boolean; service: string; version: string }>("/health"),
 
@@ -744,10 +750,12 @@ export const api = {
       for (const [k, v] of findingFilterParams(opts.filters)) p.set(k, v);
     }
     const token = getToken();
-    const r = await fetch(`/api/exploration/findings/export?${p.toString()}`, {
+    const path = `/api/exploration/findings/export?${p.toString()}`;
+    const r = await fetch(path, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
+      cache: "no-store",
     });
-    if (!r.ok) throw new Error(`export: ${r.status}`);
+    await requireReportResponse(r, path);
     const blob = await r.blob();
     // 文件名优先取后端 Content-Disposition,取不到则用默认名。
     const disp = r.headers.get("Content-Disposition") ?? "";
@@ -1041,17 +1049,16 @@ export const api = {
     ).then((r) => ({ ...r, deliveries: arr(r.deliveries) }));
   },
   notifyRetryDelivery: (id: number) => post<{ ok: boolean }>(`/notify/deliveries/${id}/retry`),
-  report: async (task?: string) => {
+  report: async (task?: string, signal?: AbortSignal) => {
     if (MOCK) return mockReport(task);
     const token = getToken();
-    const r = await fetch(`/api/report${tq(task)}`, {
+    const path = `/api/report${tq(task)}`;
+    const r = await fetch(path, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
+      cache: "no-store",
+      signal,
     });
-    if (!r.ok) {
-      const payload = (await r.json().catch(() => null)) as { error?: string; blockers?: string[] } | null;
-      const blockers = payload?.blockers?.length ? `：${payload.blockers.join("、")}` : "";
-      throw new Error(`${payload?.error ?? `report: ${r.status}`}${blockers}`);
-    }
+    await requireReportResponse(r, path);
     return r.text();
   },
   chatMentions: (kind: string, query: string, signal?: AbortSignal, cursor = "") =>

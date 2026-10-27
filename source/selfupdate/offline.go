@@ -3,6 +3,7 @@ package selfupdate
 import (
 	"archive/zip"
 	"context"
+	"debug/buildinfo"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -53,11 +54,8 @@ type offlineJob struct {
 // databases cannot be safely restored by a filesystem backup.
 func CurrentOfflineInstall() (OfflineInstall, error) {
 	var in OfflineInstall
-	if runtime.GOOS != "windows" && runtime.GOOS != "linux" {
-		return in, errors.New("当前平台暂不支持一键离线更新；请按离线升级手册操作")
-	}
-	if runtime.GOARCH != "amd64" && !(runtime.GOOS == "linux" && runtime.GOARCH == "arm64") {
-		return in, errors.New("当前平台暂不支持一键离线更新；Linux/macOS 请按离线升级手册操作")
+	if !supportedOfflinePlatform(runtime.GOOS, runtime.GOARCH) {
+		return in, errors.New("当前操作系统或CPU架构不支持一键离线更新；请按离线升级手册操作")
 	}
 	root := os.Getenv("YUNKUN_OFFLINE_ROOT")
 	if root == "" {
@@ -74,6 +72,9 @@ func CurrentOfflineInstall() (OfflineInstall, error) {
 	}
 	in.ConsolePort, _ = strconv.Atoi(os.Getenv("YUNKUN_OFFLINE_CONSOLE_PORT"))
 	in.Public = os.Getenv("YUNKUN_OFFLINE_PUBLIC") == "1"
+	if unixOfflinePlatform(runtime.GOOS) && in.Public {
+		return in, errors.New("Unix 一键更新仅支持受管启动器的本机监听模式")
+	}
 	exe, err := os.Executable()
 	appName, pgctlName, postgresName, pgMajor := "yunkun", "pg_ctl", "postgres", "18"
 	if runtime.GOOS == "windows" {
@@ -99,7 +100,7 @@ func CurrentOfflineInstall() (OfflineInstall, error) {
 	}
 	in.DatabasePort = state.DatabasePort
 	validFormat := state.Format == 1
-	if runtime.GOOS == "linux" {
+	if unixOfflinePlatform(runtime.GOOS) {
 		in.DatabasePort = state.UnixDatabasePort
 		validFormat = state.Schema == 1
 	}
@@ -126,14 +127,14 @@ func CurrentOfflineInstall() (OfflineInstall, error) {
 	}
 	pgctlPath := filepath.Join("runtime", pgMajor, "bin", pgctlName)
 	postgresPath := filepath.Join("runtime", pgMajor, "bin", postgresName)
-	if runtime.GOOS == "linux" {
+	if unixOfflinePlatform(runtime.GOOS) {
 		pgctlPath = filepath.Join("runtime", "bin", pgctlName)
 		postgresPath = filepath.Join("runtime", "bin", postgresName)
 		var launcher struct {
 			PID int `json:"pid"`
 		}
 		if readJSON(filepath.Join(private, "launcher.json"), &launcher) != nil ||
-			!linuxManagedProcess(launcher.PID, filepath.Join(root, "bin", "yunkun-offline")) {
+			!ManagedOfflineProcess(launcher.PID, filepath.Join(root, "bin", "yunkun-offline")) {
 			return in, errors.New("请使用新版受管离线启动器启动后更新")
 		}
 	}
@@ -147,6 +148,13 @@ func CurrentOfflineInstall() (OfflineInstall, error) {
 		return in, errors.New("不支持自动升级此 PostgreSQL 主版本")
 	}
 	return in, nil
+}
+
+func unixOfflinePlatform(goos string) bool { return goos == "linux" || goos == "darwin" }
+
+func supportedOfflinePlatform(goos, arch string) bool {
+	return (goos == "windows" && arch == "amd64") ||
+		(unixOfflinePlatform(goos) && (arch == "amd64" || arch == "arm64"))
 }
 
 func samePath(a, b string) bool {
@@ -205,6 +213,9 @@ func PrepareOffline(ctx context.Context, c *http.Client, rel *Release, current s
 	if goos == "" {
 		goos, goarch = "windows", "amd64"
 	}
+	if !supportedOfflinePlatform(goos, goarch) {
+		return "", errors.New("不支持此更新目标平台")
+	}
 	asset, ok := FindOfflineAsset(rel, goos, goarch)
 	if !ok || asset.Size <= 0 || asset.Size > maxOfflineZip {
 		return "", errors.New("缺少当前平台有效的完整离线包")
@@ -220,8 +231,14 @@ func PrepareOffline(ctx context.Context, c *http.Client, rel *Release, current s
 	if err != nil {
 		return "", err
 	}
+	prepared := false
+	defer func() {
+		if !prepared {
+			_ = os.RemoveAll(work)
+		}
+	}()
 	prog(PhaseDownload, 0, "正在获取更新包与校验清单")
-	sums, err := fetchSums(ctx, c, rel)
+	sums, err := fetchSums(ctx, c, rel, prog)
 	if err != nil {
 		return "", err
 	}
@@ -248,6 +265,9 @@ func PrepareOffline(ctx context.Context, c *http.Client, rel *Release, current s
 		appName = "yunkun.exe"
 	}
 	bin := filepath.Join(candidate, "bin", appName)
+	if err := checkOfflineBinaryPlatform(bin, goos, goarch); err != nil {
+		return "", err
+	}
 	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(probeCtx, bin, "-version")
@@ -256,8 +276,11 @@ func PrepareOffline(ctx context.Context, c *http.Client, rel *Release, current s
 	if err != nil || strings.TrimSpace(string(out)) != rel.TagName {
 		return "", errors.New("更新程序无法运行或程序版本与发布标签不一致")
 	}
-	if goos == "linux" {
+	if unixOfflinePlatform(goos) {
 		launcher := filepath.Join(candidate, "bin", "yunkun-offline")
+		if err := checkOfflineBinaryPlatform(launcher, goos, goarch); err != nil {
+			return "", err
+		}
 		out, err := exec.CommandContext(probeCtx, launcher, "--version").Output()
 		if err != nil || strings.TrimSpace(string(out)) != rel.TagName {
 			return "", errors.New("更新包启动器版本不匹配")
@@ -297,12 +320,36 @@ func PrepareOffline(ctx context.Context, c *http.Client, rel *Release, current s
 			return "", err
 		}
 	}
+	prepared = true
 	return jobPath, nil
 }
 
+func checkOfflineBinaryPlatform(file, goos, goarch string) error {
+	info, err := buildinfo.ReadFile(file)
+	if err != nil {
+		return errors.New("更新包程序缺少有效构建信息，当前服务未改变")
+	}
+	var builtOS, builtArch string
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "GOOS":
+			builtOS = setting.Value
+		case "GOARCH":
+			builtArch = setting.Value
+		}
+	}
+	if builtOS != goos || builtArch != goarch {
+		return fmt.Errorf("更新包程序平台不匹配：需要 %s/%s，当前服务未改变", goos, goarch)
+	}
+	return nil
+}
+
 func StartOfflineWorker(jobPath string) error {
-	if runtime.GOOS == "linux" {
-		return startLinuxOfflineWorker(jobPath)
+	if unixOfflinePlatform(runtime.GOOS) {
+		return startUnixOfflineWorker(jobPath)
+	}
+	if runtime.GOOS != "windows" {
+		return errors.New("当前平台不支持离线更新助手")
 	}
 	powershell := filepath.Join(os.Getenv("WINDIR"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
 	work := filepath.Dir(jobPath)
@@ -368,7 +415,7 @@ func offlineEntry(name string) (string, error) {
 	case "runtime", "skills", "docs", "screenshots":
 	case "setup-and-start-offline.ps1", "setup-and-start-offline.bat", "stop-offline.bat", "upgrade-offline.ps1",
 		"readme.md", "changelog.md", "notice.md", "license", "config.example.json", "version",
-		"start.sh", "stop.sh", "check.sh", "readme.txt", "package.json", "files.sha256",
+		"start.sh", "stop.sh", "check.sh", "start-yunkun.command", "readme.txt", "package.json", "files.sha256",
 		"postgresql_license.txt", "third_party_notices.txt":
 		if len(parts) != 2 {
 			return "", errors.New("发布包文件路径无效")

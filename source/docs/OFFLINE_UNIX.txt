@@ -1,0 +1,91 @@
+云鲲控制台离线部署
+
+适用环境
+  Linux x86_64 / ARM64：完整的 Ubuntu 20.04+、Debian 11+ 等 glibc 发行版。
+  运行时引用的最高 GLIBC 符号版本为 2.27；不支持 Alpine / musl。
+  macOS Intel / Apple Silicon：macOS 13 Ventura 或更新版本。
+  使用对应 CPU 的包，以普通用户运行。不要用 root / sudo 启动数据库。
+  系统需提供 bash、本地 TCP 和可写目录；建议至少 4GB 内存。
+  安装本体至少预留2GB；一键更新另需容纳下载包、解压包以及用户数据完整备份，
+  不能以压缩包大小估算空间。安装目录和用户数据不可使用符号链接。
+  macOS 未签名发行包可能需要在“系统设置 → 隐私与安全性”中允许打开。
+
+启动
+  完整解压 ZIP，保留 Unix 执行权限。macOS 可双击 Start-Yunkun.command。
+  Linux / macOS 终端：sh start.sh
+  无桌面环境：sh start.sh --no-browser
+  只检查依赖，不创建数据库：sh check.sh
+  地址：http://127.0.0.1:5173/login/
+  用户名：yunkun。首次使用自行设置管理员密码，没有统一默认密码。
+  如端口占用：sh start.sh --port 5175 --database-port 5435
+  数据库端口只在首次安装设置，以后使用保存的端口。
+  首次自动初始化 PostgreSQL、随机数据库凭据及空数据库，再启动内嵌前端。
+  启动终端需保持打开；Ctrl+C 或 sh stop.sh 停止本安装并保留数据。
+
+离线范围
+  已包含预编译控制台、内嵌网页、当前公开 Skills、PostgreSQL 18.4 及其核心依赖库。
+  Linux 同时包含 libstdc++ / libgcc，不需要另行安装 C++ 运行库。
+  启动不需要 Go、Node.js、npm、Python、Docker、Homebrew、apt 或联网下载。
+  内置文本搜索有纯 Go 后备实现，不会为搜索自动运行 npm 安装。
+  模型 API、FOFA / Quake、远程 MCP、企业微信推送等仍需用户配置和对应网络。
+  用户自选外部扫描器、Python / Node 自定义脚本、浏览器自动化和第三方 MCP
+  不属于“启动控制台”的依赖；使用这些扩展需单独准备对应工具或语言运行时。
+  PostgreSQL 可选的 PL/Python、PL/Perl、PL/Tcl 扩展不在支持范围，控制台不使用它们。
+
+数据与升级
+  .yunkun-local/ 首次运行时才生成，包含数据库、密码、配置、任务和日志。
+  请完整备份此目录，切勿上传或分享。重启保留已有配置，冲突时拒绝覆盖。
+  软件包不包含开发机的配置、数据库、任务、凭据或日志。
+  新安装请解压到新的空目录；已有客户请按升级说明备份后迁移，勿删除用户目录。
+  本源码新增 macOS Intel / Apple Silicon 受管一键更新，与 Linux x86_64 / ARM64
+  共用升级事务。是否已完成原生验收以对应交付版本的验收记录为准。
+  必须使用包含此能力的新版控制台和 yunkun-offline 启动器，并通过 start.sh 启动。
+  旧版 macOS 未实现此能力，不能仅靠发布新包使已安装的旧程序自动获得更新能力；
+  首次迁移需另按经过验收的升级方案处理，不能直接覆盖运行中的数据库。
+  暂停任务、结束Agent会话后，在系统设置检查更新并确认。下载、SHA-256校验、
+  同平台程序/启动器及依赖检查全部成功后，才会停服停库。
+  事务依次完整备份、安装、只读维护态检查迁移与登录、正常启动检查；
+  失败时停止新版，恢复匹配的旧程序和数据库快照，再验证旧版健康状态。
+  配置、密钥、数据库与用户自定义Skills保留；同名新内置Skills存到
+  .yunkun-local/upgrade-bundled-skills/ 供管理员审查，不覆盖用户修改。
+  更新前会检查备份和回滚空间；不足时保留当前服务，不删除任务或旧备份腾空间。
+  本地状态：.yunkun-local/update-state.json；
+  备份及日志：.yunkun-local/updates/update-*/ 下的 backup/、worker.log、startup.log。
+  completed表示成功，rolled_back表示失败后已恢复旧版；
+  recovery_required表示无法安全自动恢复，应保留现场，禁止强行启动或复制活库。
+  不要在验收前删除备份；也不要仅用旧二进制覆盖迁移后的新数据库。
+  macOS执行限制或依赖预检查失败时，先处理可信软件的系统授权，再重试；
+  更新器不会禁用Gatekeeper、关闭系统安全功能或使用sudo。
+  默认仅监听 127.0.0.1；本脚本不会修改防火墙或结束未知端口进程。
+
+故障检查
+  启动前运行 sh check.sh。错误会指出无法执行的二进制或缺失组件。
+  不支持的操作系统或架构需要下载匹配的软件包，不能通过重置数据库修复。
+  运行日志位于 .yunkun-local/logs/。启动失败时不要删除数据库重试。
+  使用标准 unzip 解压并保留执行权限；若解压软件丢失权限：
+  chmod u+x start.sh stop.sh check.sh bin/yunkun bin/yunkun-offline runtime/bin/*
+  macOS 同时执行 chmod u+x Start-Yunkun.command。
+
+交付验证
+  VERSION 是控制台和启动器的相同构建版本。
+  PACKAGE.json 记录平台、运行时来源及核心系统库边界。
+  FILES.sha256 是包内逐文件校验清单；外部 SHA256SUMS 校验整个 ZIP。
+  Linux 随附 GCC 运行库对应源码包 third-party-gcc-10.2.1-6-source.zip；
+  分发 Linux 离线包时请同时保留此源码附件和包内授权文件。
+  交叉编译和压缩包校验不能替代目标系统的真实部署验收。
+
+开发验收（仅测试机需要Go和Python 3.11+，客户启动不需要）
+  tests/run-unix-update-acceptance.py 在原生普通用户环境执行。输入为无客户数据的
+  同平台离线ZIP及其SHA256SUMS摘要，输出必须是一个尚不存在的新目录：
+  python3 tests/run-unix-update-acceptance.py --package /path/to/clean.zip \
+    --sha256 <该ZIP的64位SHA256摘要> --output /path/to/new-acceptance-directory
+  此工具从当前源码构建两个合成版本，使用包内运行时，执行依赖/解包检查、
+  首次安装、重启、启动失败回滚、成功升级及密码/任务/知识库/密钥/Skills保留检查。
+  合成版本验证事务行为，不等于跨历史版本的数据库迁移已验收。
+  结果包括acceptance.json、fresh-install.json、upgrade-rollback.json和源码哈希。
+  不应上传整个输出目录，其中包含合成测试数据库和测试密钥。
+  手动触发的offline-unix-acceptance工作流配置了Linux amd64/arm64、
+  macOS arm64/Intel四种原生Runner，以固定SHA-256检查历史干净运行时包。
+  只上传结果清单，不发布版本；配置工作流不等于这四个平台已通过。
+  更新入口的管理员授权与任务空闲检查、真实GitHub下载网络和macOS首次
+  Gatekeeper授权，仍需交付验收；该脚本不绕过或模拟这些系统授权。

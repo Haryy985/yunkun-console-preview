@@ -56,7 +56,7 @@ func (t *ToolSet) availableResources() actool.CoreTool {
 // may contain addresses or credentials and must never leak into discovery.
 func resourceNetworkSummary(status map[string]any) map[string]any {
 	out := map[string]any{"enforced": false}
-	for _, key := range []string{"mode", "status", "pool_name", "failure_policy", "coverage", "capture"} {
+	for _, key := range []string{"mode", "status", "pool_name", "routing_strategy", "node_semantics", "failure_policy", "coverage", "capture"} {
 		if value, ok := status[key].(string); ok {
 			out[key] = utf8Prefix(value, 160)
 		}

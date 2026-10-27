@@ -71,7 +71,7 @@ AND p.config->>'enabled'='true' AND p.config->>'kind'='fixed' AND COALESCE(p.con
 }
 
 func (s *Server) proxyImportStatus(w http.ResponseWriter, r *http.Request) {
-	p, _, ok := s.poolForRequest(w, r)
+	p, ok := s.poolMetadataForRequest(w, r)
 	if !ok {
 		return
 	}

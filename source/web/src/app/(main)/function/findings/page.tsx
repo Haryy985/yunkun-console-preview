@@ -40,6 +40,8 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { api } from "@/lib/api";
+import { ReportRequestError } from "@/lib/report-request";
+import { useRetryCountdown } from "@/hooks/use-retry-countdown";
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
 import { statusMeta } from "@/lib/status";
@@ -260,6 +262,10 @@ export default function FindingsPage() {
   const [exportScope, setExportScope] = React.useState<"filtered" | "all" | "selected">("filtered");
   const [exportFormat, setExportFormat] = React.useState<"md-single" | "md-zip" | "csv" | "json">("md-single");
   const [exporting, setExporting] = React.useState(false);
+  const exportInFlight = React.useRef(false);
+  const [exportError, setExportError] = React.useState("");
+  const [exportRetryAt, setExportRetryAt] = React.useState(0);
+  const exportRetrySeconds = useRetryCountdown(exportRetryAt);
 
   const toggleSelected = React.useCallback((id: string, checked: boolean) => {
     setSelectedIds((prev) => {
@@ -288,7 +294,10 @@ export default function FindingsPage() {
   }
 
   async function doExport() {
+    if (exportInFlight.current || Date.now() < exportRetryAt) return;
+    exportInFlight.current = true;
     setExporting(true);
+    setExportError("");
     try {
       await api.exportFindings({
         format: exportFormat,
@@ -299,8 +308,10 @@ export default function FindingsPage() {
       setExportOpen(false);
       toast.success("已开始下载导出文件");
     } catch (e) {
-      toast.error(`导出失败：${(e as Error).message}`);
+      setExportError((e as Error).message);
+      setExportRetryAt(e instanceof ReportRequestError ? e.retryAt : 0);
     } finally {
+      exportInFlight.current = false;
       setExporting(false);
     }
   }
@@ -1320,12 +1331,17 @@ export default function FindingsPage() {
             </div>
           </div>
 
+          {exportError && (
+            <p role="alert" className="max-h-48 overflow-auto whitespace-pre-wrap break-all text-destructive text-sm">
+              {exportError}
+            </p>
+          )}
           <DialogFooter>
             <Button variant="outline" onClick={() => setExportOpen(false)} disabled={exporting}>
               取消
             </Button>
-            <Button onClick={doExport} disabled={exporting || (exportScope === "selected" && selectedIds.size === 0)}>
-              <DownloadIcon /> {exporting ? "导出中…" : "导出"}
+            <Button onClick={doExport} disabled={exporting || exportRetrySeconds > 0 || (exportScope === "selected" && selectedIds.size === 0)}>
+              <DownloadIcon /> {exporting ? "导出中…" : exportRetrySeconds > 0 ? `${exportRetrySeconds} 秒后重试` : "导出"}
             </Button>
           </DialogFooter>
         </DialogContent>

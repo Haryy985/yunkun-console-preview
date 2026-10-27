@@ -33,15 +33,15 @@ position(lower($2) in lower(concat_ws(' ',address,declared_ip,verified_ip,origin
 		where += ` AND NOT enabled`
 	case "available":
 		args = append(args, warning)
-		where += ` AND enabled AND last_error='' AND last_success_at IS NOT NULL AND (expires_at IS NULL OR expires_at>now()+make_interval(secs=>$3::double precision))`
+		where += ` AND enabled AND last_error='' AND last_success_at IS NOT NULL AND (expires_at IS NULL OR expires_at>now()+make_interval(secs=>$3::double precision)) AND (runtime_cooldown_until IS NULL OR runtime_cooldown_until<=now())`
 	case "pending":
 		args = append(args, warning)
-		where += ` AND enabled AND last_error='' AND last_success_at IS NULL AND (expires_at IS NULL OR expires_at>now()+make_interval(secs=>$3::double precision))`
+		where += ` AND enabled AND last_error='' AND last_success_at IS NULL AND (expires_at IS NULL OR expires_at>now()+make_interval(secs=>$3::double precision)) AND (runtime_cooldown_until IS NULL OR runtime_cooldown_until<=now())`
 	case "expiring":
 		args = append(args, warning)
 		where += ` AND enabled AND expires_at>now() AND expires_at<=now()+make_interval(secs=>$3::double precision)`
 	case "error":
-		where += ` AND enabled AND (last_error<>'' OR expires_at<=now())`
+		where += ` AND enabled AND (last_error<>'' OR expires_at<=now() OR runtime_cooldown_until>now())`
 	default:
 		return nil, 0, errors.New("invalid node status")
 	}
@@ -67,7 +67,7 @@ position(lower($2) in lower(concat_ws(' ',address,declared_ip,verified_ip,origin
 	// Size and offset have been range checked; every user text value is bound.
 	rows, err := d.Query(`SELECT id,pool_id,address,declared_ip,expires_at,verified_ip,verified_at,last_error,
 enabled,origin,last_checked_at,latency_ms,success_count,failure_count,last_success_at,last_failure_at,notes,deleted_at,
-last_verify_mode,last_verify_target,last_http_status
+last_verify_mode,last_verify_target,last_http_status,runtime_cooldown_until,runtime_error
 FROM proxy_nodes WHERE `+where+` ORDER BY `+order+` LIMIT `+strconv.Itoa(size)+` OFFSET `+strconv.Itoa((page-1)*size), args...)
 	if err != nil {
 		return nil, 0, err
@@ -79,7 +79,7 @@ FROM proxy_nodes WHERE `+where+` ORDER BY `+order+` LIMIT `+strconv.Itoa(size)+`
 		if err := rows.Scan(&n.ID, &n.PoolID, &n.Address, &n.DeclaredIP, &n.ExpiresAt, &n.VerifiedIP, &n.VerifiedAt, &n.LastError,
 			&n.Enabled, &n.Origin, &n.LastCheckedAt, &n.LatencyMS, &n.SuccessCount, &n.FailureCount,
 			&n.LastSuccessAt, &n.LastFailureAt, &n.Notes, &n.DeletedAt,
-			&n.LastVerifyMode, &n.LastVerifyTarget, &n.LastHTTPStatus); err != nil {
+			&n.LastVerifyMode, &n.LastVerifyTarget, &n.LastHTTPStatus, &n.RuntimeCooldownUntil, &n.RuntimeError); err != nil {
 			return nil, 0, err
 		}
 		nodes = append(nodes, n)

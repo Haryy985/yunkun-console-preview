@@ -1,7 +1,8 @@
 name: release
 on:
   push:
-    tags: ["v*"]
+    # Complete offline packages are assembled and verified separately.
+    tags: ["v*", "!v*-offline"]
 permissions:
   contents: write
 jobs:

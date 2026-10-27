@@ -8,7 +8,7 @@
 
 Rowan · 云鲲安全
 
-**产品介绍与使用指南 · v1.1.0 · 2026-10-18**
+**产品介绍与使用指南 · v1.1.2 · 2026-10-27**
 
 [界面预览](#界面预览) · [功能介绍](#功能介绍) · [使用流程](#使用流程) · [新增与优化](#新增与优化) · [部署说明](#部署说明)
 
@@ -17,6 +17,15 @@ Rowan · 云鲲安全
 > 本仓库提供产品介绍、界面预览、源码和 Windows 完全离线交付包。下文介绍当前交付代码中的能力，不代表全部场景已完成实测。
 
 ## 获取产品
+
+### 2026-10-27 v1.1.2
+
+[完整离线包](https://github.com/Haryy985/yunkun-console-preview/releases/tag/v1.1.2-offline) · [本版更新与限制](source/docs/RELEASE_1.1.2.md) · [升级手册](source/docs/OFFLINE_UPDATE.md)
+
+本版汇总代理默认轮询、故障冷却、凭据显式恢复、发现目标池联动、报告导出错误诊断、
+任务缓存清理及更新下载可靠性改进；macOS接入Unix受管一键更新流程。
+下载对应系统/架构的完整离线包并核对SHA256SUMS，不要用自动生成的Source code ZIP代替。
+历史版本介绍与测试数字见下文，不等于本版全部场景验收结果。
 
 - 源码：[`source/`](source/)
 - Windows 完全离线版：见 [Releases](https://github.com/Haryy985/yunkun-console-preview/releases)

@@ -86,15 +86,16 @@ Windows x64 标准离线安装需通过包内启动器启动。
 服务停止期间页面会显示重新连接，成功后点击“重新载入控制台”。
 电源中断、磁盘损坏或自动恢复失败不能保证自动自愈；启动器会拒绝覆盖或
 重新初始化未完成的安装。保留备份和更新日志后进行恢复。
-外部数据库、自定义配置目录不开放应用内换装；Linux 开发版支持范围与验收边界见下节。
+外部数据库、自定义配置目录不开放应用内换装；Linux/macOS 开发版支持范围与验收边界见下节。
 
-### Linux 开发版更新（2026-10-24，待原生验收）
+### Linux/macOS 开发版更新（2026-10-27，待原生验收）
 
-Linux amd64/arm64 的标准离线包接入相同的页面入口。必须以普通用户通过
+Linux amd64/arm64、macOS Intel/Apple Silicon 标准离线包接入相同的页面入口。必须以普通用户通过
 `start.sh` 或 `bin/yunkun-offline` 启动，使用内置 PostgreSQL 18、
-标准 `.yunkun-local` 配置和数据目录。macOS 当前仍使用手动升级。
-更早发布且未包含本功能的 Linux 客户端须先手动升级一次；发布新版不会
-使旧程序自动获得更新代码。本节描述未发布开发改动，尚不能替代 Linux 实机验收。
+标准 `.yunkun-local` 配置和数据目录，保持本机监听。macOS 启动文件
+`Start-Yunkun.command` 已纳入更新白名单，候选控制台及启动器均校验OS/CPU与版本。
+更早发布且未包含本功能的客户端须先迁移一次；发布新版不会
+使旧程序自动获得更新代码。本节描述未发布开发改动，尚不能替代两端实机验收。
 
 助手与应用使用独立进程会话，等旧启动器释放锁、确认数据库停止后再备份。
 先检查磁盘容量、完整 ZIP 校验、候选程序/启动器版本和依赖；不足时保留旧服务。
@@ -102,11 +103,15 @@ Linux amd64/arm64 的标准离线包接入相同的页面入口。必须以普�
 标准启动器在 `waiting/backing_up/installing/starting/rolling_back/recovery_required`
 状态拒绝普通重复启动，由受管更新助手完成恢复。不要删除更新状态文件来强行启动。
 
-原生验收脚本为 `tests/offline-oneclick-unix-smoke.py`，需要两份无数据、
-可抛弃的 Linux 安装目录，使用隔离端口和合成任务/知识库/代理凭据，
-验证成功升级、启动失败回滚、登录/旧会话、历史数据、密钥及用户 Skills。
-手动 CI 为 `.github/workflows/linux-update-regression.yml`，只在人工触发时运行。
-本机 Windows 验证只覆盖事务逻辑、文件快照和交叉编译，不能据此声明 Linux 原生升级通过。
+原生验收入口为 `tests/run-unix-update-acceptance.py`，输入一个同平台干净ZIP及
+SHA-256，输出必须是新的可抛弃目录。测试机需Go与Python 3.11+，客户启动不需要。
+脚本以当前源码构建两个合成版本，调用依赖预检、完整包准备测试和
+`tests/offline-oneclick-unix-smoke.py`，使用隔离端口与合成数据，
+验证失败回滚再成功升级，以及登录/旧会话、任务、知识库、密钥、配置和用户Skills。
+同源码合成版本不能替代跨历史版本的迁移验收；真实下载网络、页面操作及Gatekeeper授权另测。
+手动CI为 `.github/workflows/offline-unix-acceptance.yml`，配置Linux amd64/arm64、macOS arm64/Intel四种原生Runner；
+只在人工触发时运行，不发布版本，只上传不含数据库或密钥的结果文件。
+四种原生结果均须实际运行后判定；Windows测试与四架构交叉编译均不计作原生通过。
 
 ### 手动恢复
 

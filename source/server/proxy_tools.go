@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
+	actool "github.com/Autumn-27/norma/tool"
 	"yunkun/console/agent"
 	"yunkun/console/proxypool"
-	actool "github.com/Autumn-27/norma/tool"
 )
 
 type taskProxyFetch struct {
@@ -22,7 +22,7 @@ type taskProxyFetch struct {
 }
 
 func (t *taskProxyFetch) Description() string {
-	return "Fetch an HTTP(S) page through this task's proxy lease. Returns status, headers and raw text (including HTML source when extract=true), truncated at 50,000 bytes. Proxy failure stops the request; no direct fallback. Inspect network_status for lease health and network coverage."
+	return "Fetch an HTTP(S) page through this task's configured proxy pool. Returns status, headers and raw text (including HTML source when extract=true), truncated at 50,000 bytes. The server rotates eligible nodes in round_robin mode and may retry safe reads after a proxy connection failure; fixed mode stays on the selected node. Exhausted pools stop requests; no direct fallback. Inspect network_status for routing strategy, health and coverage."
 }
 
 func (t *taskProxyFetch) Call(ctx context.Context, input json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {

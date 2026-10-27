@@ -42,23 +42,32 @@ type Release struct {
 
 // Asset 是 Release 上挂的一个文件。
 type Asset struct {
-	Name string `json:"name"`
-	URL  string `json:"browser_download_url"`
-	Size int64  `json:"size"`
+	ID     int64  `json:"id"`
+	Name   string `json:"name"`
+	URL    string `json:"browser_download_url"`
+	Size   int64  `json:"size"`
+	Digest string `json:"digest"`
 }
 
-// NewClient 构造一个只认 GitHub 域名的 HTTP 客户端。proxy 为空则直连。
+// NewClient constructs a GitHub-only HTTP client. An explicit proxy takes
+// precedence; otherwise standard HTTPS_PROXY/NO_PROXY settings apply.
 //
 // 刻意不复用默认 Transport：升级链路必须强制走 TLS 且校验证书，不能被别处
 // 设置的 InsecureSkipVerify 之类影响到。
 func NewClient(proxy string) *http.Client {
 	tr := &http.Transport{
-		ForceAttemptHTTP2:   true,
-		TLSHandshakeTimeout: 15 * time.Second,
+		ForceAttemptHTTP2:     true,
+		TLSHandshakeTimeout:   25 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		Proxy:                 http.ProxyFromEnvironment,
 	}
 	if p := strings.TrimSpace(proxy); p != "" {
-		if pu, err := url.Parse(p); err == nil {
+		if pu, err := url.Parse(p); err == nil && pu.Host != "" {
 			tr.Proxy = http.ProxyURL(pu)
+		} else {
+			tr.Proxy = func(*http.Request) (*url.URL, error) {
+				return nil, fmt.Errorf("更新代理地址无效，请检查系统设置")
+			}
 		}
 	}
 	return &http.Client{

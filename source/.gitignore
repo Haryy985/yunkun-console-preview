@@ -42,12 +42,14 @@ web/next-env.d.ts
 /docs/*
 !/docs/README.md
 !/docs/OFFLINE_UPDATE.md
+!/docs/OFFLINE_UNIX.txt
 !/docs/DEPLOYMENT.md
 !/docs/WINDOWS.md
 !/docs/agent-reliability-2026-10-16.md
 !/docs/RELEASE_1.0.3.md
 !/docs/RELEASE_1.0.3_ACCEPTANCE.md
 !/docs/RELEASE_1.1.0.md
+!/docs/RELEASE_1.1.2.md
 !/docs/AGENT_SKILL_GO_PORT.md
 !/docs/upstream-README.md
 !/docs/ui-layout-review/

@@ -17,9 +17,9 @@ func (i transactionTestInstance) healthy(v string, p bool) error { return i.chec
 func (i transactionTestInstance) stop() error                    { return i.shutdown() }
 
 func TestOfflineUpdateTransactionFaultRecovery(t *testing.T) {
-	for _, stage := range []string{"success", "backup", "install", "probe", "normal", "stop", "recovery"} {
+	for _, stage := range []string{"success", "backup", "install", "probe", "normal", "stop", "recovery", "launch-probe", "launch-normal", "restore", "completed-state"} {
 		t.Run(stage, func(t *testing.T) {
-			root := t.TempDir()
+			root := offlineTestRoot(t)
 			work := filepath.Join(root, ".yunkun-local", "updates", "fixture")
 			job := offlineJob{OfflineInstall: OfflineInstall{Root: root}, Work: work, From: "v1.1.0-offline", To: "v1.1.1-offline"}
 			write := func(rel, value string) {
@@ -43,6 +43,11 @@ func TestOfflineUpdateTransactionFaultRecovery(t *testing.T) {
 			write("bin/yunkun", "old-program")
 			write(".yunkun-local/postgres-data/record", "old-data")
 			write("bin/jwt.key", "original-key")
+			write("bin/proxy-pool.key", "original-pool-key")
+			write(".yunkun-local/config.json", "original-config")
+			if err := os.MkdirAll(filepath.Join(root, ".yunkun-local", "postgres-data", "empty-required"), 0700); err != nil {
+				t.Fatal(err)
+			}
 			write("skills/custom/SKILL.md", "user-skill")
 			b, _ := json.Marshal(job)
 			write(".yunkun-local/updates/fixture/job.json", string(b))
@@ -51,7 +56,13 @@ func TestOfflineUpdateTransactionFaultRecovery(t *testing.T) {
 			path := filepath.Join(work, "job.json")
 			lastPhase := ""
 			stopped, restored := true, false
-			txn := offlineTransaction{job: job, state: func(phase, message string, err error) error { lastPhase = phase; return nil }}
+			txn := offlineTransaction{job: job, state: func(phase, message string, err error) error {
+				lastPhase = phase
+				if phase == "completed" && stage == "completed-state" {
+					return errors.New("injected final state write failure")
+				}
+				return nil
+			}}
 			txn.files = func(op string) error {
 				if op == stage {
 					if op == "install" {
@@ -69,6 +80,10 @@ func TestOfflineUpdateTransactionFaultRecovery(t *testing.T) {
 			}
 			txn.launch = func(probe bool) (offlineInstance, error) {
 				program := read("bin/yunkun")
+				if program == "new-program" &&
+					((probe && stage == "launch-probe") || (!probe && stage == "launch-normal")) {
+					return nil, errors.New("injected launcher exec failure")
+				}
 				stopped = false
 				return transactionTestInstance{
 					check: func(version string, expectedProbe bool) error {
@@ -80,7 +95,7 @@ func TestOfflineUpdateTransactionFaultRecovery(t *testing.T) {
 								t.Fatal("new program checked as old")
 							}
 							write(".yunkun-local/postgres-data/record", "migrated-data")
-							if (probe && (stage == "probe" || stage == "recovery")) || (!probe && stage == "normal") {
+							if (probe && (stage == "probe" || stage == "recovery" || stage == "restore")) || (!probe && stage == "normal") {
 								return errors.New("injected startup failure")
 							}
 						} else if program != "old-program" || version != job.From {
@@ -109,7 +124,7 @@ func TestOfflineUpdateTransactionFaultRecovery(t *testing.T) {
 				if lastPhase != "completed" || read("bin/yunkun") != "new-program" || read(".yunkun-local/postgres-data/record") != "migrated-data" {
 					t.Fatal("success state incomplete")
 				}
-			case "stop", "recovery":
+			case "stop", "recovery", "restore":
 				if lastPhase != "recovery_required" {
 					t.Fatal("unsafe recovery was not stopped")
 				}
@@ -125,8 +140,15 @@ func TestOfflineUpdateTransactionFaultRecovery(t *testing.T) {
 					t.Fatal("matching program and data not recovered")
 				}
 			}
-			if read("bin/jwt.key") != "original-key" || read("skills/custom/SKILL.md") != "user-skill" {
-				t.Fatal("user key or Skill was changed")
+			if read("bin/jwt.key") != "original-key" || read("skills/custom/SKILL.md") != "user-skill" ||
+				read("bin/proxy-pool.key") != "original-pool-key" || read(".yunkun-local/config.json") != "original-config" {
+				t.Fatal("user keys, config or Skill were changed")
+			}
+			if info, err := os.Stat(filepath.Join(root, ".yunkun-local", "postgres-data", "empty-required")); err != nil || !info.IsDir() {
+				t.Fatal("required empty database directory was lost")
+			}
+			if _, err := os.Stat(filepath.Join(work, "backup", ".yunkun-local", "updates")); !os.IsNotExist(err) {
+				t.Fatal("backup recursively included its own updates directory")
 			}
 		})
 	}

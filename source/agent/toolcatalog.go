@@ -34,18 +34,20 @@ type ToolSeed struct {
 func builtinToolsByAgent() map[string][]actool.CoreTool {
 	ts := NewToolSet(nil, "")
 	return map[string][]actool.CoreTool{
-		"mainagent": ts.MainAgentTools(),
-		"planner":   ts.PlannerTools(),
-		"worker":    ts.WorkerTools(),
+		// The empty directory is only used to seed metadata; each run binds
+		// the real tool to its own session or intent directory.
+		"mainagent": append(ts.MainAgentTools(), taskCacheTool("")),
+		"planner":   append(ts.PlannerTools(), taskCacheTool("")),
+		"worker":    append(ts.WorkerTools(), taskCacheTool("")),
 		// goals（目标拆解器）默认绑 set_goals + set_constraints：靠它们把拆出的目标、
 		// 抽出的操作约束写进库。与 mainagent 共用同一受管工具，web 端可改描述/schema、按 agent 勾选。
 		"goals": {ts.setGoals(), ts.setConstraints()},
 		// auto 默认绑漏洞上报 + 资产管理工具，其他域工具可在 UI 按需勾选。
 		// 新库由此 seed 写入；老库由 seedAutoDefaultBindings 迁移。
-		"auto": {ts.addFinding(), ts.insertAssets(), ts.addCompanyScope(), ts.listAssets(), ts.listCompanies()},
+		"auto": {ts.addFinding(), ts.insertAssets(), ts.addCompanyScope(), ts.listAssets(), ts.listCompanies(), taskCacheTool("")},
 		// pentest（独立渗透 agent）默认绑：查资产 / 插资产 / 报漏洞 / 查漏洞 / 查企业。
 		// 新库由此 seed 写入；老库由 seedPentestDefaultBindings 迁移。
-		"pentest": {ts.listAssets(), ts.insertAssets(), ts.addFinding(), ts.listFindings(), ts.listCompanies(), ts.getTargetProfile(), ts.analyzeWebSurface(), ts.assetIntelSearch(), ts.threatBookLookup()},
+		"pentest": {ts.listAssets(), ts.insertAssets(), ts.addFinding(), ts.listFindings(), ts.listCompanies(), ts.getTargetProfile(), ts.analyzeWebSurface(), ts.assetIntelSearch(), ts.threatBookLookup(), taskCacheTool("")},
 	}
 }
 

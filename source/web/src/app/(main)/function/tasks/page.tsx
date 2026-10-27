@@ -3266,6 +3266,7 @@ function CreateTaskSheet({
   const [knowledgeBaseIDs, setKnowledgeBaseIDs] = React.useState<number[]>([]);
   const [proxyPoolID, setProxyPoolID] = React.useState<number>();
   const [proxyNodeID, setProxyNodeID] = React.useState<number>();
+  const [proxySelectionValid, setProxySelectionValid] = React.useState(true);
   const [llmProfileIDs, setLLMProfileIDs] = React.useState<string[]>([]);
   const [creating, setCreating] = React.useState(false);
   const [timeoutMin, setTimeoutMin] = React.useState(""); // 任务级超时(分钟);空/0 = 不限时
@@ -3319,6 +3320,10 @@ function CreateTaskSheet({
   }
 
   async function createTask() {
+    if (!proxySelectionValid) {
+      toast.error("请选择当前代理池的可用固定节点");
+      return;
+    }
     if (!description.trim() || !goal.trim()) {
       toast.error("请填写描述与目标");
       return;
@@ -3516,6 +3521,7 @@ function CreateTaskSheet({
                   if (!value) setProxyNodeID(undefined);
                 }}
                 onNodeChange={setProxyNodeID}
+                onValidityChange={setProxySelectionValid}
               />
             </Field>
             <Field>
@@ -3623,7 +3629,7 @@ function CreateTaskSheet({
           <SheetClose asChild>
             <Button variant="outline">取消</Button>
           </SheetClose>
-          <Button onClick={createTask} disabled={creating || uploading}>
+          <Button onClick={createTask} disabled={creating || uploading || !proxySelectionValid}>
             {creating && <Spinner data-icon="inline-start" />}
             {creating ? "创建中" : "创建"}
           </Button>

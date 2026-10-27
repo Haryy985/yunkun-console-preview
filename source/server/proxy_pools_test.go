@@ -325,7 +325,9 @@ func TestProxyProviderRateLimitAndExpirySnapshot(t *testing.T) {
 	if err := s.m.pg.StoreProxyNodes(id, nodes); err != nil {
 		t.Fatal(err)
 	}
-	task, err := s.m.pg.CreateTaskWithOptions("expiry", "test", db.TaskCreateOptions{ProxyPoolID: &id})
+	// Expiry snapshots belong to explicit pins. Round-robin tasks acquire
+	// a fresh eligible node lease on each request.
+	task, err := s.m.pg.CreateTaskWithOptions("expiry", "test", db.TaskCreateOptions{ProxyPoolID: &id, ProxyNodeID: &nodes[0].ID})
 	if err != nil {
 		t.Fatal(err)
 	}

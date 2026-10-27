@@ -1,0 +1,90 @@
+name: offline-unix-acceptance
+
+# Read-only acceptance. Running it never creates a release or updates a client.
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: source
+    shell: bash
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-amd64
+            sha256: 99df6361d855115f3c32d9fb3959e328283580ca6fa1d2024b56adddeea177d3
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+            sha256: 805580baf3b9a7f0997ae4e272311063b3056252324c7800b486df62adcd5e83
+          - runner: macos-15
+            platform: darwin-arm64
+            sha256: 720fe433a5d00ccba53437cb691c7b7caebab076d8e1ab01d03ed987589c14e0
+          - runner: macos-15-intel
+            platform: darwin-amd64
+            sha256: 792c41d08b65cc7c8ebfe16bccaf38cd2165a865cc7a55cb5b6a46181ca10d66
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: source/go.mod
+          cache-dependency-path: source/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: source/web/package-lock.json
+      - name: Verify native runner
+        env:
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+        run: |
+          test "$(go env GOOS)-$(go env GOARCH)" = "$EXPECTED_PLATFORM"
+          test "$(id -u)" != 0
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        working-directory: source/web
+      - run: npm run build:static
+        working-directory: source/web
+      - name: Embed current reviewed frontend
+        run: |
+          mkdir -p server/webui/current
+          cp -R web/out/. server/webui/current/
+      - name: Fetch a clean published runtime fixture
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          gh release download v1.1.0-offline --repo Haryy985/yunkun-console-preview \
+            --pattern "yunkun-1.1.0-offline-$PLATFORM.zip" \
+            --dir "$RUNNER_TEMP/yunkun-base"
+      - name: Native install, update and failure rollback
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          BASE_SHA256: ${{ matrix.sha256 }}
+        run: |
+          ASSET="yunkun-1.1.0-offline-$PLATFORM.zip"
+          python3 tests/run-unix-update-acceptance.py \
+            --package "$RUNNER_TEMP/yunkun-base/$ASSET" --sha256 "$BASE_SHA256" \
+            --output "$RUNNER_TEMP/yunkun-native-result"
+      - name: Upload non-secret acceptance results only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-acceptance-${{ matrix.platform }}
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/yunkun-native-result/acceptance.json
+            ${{ runner.temp }}/yunkun-native-result/source-sha256.json
+            ${{ runner.temp }}/yunkun-native-result/fresh-install.json
+            ${{ runner.temp }}/yunkun-native-result/upgrade-rollback.json

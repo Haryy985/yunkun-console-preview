@@ -1,6 +1,8 @@
 package selfupdate
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -208,16 +210,14 @@ func copyVerifiedFile(src, dst string, mode fs.FileMode) error {
 		out.Close()
 		return err
 	}
-	_, copyErr := io.Copy(out, in)
+	sourceHash := sha256.New()
+	_, copyErr := io.Copy(io.MultiWriter(out, sourceHash), in)
 	syncErr := out.Sync()
 	closeErr := out.Close()
 	if err := errors.Join(copyErr, syncErr, closeErr); err != nil {
 		return err
 	}
-	a, err := fileSHA256(src)
-	if err != nil {
-		return err
-	}
+	a := hex.EncodeToString(sourceHash.Sum(nil))
 	b, err := fileSHA256(out.Name())
 	if err != nil || a != b {
 		return fmt.Errorf("file verification failed: %s", dst)

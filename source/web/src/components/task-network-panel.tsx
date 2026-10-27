@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { FileTextIcon, RefreshCwIcon } from "lucide-react";
+import { FileTextIcon, RefreshCwIcon, SaveIcon } from "lucide-react";
 import { api } from "@/lib/api";
 import type { TaskNetwork, ProxyEvent } from "@/lib/proxy-pool-types";
 import { Button } from "@/components/ui/button";
@@ -53,10 +53,15 @@ export function TaskNetworkPanel({ taskID, canReassign = false }: { taskID: stri
   const [data, setData] = React.useState<TaskNetwork | null>(null);
   const [error, setError] = React.useState("");
   const [loading, setLoading] = React.useState(false);
+  const [strategy, setStrategy] = React.useState<"round_robin" | "fixed">("round_robin");
+  const [nodeID, setNodeID] = React.useState("");
   const load = React.useCallback(async () => {
     setLoading(true);
     try {
-      setData(await api.taskNetwork(taskID));
+      const next = await api.taskNetwork(taskID);
+      setData(next);
+      setStrategy(next.binding?.strategy ?? "round_robin");
+      setNodeID(next.binding?.node_id ? String(next.binding.node_id) : "");
       setError("");
     } catch (e) {
       setError((e as Error).message);
@@ -98,10 +103,10 @@ export function TaskNetworkPanel({ taskID, canReassign = false }: { taskID: stri
             </div>
             <div>
               <dt className="text-muted-foreground">模式</dt>
-              <dd className="mt-1">配置模式 · 未强制隔离</dd>
+              <dd className="mt-1">{data.routing_strategy === "fixed" ? "手动固定节点" : "自动轮询"}</dd>
             </div>
             <div>
-              <dt className="text-muted-foreground">节点</dt>
+              <dt className="text-muted-foreground">{data.routing_strategy === "fixed" ? "固定节点" : "下一可用节点（快照）"}</dt>
               <dd className="mt-1 break-all">{data.node?.address ?? "-"}</dd>
             </div>
             <div>
@@ -114,7 +119,35 @@ export function TaskNetworkPanel({ taskID, canReassign = false }: { taskID: stri
               {data.reason}
             </p>
           )}
-          {canReassign && (user.role === "admin" || user.role === "operator") && (
+          {user.role === "admin" && (
+            <div className="flex flex-wrap items-center gap-3">
+              <select aria-label="代理调度策略" className="h-9 rounded border bg-background px-2 text-sm"
+                disabled={loading || !canReassign} value={strategy}
+                onChange={(e) => setStrategy(e.target.value as "round_robin" | "fixed")}>
+                <option value="round_robin">自动轮询（默认）</option>
+                <option value="fixed">手动固定节点</option>
+              </select>
+              {strategy === "fixed" && (
+                <input aria-label="固定节点 ID" type="number" min="1" placeholder="节点 ID"
+                  className="h-9 w-36 rounded border bg-background px-2 text-sm"
+                  disabled={loading || !canReassign} value={nodeID} onChange={(e) => setNodeID(e.target.value)} />
+              )}
+              <Button variant="outline" disabled={loading || !canReassign || (strategy === "fixed" && (!Number.isSafeInteger(Number(nodeID)) || Number(nodeID) <= 0))}
+                title={canReassign ? "保存调度策略" : "请先暂停任务"}
+                onClick={async () => {
+                  setLoading(true);
+                  try {
+                    await api.setTaskProxyRouting(taskID, strategy, strategy === "fixed" ? Number(nodeID) : undefined);
+                    toast.success("代理调度策略已保存");
+                    await load();
+                  } catch (e) { toast.error((e as Error).message); }
+                  finally { setLoading(false); }
+                }}>
+                <SaveIcon className="size-4" />保存策略
+              </Button>
+            </div>
+          )}
+          {canReassign && user.role === "admin" && data.routing_strategy === "fixed" && (
             <Button
               variant="outline"
               disabled={loading}

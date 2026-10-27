@@ -5,12 +5,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -63,7 +66,7 @@ func Stage(ctx context.Context, c *http.Client, rel *Release, currentVersion str
 	}
 
 	prog(PhaseDownload, 0, "获取校验和清单…")
-	sums, err := fetchSums(ctx, c, rel)
+	sums, err := fetchSums(ctx, c, rel, prog)
 	if err != nil {
 		return err
 	}
@@ -128,7 +131,7 @@ func Stage(ctx context.Context, c *http.Client, rel *Release, currentVersion str
 }
 
 // fetchSums 下载并解析 SHA256SUMS，返回 文件名 → 十六进制摘要。
-func fetchSums(ctx context.Context, c *http.Client, rel *Release) (map[string]string, error) {
+func fetchSums(ctx context.Context, c *http.Client, rel *Release, prog Progress) (map[string]string, error) {
 	asset, ok := rel.FindAsset(sumsAsset)
 	if !ok {
 		asset, ok = rel.FindAsset("SHA256SUMS.txt")
@@ -136,21 +139,71 @@ func fetchSums(ctx context.Context, c *http.Client, rel *Release) (map[string]st
 			return nil, fmt.Errorf("该 Release 没有 %s，无法校验完整性，拒绝升级", sumsAsset)
 		}
 	}
-	body, err := get(ctx, c, asset.URL)
-	if err != nil {
-		return nil, fmt.Errorf("下载 %s: %w", sumsAsset, err)
+	if asset.Size > 1<<20 {
+		return nil, fmt.Errorf("%s 超过大小限制", sumsAsset)
 	}
-	defer body.Close()
-
-	raw, err := io.ReadAll(io.LimitReader(body, 1<<20))
-	if err != nil {
-		return nil, fmt.Errorf("读取 %s: %w", sumsAsset, err)
+	// The API asset route avoids an extra TLS connection to github.com on
+	// networks where the release-page host is unreliable. GitHub redirects
+	// this route only to its release-assets host, still subject to checkURL.
+	urls := []string{}
+	if asset.ID > 0 {
+		urls = append(urls, "https://api.github.com/repos/"+Repo+"/releases/assets/"+strconv.FormatInt(asset.ID, 10))
 	}
-	out := parseSums(string(raw))
-	if len(out) == 0 {
-		return nil, fmt.Errorf("%s 内容为空或格式无法识别", sumsAsset)
+	urls = append(urls, asset.URL)
+	var lastErr error
+	for _, rawURL := range urls {
+		attempts := 2
+		if len(urls) > 1 && rawURL == urls[len(urls)-1] {
+			attempts = 1
+		}
+		for attempt := 1; attempt <= attempts; attempt++ {
+			attemptCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			headers := http.Header{}
+			if strings.HasPrefix(rawURL, "https://api.github.com/") {
+				headers.Set("Accept", "application/octet-stream")
+			}
+			resp, err := getResponse(attemptCtx, c, rawURL, headers)
+			if err == nil {
+				var raw []byte
+				raw, err = io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+				_ = resp.Body.Close()
+				if err == nil {
+					switch {
+					case len(raw) > 1<<20:
+						err = fmt.Errorf("%s 超过大小限制", sumsAsset)
+					case asset.Size > 0 && int64(len(raw)) != asset.Size:
+						err = fmt.Errorf("%s 长度不符", sumsAsset)
+					case asset.Digest != "" && !strings.EqualFold(asset.Digest, "sha256:"+fmt.Sprintf("%x", sha256.Sum256(raw))):
+						err = fmt.Errorf("%s 摘要不符", sumsAsset)
+					default:
+						if sums := parseSums(string(raw)); len(sums) > 0 {
+							cancel()
+							return sums, nil
+						}
+						err = fmt.Errorf("%s 内容为空或格式无法识别", sumsAsset)
+					}
+				}
+			}
+			cancel()
+			lastErr = err
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if attempt == attempts || !retryableFetch(err) {
+				break
+			}
+			if prog != nil {
+				prog(PhaseDownload, 0, fmt.Sprintf("校验清单连接失败，正在重试（%d/%d）", attempt+1, attempts))
+			}
+			if err := waitRetry(ctx, attempt); err != nil {
+				return nil, err
+			}
+		}
+		if prog != nil && rawURL != urls[len(urls)-1] {
+			prog(PhaseDownload, 0, "校验清单 API 不可用，尝试发布附件地址")
+		}
 	}
-	return out, nil
+	return nil, fmt.Errorf("下载 %s 失败（已尝试 GitHub API 和发布附件，检查服务器网络或系统代理）: %w", sumsAsset, lastErr)
 }
 
 // parseSums 解析 sha256sum 风格的清单，返回 文件名 → 十六进制摘要。
@@ -192,12 +245,12 @@ func isHexSHA256(s string) bool {
 
 // download 把资产写入 dst，同时计算 SHA256 并按 Content-Length 汇报进度。
 func download(ctx context.Context, c *http.Client, a Asset, dst string, prog Progress) (string, error) {
-	body, err := get(ctx, c, a.URL)
-	if err != nil {
-		return "", fmt.Errorf("下载 %s: %w", a.Name, err)
+	if prog == nil {
+		prog = func(Phase, int, string) {}
 	}
-	defer body.Close()
-
+	if a.Size <= 0 || a.Size > maxOfflineZip {
+		return "", fmt.Errorf("发布包大小无效或超限")
+	}
 	f, err := os.Create(dst)
 	if err != nil {
 		return "", fmt.Errorf("创建临时文件: %w", err)
@@ -206,11 +259,75 @@ func download(ctx context.Context, c *http.Client, a Asset, dst string, prog Pro
 
 	h := sha256.New()
 	pw := &progressWriter{total: a.Size, prog: prog, name: a.Name, last: time.Now()}
-	if a.Size <= 0 || a.Size > maxOfflineZip {
-		return "", fmt.Errorf("发布包大小无效或超限")
-	}
-	if _, err := io.Copy(io.MultiWriter(f, h, pw), io.LimitReader(body, a.Size+1)); err != nil {
-		return "", fmt.Errorf("下载中断: %w", err)
+	urls := assetURLs(a)
+	for attempt := 1; attempt <= 4 && pw.written < a.Size; attempt++ {
+		headers := http.Header{}
+		offset := pw.written
+		if offset > 0 {
+			headers.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+		}
+		rawURL := urls[0]
+		if attempt > 2 && len(urls) > 1 {
+			rawURL = urls[1]
+		}
+		if strings.HasPrefix(rawURL, "https://api.github.com/") {
+			headers.Set("Accept", "application/octet-stream")
+		}
+		resp, err := getResponse(ctx, c, rawURL, headers)
+		if err != nil {
+			if ctx.Err() == nil && !retryableFetch(err) && len(urls) > 1 && rawURL == urls[0] {
+				attempt = 2 // The API asset endpoint is unavailable; try the browser URL.
+				continue
+			}
+			if ctx.Err() != nil || !retryableFetch(err) || attempt == 4 {
+				return "", fmt.Errorf("下载 %s: %w", a.Name, err)
+			}
+		} else {
+			if strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") &&
+				rawURL == urls[0] && len(urls) > 1 {
+				resp.Body.Close()
+				attempt = 2 // API served metadata instead of bytes; use browser URL.
+				continue
+			}
+			if strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") ||
+				(offset == 0 && resp.StatusCode != http.StatusOK) {
+				resp.Body.Close()
+				return "", fmt.Errorf("%s 返回了非完整发布包，拒绝安装", a.Name)
+			}
+			if offset > 0 && (resp.StatusCode != http.StatusPartialContent ||
+				!validContentRange(resp.Header.Get("Content-Range"), offset, a.Size)) {
+				resp.Body.Close()
+				return "", fmt.Errorf("%s 的服务器未正确支持断点续传，保留旧版本；请检查网络后重试", a.Name)
+			}
+			// A stalled body must not hold the upgrade open for the client's
+			// 30-minute whole-request timeout. Each successful write resets it.
+			stall := time.AfterFunc(45*time.Second, func() { _ = resp.Body.Close() })
+			pw.onWrite = func() { stall.Reset(45 * time.Second) }
+			_, err = io.Copy(io.MultiWriter(f, h, pw), io.LimitReader(resp.Body, a.Size-offset+1))
+			pw.onWrite = nil
+			stall.Stop()
+			resp.Body.Close()
+			if err == nil && pw.written > a.Size {
+				return "", fmt.Errorf("下载内容超过发布包大小")
+			}
+			if err == nil && pw.written < a.Size {
+				err = io.ErrUnexpectedEOF
+			}
+			if err == nil {
+				break
+			}
+			var fileErr *os.PathError
+			if errors.As(err, &fileErr) {
+				return "", fmt.Errorf("写入更新包失败: %w", err)
+			}
+			if ctx.Err() != nil || attempt == 4 {
+				return "", fmt.Errorf("下载中断: %w", err)
+			}
+		}
+		prog(PhaseDownload, int(pw.written*100/a.Size), fmt.Sprintf("网络中断，保留已下载的 %s，准备续传（%d/4）", humanSize(pw.written), attempt+1))
+		if err := waitRetry(ctx, attempt); err != nil {
+			return "", err
+		}
 	}
 	if err := f.Sync(); err != nil {
 		return "", fmt.Errorf("落盘失败: %w", err)
@@ -221,8 +338,18 @@ func download(ctx context.Context, c *http.Client, a Asset, dst string, prog Pro
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+func assetURLs(a Asset) []string {
+	if a.ID > 0 {
+		return []string{
+			"https://api.github.com/repos/" + Repo + "/releases/assets/" + strconv.FormatInt(a.ID, 10),
+			a.URL,
+		}
+	}
+	return []string{a.URL}
+}
+
 // get 发起一个受白名单约束的 GET，返回响应体。
-func get(ctx context.Context, c *http.Client, rawURL string) (io.ReadCloser, error) {
+func getResponse(ctx context.Context, c *http.Client, rawURL string, headers http.Header) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
@@ -230,16 +357,50 @@ func get(ctx context.Context, c *http.Client, rawURL string) (io.ReadCloser, err
 	if err := checkURL(req.URL); err != nil {
 		return nil, err
 	}
+	req.Header = headers
 	req.Header.Set("User-Agent", "yunkun-selfupdate")
 	resp, err := c.Do(req)
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		resp.Body.Close()
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		return nil, fetchStatusError(resp.StatusCode)
 	}
-	return resp.Body, nil
+	return resp, nil
+}
+
+type fetchStatusError int
+
+func (s fetchStatusError) Error() string { return fmt.Sprintf("HTTP %d", s) }
+
+func retryableFetch(err error) bool {
+	var status fetchStatusError
+	if errors.As(err, &status) {
+		return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) || errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+func waitRetry(ctx context.Context, attempt int) error {
+	timer := time.NewTimer(time.Duration(attempt) * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func validContentRange(value string, start, total int64) bool {
+	var first, last, size int64
+	if n, _ := fmt.Sscanf(value, "bytes %d-%d/%d", &first, &last, &size); n != 3 {
+		return false
+	}
+	return value == fmt.Sprintf("bytes %d-%d/%d", first, last, size) &&
+		first == start && last >= first && last < total && size == total
 }
 
 // extractBinary 从发布包里取出 artex 可执行文件。
@@ -308,10 +469,14 @@ type progressWriter struct {
 	name    string
 	prog    Progress
 	last    time.Time
+	onWrite func()
 }
 
 func (w *progressWriter) Write(b []byte) (int, error) {
 	w.written += int64(len(b))
+	if w.onWrite != nil {
+		w.onWrite()
+	}
 	if time.Since(w.last) < 300*time.Millisecond {
 		return len(b), nil
 	}

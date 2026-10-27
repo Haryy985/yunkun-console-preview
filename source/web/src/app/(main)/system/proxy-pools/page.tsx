@@ -102,6 +102,8 @@ function verificationLabel(node: ProxyNode) {
 }
 
 function nodeStatus(node: ProxyNode, warningSeconds: number) {
+  if (node.enabled && node.runtime_cooldown_until && new Date(node.runtime_cooldown_until).getTime() > Date.now())
+    return { label: "故障冷却", className: "text-destructive" };
   if (!node.enabled || node.deleted_at) return { label: "已停用", className: "text-muted-foreground" };
   if (
     node.expires_at &&
@@ -141,6 +143,7 @@ export default function ProxyPoolsPage() {
   const [addresses, setAddresses] = React.useState("");
   const [secrets, setSecrets] = React.useState<ProxySecrets>({});
   const [replaceSecrets, setReplaceSecrets] = React.useState(false);
+  const [recoverNoAuth, setRecoverNoAuth] = React.useState(false);
   const [deleting, setDeleting] = React.useState<ProxyPool | null>(null);
   const [nodeQuery, setNodeQuery] = React.useState("");
   const [selectedNodeIDs, setSelectedNodeIDs] = React.useState<number[]>([]);
@@ -159,6 +162,10 @@ export default function ProxyPoolsPage() {
   const [nodeSort, setNodeSort] = React.useState("newest");
   const [search, setSearch] = React.useState("");
   const [detailLoading, setDetailLoading] = React.useState(false);
+  const [nodesLoaded, setNodesLoaded] = React.useState(false);
+  const [detailError, setDetailError] = React.useState("");
+  const [eventsError, setEventsError] = React.useState("");
+  const [importError, setImportError] = React.useState("");
   const [verifyMode, setVerifyMode] = React.useState<ProxyVerificationMode>("connectivity");
   const [verifyingIDs, setVerifyingIDs] = React.useState<number[]>([]);
   const [verification, setVerification] = React.useState<{
@@ -176,6 +183,8 @@ export default function ProxyPoolsPage() {
   const detailRequest = React.useRef(0);
   const previousPool = React.useRef(selected);
   const current = pools.find((p) => p.id === selected);
+  const credentialsUnavailable = current?.credentials_available === false;
+  const editingCredentialsUnavailable = pools.find((p) => p.id === editing)?.credentials_available === false;
 
   React.useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -221,15 +230,20 @@ export default function ProxyPoolsPage() {
         setNodes(n.value.nodes);
         setSummary(n.value.summary);
         setNodeTotal(n.value.total);
+        setNodesLoaded(true);
+        setDetailError("");
       } else {
         setNodes([]);
         setNodeTotal(0);
-        toast.error(n.reason.message);
+        setNodesLoaded(false);
+        setDetailError(n.reason?.message || "节点读取失败");
       }
-      if (e.status === "fulfilled") setEvents(e.value.events);
-      else {
+      if (e.status === "fulfilled") {
+        setEvents(e.value.events);
+        setEventsError("");
+      } else {
         setEvents([]);
-        toast.error(e.reason.message);
+        setEventsError(e.reason?.message || "使用记录读取失败");
       }
     },
     [nodePage, nodePageSize, search, nodeStatusFilter, nodeProtocol, nodeSort],
@@ -239,23 +253,32 @@ export default function ProxyPoolsPage() {
     if (!selected || !admin) return;
     let canceled = false;
     let previous = 0;
+    let failures = 0;
     let timer: ReturnType<typeof setTimeout>;
     setImportPending(0);
+    setImportError("");
     const poll = async () => {
       try {
         const status = await api.proxyImportStatus(selected);
         if (canceled) return;
+        failures = 0;
+        setImportError("");
         setImportPending(status.pending);
         if (status.pending > 0 || previous > 0) await loadDetail(selected);
         previous = status.pending;
-      } catch {
-        // Normal page loading reports connection errors.
+      } catch (e) {
+        if (canceled) return;
+        failures++;
+        setImportError((e as Error).message || "导入验证状态读取失败");
       } finally {
-        if (!canceled) timer = setTimeout(poll, 2000);
+        if (!canceled) timer = setTimeout(poll, Math.min(30000, 2000 * 2 ** Math.min(failures, 4)));
       }
     };
     void poll();
-    return () => { canceled = true; clearTimeout(timer); };
+    return () => {
+      canceled = true;
+      clearTimeout(timer);
+    };
   }, [selected, admin, loadDetail]);
   React.useEffect(() => {
     void load();
@@ -289,6 +312,9 @@ export default function ProxyPoolsPage() {
     if (previousPool.current === selected) return;
     previousPool.current = selected;
     setNodes([]);
+    setNodesLoaded(false);
+    setDetailError("");
+    setEventsError("");
     setSelectedNodeIDs([]);
     setNodePage(1);
     setNodeTotal(0);
@@ -309,6 +335,7 @@ export default function ProxyPoolsPage() {
     setAddresses(p?.config.addresses?.join("\n") ?? "");
     setSecrets({});
     setReplaceSecrets(!p);
+    setRecoverNoAuth(false);
     setOpen(true);
   }
   async function action(run: () => Promise<unknown>, success: string) {
@@ -326,8 +353,22 @@ export default function ProxyPoolsPage() {
   }
   async function save(e: React.FormEvent) {
     e.preventDefault();
+    if (editingCredentialsUnavailable && !replaceSecrets) {
+      toast.error("原代理池凭据不可读，请先恢复原密钥，或勾选替换整组凭据");
+      return;
+    }
     setBusy(true);
     try {
+      if (editingCredentialsUnavailable && editing) {
+        await api.recoverProxyCredentials(editing, recoverNoAuth ? {} : secrets, recoverNoAuth);
+        setOpen(false);
+        setSecrets({});
+        await load();
+        await loadDetail(editing);
+        setDiscoveryRefresh((value) => value + 1);
+        toast.success("凭据已恢复，节点已保留；请重新验证并启用");
+        return;
+      }
       const c = {
         ...config,
         addresses: addresses
@@ -340,6 +381,7 @@ export default function ProxyPoolsPage() {
       setSecrets({});
       await load();
       setSelected(result.id);
+      await loadDetail(result.id);
       setDiscoveryRefresh((value) => value + 1);
       toast.success("代理来源已保存");
     } catch (e) {
@@ -561,6 +603,16 @@ export default function ProxyPoolsPage() {
           {error}
         </p>
       )}
+      {credentialsUnavailable && (
+        <div role="alert" className="flex flex-wrap items-center gap-3 border-l-2 border-destructive px-3 py-2 text-sm">
+          <p className="min-w-0 flex-1 text-destructive">
+            当前代理池凭据不可解密。节点数据仍保留，但验证和出网已阻止；这不是 FOFA / Quake 发现来源的 API Key。
+          </p>
+          <Button variant="outline" disabled={busy} onClick={() => edit(current)}>
+            编辑代理池凭据
+          </Button>
+        </div>
+      )}
       <Tabs
         value={mainView}
         onValueChange={(view) => {
@@ -589,6 +641,7 @@ export default function ProxyPoolsPage() {
       {mainView === "discovery" && admin ? (
         <ProxyDiscoveryPanel
           refreshKey={discoveryRefresh}
+          preferredPoolID={selected}
           onCreatePool={() => edit()}
           onOpenPool={(id) => {
             setSelected(id);
@@ -636,7 +689,7 @@ export default function ProxyPoolsPage() {
                   <Icon className={`size-4 ${color}`} />
                   <span className="whitespace-nowrap text-muted-foreground text-xs">{label}</span>
                 </div>
-                <p className="font-semibold text-lg tabular-nums">{value}</p>
+                <p className="font-semibold text-lg tabular-nums">{nodesLoaded ? value : "-"}</p>
               </div>
             ))}
           </section>
@@ -666,7 +719,10 @@ export default function ProxyPoolsPage() {
                       </button>
                     </td>
                     <td className="whitespace-nowrap p-3">{kinds[p.config.kind]}</td>
-                    <td className="p-3">{p.config.enabled ? "启用" : "禁用"}</td>
+                    <td className="p-3">
+                      {p.config.enabled ? "启用" : "禁用"}
+                      {p.credentials_available === false && <p className="text-destructive text-xs">凭据不可解密</p>}
+                    </td>
                     <td
                       className={`p-3 ${!p.quota.error && p.quota.remaining !== undefined && p.quota.remaining <= p.config.low_quota ? "text-amber-700 dark:text-amber-400" : ""}`}
                     >
@@ -770,7 +826,13 @@ export default function ProxyPoolsPage() {
                       <option value="exit_ip">出口 IP · IP 回显接口</option>
                     </select>
                     <Button
-                      disabled={busy || detailLoading || !current.config.enabled || pagedNodes.length === 0}
+                      disabled={
+                        busy ||
+                        detailLoading ||
+                        credentialsUnavailable ||
+                        !current.config.enabled ||
+                        pagedNodes.length === 0
+                      }
                       onClick={() => void verifyNodes(pagedNodes.map((node) => node.id))}
                     >
                       <ShieldCheckIcon className="mr-2 size-4" />
@@ -779,7 +841,7 @@ export default function ProxyPoolsPage() {
                     {selectedNodeIDs.length > 0 && (
                       <Button
                         variant="outline"
-                        disabled={busy || !current.config.enabled}
+                        disabled={busy || credentialsUnavailable || !current.config.enabled}
                         onClick={() => void verifyNodes(selectedNodeIDs)}
                       >
                         <ShieldCheckIcon className="mr-2 size-4" />
@@ -800,8 +862,13 @@ export default function ProxyPoolsPage() {
                       if (file) void importProxyFile(file);
                     }}
                   />
-                  <Button variant="outline" disabled={busy || !current.config.enabled || current.config.kind !== "fixed"}
-                    onClick={() => importInput.current?.click()}>
+                  <Button
+                    variant="outline"
+                    disabled={
+                      busy || credentialsUnavailable || !current.config.enabled || current.config.kind !== "fixed"
+                    }
+                    onClick={() => importInput.current?.click()}
+                  >
                     <FileUpIcon className="mr-2 size-4" />
                     导入并验证
                   </Button>
@@ -816,7 +883,7 @@ export default function ProxyPoolsPage() {
                   {current.config.quota_supported && (
                     <Button
                       variant="outline"
-                      disabled={busy || !current.config.enabled}
+                      disabled={busy || credentialsUnavailable || !current.config.enabled}
                       onClick={() =>
                         action(async () => {
                           const q = await api.proxyQuota(current.id);
@@ -833,7 +900,7 @@ export default function ProxyPoolsPage() {
                   )}
                   <Button
                     variant="outline"
-                    disabled={busy || !current.config.enabled}
+                    disabled={busy || credentialsUnavailable || !current.config.enabled}
                     onClick={() => action(() => api.fetchProxyNodes(current.id), "节点已更新")}
                   >
                     <DownloadIcon className="mr-2 size-4" />
@@ -851,7 +918,24 @@ export default function ProxyPoolsPage() {
                   小象暂未返回余量数据。余量查询仅适用于短效包量套餐；其他套餐可关闭余量查询，继续提取节点。
                 </p>
               )}
-              {importPending > 0 && <p className="text-sm text-muted-foreground">导入验证中：剩余 {importPending} 个</p>}
+              {detailError && (
+                <p role="alert" className="text-sm text-destructive">
+                  节点读取失败：{detailError}。无法确定节点数量，请重试。
+                </p>
+              )}
+              {eventsError && mainView === "events" && (
+                <p role="alert" className="text-sm text-destructive">
+                  使用记录读取失败：{eventsError}
+                </p>
+              )}
+              {importError && (
+                <p role="alert" className="text-sm text-destructive">
+                  导入验证状态不可用：{importError}
+                </p>
+              )}
+              {!importError && importPending > 0 && (
+                <p className="text-sm text-muted-foreground">导入验证中：剩余 {importPending} 个</p>
+              )}
               {verification && (
                 <div
                   role="status"
@@ -936,7 +1020,9 @@ export default function ProxyPoolsPage() {
                     <option value="newest">最新加入</option>
                     <option value="latency">验证耗时升序</option>
                   </select>
-                  <span className="text-muted-foreground text-xs">共 {nodeTotal} 条</span>
+                  <span className="text-muted-foreground text-xs">
+                    {nodesLoaded ? `共 ${nodeTotal} 条` : "数量未知"}
+                  </span>
                 </div>
               )}
               {selectedNodeIDs.length > 0 ? (
@@ -1007,12 +1093,12 @@ export default function ProxyPoolsPage() {
                             </td>
                             <td className="max-w-52 break-all p-3 font-mono text-xs">
                               {nodeEndpoint(n.address).host}
-                              {n.last_error && (
+                              {(n.last_error || n.runtime_error) && (
                                 <p
                                   className="mt-1 line-clamp-2 max-w-44 break-words font-sans text-destructive"
-                                  title={proxyVerificationMessage(n.last_error)}
+                                  title={proxyVerificationMessage(n.last_error || n.runtime_error || "")}
                                 >
-                                  {proxyVerificationMessage(n.last_error)}
+                                  {proxyVerificationMessage(n.last_error || n.runtime_error || "")}
                                 </p>
                               )}
                             </td>
@@ -1065,7 +1151,7 @@ export default function ProxyPoolsPage() {
                                   variant="ghost"
                                   title={verifyMode === "connectivity" ? "验证百度连通性" : "验证出口 IP"}
                                   aria-label={`验证节点 ${n.id}`}
-                                  disabled={busy || detailLoading || !current.config.enabled}
+                                  disabled={busy || detailLoading || credentialsUnavailable || !current.config.enabled}
                                   onClick={() => void verifyNodes([n.id])}
                                 >
                                   {verifyingIDs.includes(n.id) ? (
@@ -1092,26 +1178,28 @@ export default function ProxyPoolsPage() {
                     </table>
                     {pagedNodes.length === 0 && (
                       <p className="p-8 text-center text-muted-foreground text-sm">
-                        {detailLoading ? "加载中" : "没有匹配的节点"}
+                        {detailLoading ? "加载中" : detailError ? "节点读取失败，数量未知" : "没有匹配的节点"}
                       </p>
                     )}
                   </div>
-                  <fieldset disabled={busy} className="min-w-0">
-                    <TablePagination
-                      page={nodePage}
-                      pageSize={nodePageSize}
-                      total={nodeTotal}
-                      onPageChange={(page) => {
-                        if (!busy) setNodePage(page);
-                      }}
-                      pageSizeOptions={[10, 20, 50, 100]}
-                      onPageSizeChange={(size) => {
-                        if (busy) return;
-                        setNodePageSize(size);
-                        setNodePage(1);
-                      }}
-                    />
-                  </fieldset>
+                  {nodesLoaded && (
+                    <fieldset disabled={busy} className="min-w-0">
+                      <TablePagination
+                        page={nodePage}
+                        pageSize={nodePageSize}
+                        total={nodeTotal}
+                        onPageChange={(page) => {
+                          if (!busy) setNodePage(page);
+                        }}
+                        pageSizeOptions={[10, 20, 50, 100]}
+                        onPageSizeChange={(size) => {
+                          if (busy) return;
+                          setNodePageSize(size);
+                          setNodePage(1);
+                        }}
+                      />
+                    </fieldset>
+                  )}
                 </TabsContent>
                 <TabsContent value="events">
                   <ProxyEventsTable events={events} />
@@ -1134,6 +1222,12 @@ export default function ProxyPoolsPage() {
             <SheetDescription>来源配置与连接认证</SheetDescription>
           </SheetHeader>
           <form onSubmit={save} className="space-y-5 p-4">
+            {editingCredentialsUnavailable && (
+              <p role="alert" className="text-sm text-destructive">
+                原代理池凭据不可读。恢复前请暂停此池关联的全部任务。本次仅替换凭据，保留节点并停用旧验证；其他配置不变。
+                仅替换凭据会保留节点，但停用节点并清除旧验证结果；有任务绑定时禁止替换。
+              </p>
+            )}
             <div className="space-y-2">
               <Label htmlFor="pool-name">名称</Label>
               <Input
@@ -1333,7 +1427,19 @@ export default function ProxyPoolsPage() {
                   <Label htmlFor="replace-secrets">替换整组凭据（空字段会清除）</Label>
                 </div>
               )}
-              {replaceSecrets && (
+              {editing && replaceSecrets && (
+                <p className="text-sm text-muted-foreground">
+                  仅在确认代理不需要认证时留空。仅替换凭据会停用已有节点，需要重新验证后启用。
+                </p>
+              )}
+              {editingCredentialsUnavailable && replaceSecrets && config.kind === "fixed" && (
+                <div className="flex items-center gap-2">
+                  <Checkbox id="recover-no-auth" checked={recoverNoAuth}
+                    onCheckedChange={(value) => setRecoverNoAuth(value === true)} />
+                  <Label htmlFor="recover-no-auth">确认此池代理不需要账号密码</Label>
+                </div>
+              )}
+              {replaceSecrets && !recoverNoAuth && (
                 <>
                   {config.kind === "xiaoxiang" && (
                     <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -1365,7 +1471,7 @@ export default function ProxyPoolsPage() {
               )}
             </fieldset>
             <Button className="w-full" type="submit" disabled={busy}>
-              {busy ? "保存中" : "保存来源"}
+              {busy ? "保存中" : editingCredentialsUnavailable ? "确认恢复凭据" : "保存来源"}
             </Button>
           </form>
         </SheetContent>

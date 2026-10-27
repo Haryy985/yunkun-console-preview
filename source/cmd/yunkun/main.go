@@ -50,7 +50,7 @@ func run() int {
 		showVersion      = flag.Bool("version", false, "print build version and exit")
 		updateJob        = flag.String("offline-files", "", "private offline update job")
 		updateOperation  = flag.String("file-operation", "", "private update file operation")
-		offlineWorkerJob = flag.String("offline-worker", "", "private Linux offline update supervisor")
+		offlineWorkerJob = flag.String("offline-worker", "", "private Linux/macOS offline update supervisor")
 	)
 	flag.Parse()
 	if *offlineWorkerJob != "" {

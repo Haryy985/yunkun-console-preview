@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package selfupdate
 
@@ -12,24 +12,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"syscall"
 	"time"
 )
 
-func linuxManagedProcess(pid int, executable string) bool {
-	if pid <= 1 {
-		return false
-	}
-	actual, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
-	if err != nil || actual != executable {
-		return false
-	}
-	info, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
-	return err == nil && info.Sys().(*syscall.Stat_t).Uid == uint32(os.Geteuid())
-}
-
-func startLinuxOfflineWorker(jobPath string) error {
+func startUnixOfflineWorker(jobPath string) error {
 	work := filepath.Dir(jobPath)
 	cmd := exec.Command(filepath.Join(work, "file-helper"), "-offline-worker", jobPath)
 	// The launcher kills the console's process group during shutdown. The
@@ -86,7 +75,7 @@ func writeOfflineJSON(file string, value any) error {
 	return os.Rename(tmp.Name(), file)
 }
 
-func setLinuxUpdateState(job offlineJob, phase, message string, failure error) error {
+func setUnixUpdateState(job offlineJob, phase, message string, failure error) error {
 	state := OfflineState{Phase: phase, Percent: -1, Message: message, Version: job.To,
 		Job: job.Work, Backup: filepath.Join(job.Work, "backup"), UpdatedAt: time.Now().UTC().Format(time.RFC3339)}
 	if failure != nil {
@@ -104,7 +93,7 @@ func awaitOriginalShutdown(job offlineJob) error {
 	}
 	defer lock.Close()
 	for {
-		if !linuxManagedProcess(job.ParentPID, filepath.Join(job.Root, "bin", "yunkun")) {
+		if !ManagedOfflineProcess(job.ParentPID, filepath.Join(job.Root, "bin", "yunkun")) {
 			err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 			if err == nil {
 				defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
@@ -127,13 +116,13 @@ func awaitOriginalShutdown(job offlineJob) error {
 	}
 }
 
-type linuxUpdateInstance struct {
+type unixUpdateInstance struct {
 	cmd  *exec.Cmd
 	done chan error
 	job  offlineJob
 }
 
-func launchLinuxUpdate(job offlineJob, probe bool) (*linuxUpdateInstance, error) {
+func launchUnixUpdate(job offlineJob, probe bool) (*unixUpdateInstance, error) {
 	cmd := exec.Command(filepath.Join(job.Root, "bin", "yunkun-offline"),
 		"--no-browser", "--port", strconv.Itoa(job.ConsolePort), "--database-port", strconv.Itoa(job.DatabasePort))
 	cmd.Dir = job.Root
@@ -153,16 +142,16 @@ func launchLinuxUpdate(job offlineJob, probe bool) (*linuxUpdateInstance, error)
 		return nil, err
 	}
 	log.Close()
-	instance := &linuxUpdateInstance{cmd: cmd, done: make(chan error, 1), job: job}
+	instance := &unixUpdateInstance{cmd: cmd, done: make(chan error, 1), job: job}
 	go func() { instance.done <- cmd.Wait() }()
 	return instance, nil
 }
 
-func (i *linuxUpdateInstance) stop() error {
+func (i *unixUpdateInstance) stop() error {
 	select {
 	case <-i.done:
 	default:
-		if !linuxManagedProcess(i.cmd.Process.Pid, filepath.Join(i.job.Root, "bin", "yunkun-offline")) {
+		if !ManagedOfflineProcess(i.cmd.Process.Pid, filepath.Join(i.job.Root, "bin", "yunkun-offline")) {
 			return errors.New("refusing to signal an unverified launcher")
 		}
 		if err := i.cmd.Process.Signal(syscall.SIGTERM); err != nil {
@@ -180,7 +169,7 @@ func (i *linuxUpdateInstance) stop() error {
 	return nil
 }
 
-func (i *linuxUpdateInstance) healthy(version string, probe bool) error {
+func (i *unixUpdateInstance) healthy(version string, probe bool) error {
 	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil}}
 	defer client.CloseIdleConnections()
 	deadline := time.NewTimer(110 * time.Second)
@@ -239,9 +228,10 @@ func RunOfflineWorker(jobPath string) (result error) {
 	if err := readJSON(jobPath, &job); err != nil {
 		return err
 	}
-	if job.GOOS != "linux" || job.Public || job.ConsolePort < 1024 || job.ConsolePort > 65535 ||
+	if job.GOOS != runtime.GOOS || job.GOARCH != runtime.GOARCH ||
+		job.Public || job.ConsolePort < 1024 || job.ConsolePort > 65535 ||
 		job.DatabasePort < 1024 || job.DatabasePort > 65535 || job.DatabasePort == job.ConsolePort {
-		return errors.New("invalid Linux managed update job")
+		return errors.New("invalid Unix managed update job")
 	}
 	if err := OfflineFiles(jobPath, "check"); err != nil {
 		return err
@@ -250,14 +240,14 @@ func RunOfflineWorker(jobPath string) (result error) {
 	if err != nil || !samePath(helper, filepath.Join(job.Work, "file-helper")) {
 		return errors.New("invalid update helper")
 	}
-	if !linuxManagedProcess(job.ParentPID, filepath.Join(job.Root, "bin", "yunkun")) {
+	if !ManagedOfflineProcess(job.ParentPID, filepath.Join(job.Root, "bin", "yunkun")) {
 		return errors.New("update parent is not the managed console")
 	}
 	var launcher struct {
 		PID int `json:"pid"`
 	}
 	if readJSON(filepath.Join(job.Root, ".yunkun-local", "launcher.json"), &launcher) != nil ||
-		!linuxManagedProcess(launcher.PID, filepath.Join(job.Root, "bin", "yunkun-offline")) {
+		!ManagedOfflineProcess(launcher.PID, filepath.Join(job.Root, "bin", "yunkun-offline")) {
 		return errors.New("managed launcher is unavailable")
 	}
 	lock, err := os.OpenFile(filepath.Join(job.Root, ".yunkun-local", "updates", "update.lock"), os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0600)
@@ -271,8 +261,8 @@ func RunOfflineWorker(jobPath string) (result error) {
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 	defer func() {
 		if result != nil && OfflineStatus(job.Root).Phase == "waiting" &&
-			linuxManagedProcess(job.ParentPID, filepath.Join(job.Root, "bin", "yunkun")) {
-			_ = setLinuxUpdateState(job, "failed", "Update preparation failed; the current service was retained.", result)
+			ManagedOfflineProcess(job.ParentPID, filepath.Join(job.Root, "bin", "yunkun")) {
+			_ = setUnixUpdateState(job, "failed", "Update preparation failed; the current service was retained.", result)
 		}
 	}()
 	var size uint64
@@ -288,22 +278,22 @@ func RunOfflineWorker(jobPath string) (result error) {
 	if disk.Bavail*uint64(disk.Bsize) < size*2+(1<<30) {
 		return errors.New("insufficient space for backup and rollback")
 	}
-	if err := setLinuxUpdateState(job, "waiting", "Waiting for the managed console and database to stop.", nil); err != nil {
+	if err := setUnixUpdateState(job, "waiting", "Waiting for the managed console and database to stop.", nil); err != nil {
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(job.Work, "ready"), []byte("ready"), 0600); err != nil {
 		return err
 	}
 	if err := awaitOriginalShutdown(job); err != nil {
-		_ = setLinuxUpdateState(job, "recovery_required", "Shutdown was not confirmed; preserve this installation and inspect the logs.", err)
+		_ = setUnixUpdateState(job, "recovery_required", "Shutdown was not confirmed; preserve this installation and inspect the logs.", err)
 		return err
 	}
 	return (offlineTransaction{
 		job: job,
 		state: func(phase, message string, failure error) error {
-			return setLinuxUpdateState(job, phase, message, failure)
+			return setUnixUpdateState(job, phase, message, failure)
 		},
-		launch: func(probe bool) (offlineInstance, error) { return launchLinuxUpdate(job, probe) },
+		launch: func(probe bool) (offlineInstance, error) { return launchUnixUpdate(job, probe) },
 		files:  func(operation string) error { return OfflineFiles(jobPath, operation) },
 	}).run()
 }

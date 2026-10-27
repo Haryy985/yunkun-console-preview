@@ -1,4 +1,4 @@
-"""Native Linux upgrade/rollback acceptance; synthetic data and loopback only.
+"""Native Linux/macOS upgrade/rollback acceptance; synthetic data and loopback only.
 
 Usage: python3 offline-oneclick-unix-smoke.py CLEAN_INSTALL CLEAN_CANDIDATE RESULT
 Both package directories must be disposable, data-free copies. This directly
@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import platform
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -22,8 +23,8 @@ import urllib.request
 
 
 def main():
-    if platform.system() != "Linux" or os.geteuid() == 0:
-        raise RuntimeError("Run on native Linux as a regular user, without sudo")
+    if platform.system() not in ("Linux", "Darwin") or os.geteuid() == 0:
+        raise RuntimeError("Run on native Linux/macOS as a regular user, without sudo")
     root, candidate, result_path = (Path(p).resolve() for p in sys.argv[1:4])
     if root == candidate or root in candidate.parents or candidate in root.parents:
         raise RuntimeError("Use separate disposable package directories")
@@ -68,15 +69,15 @@ def main():
             return False
 
     def app_pid():
-        launcher = json.loads((private / "launcher.json").read_text())["pid"]
-        children = Path(f"/proc/{launcher}/task/{launcher}/children").read_text().split()
-        for value in children:
-            try:
-                if Path(f"/proc/{value}/exe").readlink() == root / "bin/yunkun":
-                    return int(value)
-            except OSError:
-                pass
-        raise RuntimeError("Managed console child not found")
+        record = json.loads((private / "launcher.json").read_text())
+        pid = record["console_pid"]
+        # The supervisor independently verifies the executable before creating
+        # its ready marker; also reject stale/non-child records here.
+        identity = subprocess.check_output(
+            ["/bin/ps", "-p", str(pid), "-o", "ppid=", "-o", "uid="], text=True).split()
+        if identity != [str(record["pid"]), str(os.geteuid())]:
+            raise RuntimeError("Managed console child not found")
+        return pid
 
     def run_update(name, expected_from, fail=False):
         work = private / "updates" / name
@@ -84,7 +85,8 @@ def main():
         shutil.copytree(candidate, work / "candidate", symlinks=False)
         if fail:
             launcher = work / "candidate/bin/yunkun-offline"
-            launcher.write_text("#!/bin/sh\nexit 23\n")
+            marker = shlex.quote(str(private / "data/native-update-marker.txt"))
+            launcher.write_text(f"#!/bin/sh\nprintf changed > {marker}\nexit 23\n")
             launcher.chmod(0o700)
         helper = work / "file-helper"
         shutil.copy2(root / "bin/yunkun", helper)
@@ -92,7 +94,8 @@ def main():
         parent = app_pid()
         job = dict(root=str(root), work=str(work), parent_pid=parent,
             console_port=port, database_port=db_port, public=False,
-            goos="linux", goarch={"x86_64": "amd64", "aarch64": "arm64"}[platform.machine()],
+            goos={"Linux": "linux", "Darwin": "darwin"}[platform.system()],
+            goarch={"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64"}[platform.machine()],
             **{"from": expected_from, "to": target})
         job_file = work / "job.json"
         job_file.write_text(json.dumps(job))
@@ -104,18 +107,29 @@ def main():
             if process.poll() is not None:
                 raise RuntimeError(f"Supervisor exited before readiness; inspect {work}/worker.log")
             return (work / "ready").exists()
-        wait_for(supervisor_ready, 60)
-        # Models the app's graceful exit after the apply endpoint stages a job.
-        if Path(f"/proc/{parent}/exe").readlink() != root / "bin/yunkun":
-            raise RuntimeError("Refusing to stop an unrelated process")
-        os.kill(parent, signal.SIGTERM)
-        process.wait(timeout=360)
+        try:
+            wait_for(supervisor_ready, 60)
+            # Models the app's graceful exit after the apply endpoint stages a job.
+            if app_pid() != parent:
+                raise RuntimeError("Refusing to stop an unrelated process")
+            os.kill(parent, signal.SIGTERM)
+            process.wait(timeout=360)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=10)
         state = json.loads((private / "update-state.json").read_text())
         expected = "rolled_back" if fail else "completed"
         if state["phase"] != expected or process.returncode != (1 if fail else 0):
             raise RuntimeError(f"Expected {expected}; inspect {work}/worker.log")
         assert (work / "backup-verified").is_file()
         assert not (work / "backup/.yunkun-local/updates").exists()
+        if fail:
+            assert (work / "failed-installation/.yunkun-local/data/native-update-marker.txt").read_text() == "changed"
         checks.append(expected)
 
     launcher_log = root.parent / "native-update-launcher.log"
@@ -140,11 +154,15 @@ def main():
         skill.write_text("User-owned fixture")
         keys = {name: hashlib.sha256((root / "bin" / name).read_bytes()).hexdigest()
             for name in ("jwt.key", "proxy-pool.key")}
-        run_update("success", original)
-        for failed in (False, True):
+        marker = private / "data/native-update-marker.txt"
+        marker.write_text("original")
+        config_hash = hashlib.sha256((private / "config.json").read_bytes()).hexdigest()
+        for failed in (True, False):
             if failed:
-                run_update("failed-start", target, True)
-            assert api("/api/health")["version"] == target
+                run_update("failed-start", original, True)
+            else:
+                run_update("success", original)
+            assert api("/api/health")["version"] == (original if failed else target)
             api("/api/auth/me", token=token)
             api("/api/auth/login", {"username": "yunkun", "password": password})
             assert "upgrade-local-history" in json.dumps(api("/api/tasks", token=token))
@@ -152,13 +170,16 @@ def main():
             pools = api("/api/proxy-pools", token=token)["pools"]
             assert next(p for p in pools if p["id"] == pool["id"])["has_credentials"]
             assert skill.read_text() == "User-owned fixture"
+            assert marker.read_text() == "original"
+            assert hashlib.sha256((private / "config.json").read_bytes()).hexdigest() == config_hash
             for name, digest in keys.items():
                 assert hashlib.sha256((root / "bin" / name).read_bytes()).hexdigest() == digest
         checks.extend(["password", "session", "history", "knowledge", "proxy credentials",
-            "keys", "custom skills", "backup excludes updates"])
+            "keys", "config", "custom skills", "failed data snapshot", "backup excludes updates"])
         result_path.parent.mkdir(parents=True, exist_ok=True)
-        result_path.write_text(json.dumps(dict(passed=True, checks=checks), indent=2))
-        print("PASS: native Linux supervisor upgrade and startup-failure rollback")
+        result_path.write_text(json.dumps(dict(passed=True, checks=checks,
+            platform=platform.system(), machine=platform.machine(), original=original, target=target), indent=2))
+        print("PASS: native Unix supervisor upgrade and startup-failure rollback")
     finally:
         if (private / "launcher.json").exists():
             subprocess.run([root / "bin/yunkun-offline", "--stop"], check=True, timeout=100)

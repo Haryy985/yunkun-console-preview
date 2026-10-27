@@ -43,8 +43,9 @@ func (s *Server) initProxyPools(keyDir string) error {
 	s.proxyPools = &proxyPoolService{vault: vault, provider: proxypool.NewProvider(),
 		verifying: make(map[int64]bool), verifySlots: make(chan struct{}, 8)}
 	s.proxyPools.gateway = &proxypool.Gateway{Key: s.jwtKey, Context: s.ctx, Resolve: s.resolveProxyRoute,
+		Select: s.selectProxyRoute, Validate: s.validateProxyRoute, Failure: s.proxyRuntimeFailure,
 		Audit: func(r proxypool.Route, target, result string) error {
-			return s.m.pg.AddProxyRouteEvent(r.TaskID, r.PoolID, r.Node.ID, target, result)
+			return s.completeProxyRoute(r, target, result, "")
 		},
 		CaptureEnabled: s.m.TrafficEnabled,
 		Capture: func(_ proxypool.Route, req *http.Request, resp *http.Response, request, response []byte) (string, error) {
@@ -53,7 +54,7 @@ func (s *Server) initProxyPools(keyDir string) error {
 			}
 			return s.m.traffic.RecordHTTP(req, resp, request, response)
 		},
-		Complete: s.m.pg.AddProxyRouteCompletion,
+		Complete: s.completeProxyRoute,
 	}
 	return nil
 }
@@ -89,6 +90,7 @@ func (s *Server) proxyPoolRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /api/proxy-settings", s.updateProxySettings)
 	mux.HandleFunc("POST /api/proxy-pools", s.saveProxyPool)
 	mux.HandleFunc("PUT /api/proxy-pools/{id}", s.saveProxyPool)
+	mux.HandleFunc("POST /api/proxy-pools/{id}/credentials/recover", s.recoverProxyCredentials)
 	mux.HandleFunc("DELETE /api/proxy-pools/{id}", s.deleteProxyPool)
 	mux.HandleFunc("GET /api/proxy-pools/{id}/nodes", s.listProxyNodes)
 	mux.HandleFunc("POST /api/proxy-pools/{id}/nodes/import", s.importProxyNodes)
@@ -103,6 +105,7 @@ func (s *Server) proxyPoolRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/proxy-pools/{id}/events", s.proxyPoolEvents)
 	mux.HandleFunc("GET /api/tasks/{id}/network", s.taskNetworkStatus)
 	mux.HandleFunc("POST /api/tasks/{id}/network/lease", s.reassignTaskProxyLease)
+	mux.HandleFunc("PUT /api/tasks/{id}/network/routing", s.setTaskProxyRouting)
 }
 
 func (s *Server) importProxyNodes(w http.ResponseWriter, r *http.Request) {
@@ -210,7 +213,7 @@ func parseProxyImport(data []byte, defaultProtocol string) ([]string, error) {
 }
 
 func (s *Server) exportProxyNodes(w http.ResponseWriter, r *http.Request) {
-	p, _, ok := s.poolForRequest(w, r)
+	p, ok := s.poolMetadataForRequest(w, r)
 	if !ok {
 		return
 	}
@@ -319,6 +322,8 @@ func (s *Server) listProxyPools(w http.ResponseWriter, r *http.Request) {
 	for _, p := range pools {
 		if admin {
 			secrets, err := s.proxyPools.vault.Open(p.Credentials)
+			available := err == nil
+			p.CredentialsAvailable = &available
 			if err == nil {
 				p.HasCredentials = secrets != (proxypool.Secrets{})
 			}
@@ -363,6 +368,7 @@ func (s *Server) saveProxyPool(w http.ResponseWriter, r *http.Request) {
 	s.proxyPools.mu.Lock()
 	defer s.proxyPools.mu.Unlock()
 	var secrets proxypool.Secrets
+	var cipher string
 	requireUnused := false
 	if id > 0 {
 		old, err := s.m.pg.ProxyPool(id)
@@ -374,10 +380,13 @@ func (s *Server) saveProxyPool(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 404, "来源不存在")
 			return
 		}
-		secrets, err = s.proxyPools.vault.Open(old.Credentials)
-		if err != nil {
-			writeErr(w, 503, "凭据解密失败，检查应用密钥")
-			return
+		if req.Secrets == nil {
+			secrets, err = s.proxyPools.vault.Open(old.Credentials)
+			if err != nil {
+				writeErr(w, 503, "代理池凭据不可用：请恢复原 proxy-pool.key，或显式替换整组代理池凭据；修改发现来源的 Key 不会修复此代理池")
+				return
+			}
+			cipher = old.Credentials
 		}
 		// Changing endpoint identity under a running lease is ambiguous.
 		if old.Config.Kind != req.Config.Kind || old.Config.Protocol != req.Config.Protocol || old.Config.APIURL != req.Config.APIURL ||
@@ -398,11 +407,15 @@ func (s *Server) saveProxyPool(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "凭据格式无效或过长")
 		return
 	}
-	cipher, err := s.proxyPools.vault.Seal(secrets)
-	if err != nil {
-		writeErr(w, 500, "保存凭据失败")
-		return
+	if id == 0 || req.Secrets != nil {
+		var err error
+		cipher, err = s.proxyPools.vault.Seal(secrets)
+		if err != nil {
+			writeErr(w, 500, "保存凭据失败")
+			return
+		}
 	}
+	var err error
 	id, err = s.m.pg.SaveProxyPool(id, req.Config, cipher, requireUnused)
 	if err != nil {
 		if errors.Is(err, db.ErrProxyPoolInUse) {
@@ -433,34 +446,44 @@ func (s *Server) deleteProxyPool(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
-func (s *Server) poolForRequest(w http.ResponseWriter, r *http.Request) (*db.ProxyPool, proxypool.Secrets, bool) {
+// Inventory and history do not need plaintext credentials. Keep decryption
+// mandatory for verification, fetching and routing, not for read-only metadata.
+func (s *Server) poolMetadataForRequest(w http.ResponseWriter, r *http.Request) (*db.ProxyPool, bool) {
 	if !s.proxyPoolReady(w) {
-		return nil, proxypool.Secrets{}, false
+		return nil, false
 	}
 	id, ok := pathInt(r, "id")
-	if !ok {
+	if !ok || id <= 0 {
 		writeErr(w, 400, "来源 ID 无效")
-		return nil, proxypool.Secrets{}, false
+		return nil, false
 	}
 	p, err := s.m.pg.ProxyPool(id)
 	if err != nil {
 		writeErr(w, 500, "读取来源失败")
-		return nil, proxypool.Secrets{}, false
+		return nil, false
 	}
 	if p == nil {
 		writeErr(w, 404, "来源不存在")
+		return nil, false
+	}
+	return p, true
+}
+
+func (s *Server) poolForRequest(w http.ResponseWriter, r *http.Request) (*db.ProxyPool, proxypool.Secrets, bool) {
+	p, ok := s.poolMetadataForRequest(w, r)
+	if !ok {
 		return nil, proxypool.Secrets{}, false
 	}
 	secrets, err := s.proxyPools.vault.Open(p.Credentials)
 	if err != nil {
-		writeErr(w, 503, "凭据不可用")
+		writeErr(w, 503, "代理池凭据不可用：请恢复原 proxy-pool.key，或在来源管理中显式替换整组凭据；不是 FOFA / Quake 发现来源的 API Key")
 		return nil, proxypool.Secrets{}, false
 	}
 	return p, secrets, true
 }
 
 func (s *Server) listProxyNodes(w http.ResponseWriter, r *http.Request) {
-	p, _, ok := s.poolForRequest(w, r)
+	p, ok := s.poolMetadataForRequest(w, r)
 	if !ok {
 		return
 	}
@@ -778,7 +801,7 @@ func (s *Server) checkProxyNode(ctx context.Context, p *db.ProxyPool, secrets pr
 	if verifyErr != nil {
 		problem = verifyErr.Error()
 	}
-	if err := s.m.pg.RecordProxyNodeVerification(p.ID, n.ID, result, problem, latency); err != nil {
+	if err := s.m.pg.RecordProxyNodeVerification(p.ID, n.ID, result, problem, latency, p.Credentials); err != nil {
 		return result, latency, errProxyVerifyStore
 	}
 	return result, latency, verifyErr
@@ -812,6 +835,14 @@ func nodeVerificationTarget(configuredURL, mode string) (string, string, error) 
 }
 
 func (s *Server) resolveProxyRoute(ctx context.Context, taskID int64) (proxypool.Route, error) {
+	return s.proxyRoute(ctx, taskID, false)
+}
+
+func (s *Server) selectProxyRoute(ctx context.Context, taskID int64) (proxypool.Route, error) {
+	return s.proxyRoute(ctx, taskID, true)
+}
+
+func (s *Server) proxyRoute(ctx context.Context, taskID int64, advance bool) (proxypool.Route, error) {
 	route := proxypool.Route{TaskID: taskID}
 	if err := ctx.Err(); err != nil {
 		return route, err
@@ -830,17 +861,15 @@ func (s *Server) resolveProxyRoute(ctx context.Context, taskID int64) (proxypool
 	if err := s.m.pg.QueryRowContext(ctx, `SELECT deleted_at IS NULL AND NOT paused AND NOT queued FROM tasks WHERE id=$1`, taskID).Scan(&allowed); err != nil || !allowed {
 		return route, errors.New("task is paused, queued or unavailable")
 	}
-	p, err := s.m.pg.ProxyPool(b.PoolID)
-	if err != nil || p == nil || !p.Config.Enabled {
-		return route, errors.New("proxy pool disabled or unavailable")
+	p, n, err := s.m.pg.SelectProxyRouteNode(ctx, b, advance)
+	if err != nil {
+		return route, err
 	}
 	route.PoolID = p.ID
 	route.Revision = b.Revision
-	if b.NodeID == nil {
-		return route, errors.New("proxy lease unavailable")
-	}
-	n, err := s.m.pg.ProxyNode(p.ID, *b.NodeID)
-	if err != nil || n == nil {
+	route.Strategy = b.Strategy
+	route.CredentialTag = sha256.Sum256([]byte(p.Credentials))
+	if n == nil {
 		return route, errors.New("proxy nodes unavailable")
 	}
 	if !n.Enabled {
@@ -851,7 +880,7 @@ func (s *Server) resolveProxyRoute(ctx context.Context, taskID int64) (proxypool
 		return route, errors.New("discovered proxy evidence expired or unhealthy; reverify before routing")
 	}
 	margin := time.Now().Add(time.Duration(p.Config.SafetySeconds) * time.Second)
-	if (b.ExpiresAt != nil && !b.ExpiresAt.After(margin)) || (n.ExpiresAt != nil && !n.ExpiresAt.After(margin)) {
+	if (b.Strategy == "fixed" && b.ExpiresAt != nil && !b.ExpiresAt.After(margin)) || (n.ExpiresAt != nil && !n.ExpiresAt.After(margin)) {
 		return route, errors.New("proxy lease expired; pause the task, fetch nodes and reassign its lease")
 	}
 	secrets, err := s.proxyPools.vault.Open(p.Credentials)
@@ -859,7 +888,9 @@ func (s *Server) resolveProxyRoute(ctx context.Context, taskID int64) (proxypool
 		return route, err
 	}
 	route.Node = *n
-	route.Node.ExpiresAt = b.ExpiresAt
+	if b.Strategy == "fixed" {
+		route.Node.ExpiresAt = b.ExpiresAt
+	}
 	route.Upstream, err = p.Config.Upstream(*n, secrets)
 	return route, err
 }
@@ -892,6 +923,15 @@ func (s *Server) networkStatus(taskID int64) (map[string]any, error) {
 		"managed_tools":   []string{"HTTP", "WebFetch"},
 		"unmanaged_tools": []string{"Bash (environment only)", "interactive_shell", "browser/MCP", "custom network tools", "asset enrichment", "web_search", "LLM/provider requests"},
 		"coverage":        "managed_http_tools_only"}
+	out["routing_strategy"] = b.Strategy
+	if b.Strategy == "round_robin" {
+		out["failure_policy"] = "same_pool_failover_then_stop"
+		out["node_semantics"] = "next_eligible_snapshot"
+		// The old node_id is a historical lease anchor, not a current pin.
+		visibleBinding := *b
+		visibleBinding.NodeID, visibleBinding.ExpiresAt = nil, nil
+		out["binding"] = visibleBinding
+	}
 	if s.m.TrafficEnabled() {
 		if s.m.traffic == nil {
 			out["capture"] = "storage_unavailable"
@@ -944,7 +984,7 @@ func (s *Server) taskNetworkStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) proxyPoolEvents(w http.ResponseWriter, r *http.Request) {
-	p, _, ok := s.poolForRequest(w, r)
+	p, ok := s.poolMetadataForRequest(w, r)
 	if !ok {
 		return
 	}

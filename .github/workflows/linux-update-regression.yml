@@ -1,4 +1,4 @@
-name: Linux update regression (manual review only)
+name: Unix update regression (legacy manual entry)
 
 on:
   workflow_dispatch:
@@ -8,60 +8,4 @@ permissions:
 
 jobs:
   native-update:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: source/go.mod
-          cache-dependency-path: source/go.sum
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: source/web/package-lock.json
-      - name: Test updater and compile the embedded UI
-        working-directory: source
-        run: |
-          go test ./selfupdate -count=1
-          npm --prefix web ci --ignore-scripts --no-audit --no-fund
-          npm --prefix web run build:static
-      - name: Assemble disposable packages from a verified runtime
-        env:
-          GH_TOKEN: ${{ github.token }}
-        working-directory: source
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/native-update"
-          cd "$RUNNER_TEMP/native-update"
-          gh release download v1.1.0-offline --repo Haryy985/yunkun-console-preview \
-            --pattern yunkun-1.1.0-offline-linux-amd64.zip --pattern SHA256SUMS
-          grep '  yunkun-1.1.0-offline-linux-amd64.zip$' SHA256SUMS | sha256sum -c -
-          unzip -q yunkun-1.1.0-offline-linux-amd64.zip
-          mv yunkun-v1.1.0-offline installation
-          cp -a installation candidate
-          cd "$GITHUB_WORKSPACE/source"
-          for spec in 'installation v1.1.0-offline' 'candidate v1.1.1-offline'; do
-            read -r folder version <<< "$spec"
-            go build -tags embedui -ldflags "-X main.version=$version" \
-              -o "$RUNNER_TEMP/native-update/$folder/bin/yunkun" ./cmd/yunkun
-            go build -ldflags "-X main.version=$version" \
-              -o "$RUNNER_TEMP/native-update/$folder/bin/yunkun-offline" ./cmd/yunkun-offline
-            printf '%s\n' "$version" > "$RUNNER_TEMP/native-update/$folder/VERSION"
-          done
-      - name: Verify native upgrade and rollback with synthetic data
-        working-directory: source
-        run: |
-          python3 tests/offline-oneclick-unix-smoke.py \
-            "$RUNNER_TEMP/native-update/installation" \
-            "$RUNNER_TEMP/native-update/candidate" \
-            "$RUNNER_TEMP/native-update-result.json"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: linux-update-acceptance
-          path: ${{ runner.temp }}/native-update-result.json
-          if-no-files-found: ignore
+    uses: ./.github/workflows/offline-unix-acceptance.yml

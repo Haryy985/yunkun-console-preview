@@ -504,6 +504,7 @@ export function ApprovalDetail({
                 <div>工具调用 ID：{audit.tool_use_id || "未记录"}</div>
                 <div>参数摘要 SHA-256：{audit.input_digest}</div>
                 <div>审查配置指纹 SHA-256：{audit.config_digest || "未记录"}</div>
+                {audit.review_duration_ms ? <div>模型审核耗时：{(audit.review_duration_ms / 1000).toFixed(2)} 秒（不含人工等待）</div> : null}
                 {audit.model_input_digest ? <div>模型审查输入 SHA-256：{audit.model_input_digest}</div> : null}
                 {audit.execution_ended_at ? <div>结果记录时间：{fmtTime(audit.execution_ended_at)}</div> : null}
               </dl>

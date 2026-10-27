@@ -2,13 +2,15 @@
 
 import * as React from "react";
 
-import { CheckIcon, CopyIcon, FileTextIcon } from "lucide-react";
+import { CheckIcon, CopyIcon, FileTextIcon, RotateCwIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Markdown } from "@/components/markdown";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { api } from "@/lib/api";
+import { ReportRequestError } from "@/lib/report-request";
+import { useRetryCountdown } from "@/hooks/use-retry-countdown";
 import { copyText } from "@/lib/utils";
 
 export function ReportTab({ taskId }: { taskId: string }) {
@@ -16,29 +18,50 @@ export function ReportTab({ taskId }: { taskId: string }) {
   const [error, setError] = React.useState<string>("");
   const [loading, setLoading] = React.useState(true);
   const [copied, setCopied] = React.useState(false);
+  const [attempt, setAttempt] = React.useState(0);
+  const [retryAt, setRetryAt] = React.useState(0);
+  const retrySeconds = useRetryCountdown(retryAt);
+  const retrying = React.useRef(false);
 
   React.useEffect(() => {
     let active = true;
+    const controller = new AbortController();
     setLoading(true);
     setError("");
+    setReport("");
+    setCopied(false);
     api
-      .report(taskId)
+      .report(taskId, controller.signal)
       .then((text) => {
-        if (active) setReport(text);
+        if (active) {
+          setReport(text);
+          setRetryAt(0);
+        }
       })
       .catch((reason) => {
         if (active) {
           setReport("");
           setError((reason as Error).message);
+          setRetryAt(reason instanceof ReportRequestError ? reason.retryAt : 0);
         }
       })
       .finally(() => {
-        if (active) setLoading(false);
+        if (active) {
+          setLoading(false);
+          retrying.current = false;
+        }
       });
     return () => {
       active = false;
+      controller.abort();
     };
-  }, [taskId]);
+  }, [taskId, attempt]);
+
+  function retry() {
+    if (loading || retrying.current || Date.now() < retryAt) return;
+    retrying.current = true;
+    setAttempt((value) => value + 1);
+  }
 
   async function copy() {
     if (!report) return;
@@ -68,7 +91,7 @@ export function ReportTab({ taskId }: { taskId: string }) {
     );
   } else if (error) {
     content = (
-      <p role="alert" className="py-8 text-center text-destructive text-sm">
+      <p role="alert" className="max-h-64 overflow-auto whitespace-pre-wrap break-all py-8 text-destructive text-sm">
         {error}
       </p>
     );
@@ -83,11 +106,16 @@ export function ReportTab({ taskId }: { taskId: string }) {
 
   return (
     <Card>
-      <CardHeader className="flex-row items-center justify-between">
+      <CardHeader className="flex-row flex-wrap items-center justify-between gap-2">
         <CardTitle className="flex items-center gap-2 text-sm">
           <FileTextIcon className="size-4" /> 渗透测试报告（Markdown）
         </CardTitle>
         <div className="flex gap-2">
+          {error && (
+            <Button size="sm" variant="outline" onClick={retry} disabled={loading || retrySeconds > 0}>
+              <RotateCwIcon /> {retrySeconds > 0 ? `${retrySeconds} 秒后重试` : "重试"}
+            </Button>
+          )}
           {report && (
             <Button size="sm" variant="outline" onClick={copy}>
               {copied ? <CheckIcon /> : <CopyIcon />} 复制

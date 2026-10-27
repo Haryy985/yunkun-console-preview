@@ -24,17 +24,22 @@ import (
 )
 
 type Route struct {
-	Revision int64
-	TaskID   int64
-	PoolID   int64
-	Node     Node
-	Upstream *url.URL
+	Strategy      string
+	CredentialTag [32]byte
+	Revision      int64
+	TaskID        int64
+	PoolID        int64
+	Node          Node
+	Upstream      *url.URL
 }
 
 type Gateway struct {
 	Key            []byte
 	Context        context.Context
 	Resolve        func(context.Context, int64) (Route, error)
+	Select         func(context.Context, int64) (Route, error)
+	Validate       func(context.Context, Route) error
+	Failure        func(Route, string) error
 	Audit          func(Route, string, string) error
 	CaptureEnabled func() bool
 	Capture        func(Route, *http.Request, *http.Response, []byte, []byte) (string, error)
@@ -88,8 +93,14 @@ func (g *Gateway) Wrap(next http.Handler) http.Handler {
 
 func proxyTransport(upstream *url.URL) *http.Transport {
 	return &http.Transport{
-		Proxy:               http.ProxyURL(upstream),
-		DialContext:         (&net.Dialer{Timeout: 15 * time.Second}).DialContext,
+		Proxy: http.ProxyURL(upstream),
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			conn, err := (&net.Dialer{Timeout: 15 * time.Second}).DialContext(ctx, network, address)
+			if err != nil && ctx.Err() == nil {
+				return nil, &proxyDialError{err}
+			}
+			return conn, err
+		},
 		TLSHandshakeTimeout: 15 * time.Second, ResponseHeaderTimeout: 30 * time.Second,
 		DisableKeepAlives: true,
 	}
@@ -124,7 +135,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(w, resp.Body)
 		return
 	}
-	route, err := g.Resolve(r.Context(), id)
+	route, err := g.selectRoute(r.Context(), id)
 	if err != nil || route.Upstream == nil {
 		http.Error(w, "task proxy unavailable; direct fallback forbidden", http.StatusServiceUnavailable)
 		return
@@ -149,45 +160,48 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}()
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
-	// Recheck persisted policy during both HTTP requests and CONNECT tunnels.
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		serverDone := (<-chan struct{})(nil)
-		if g.Context != nil {
-			serverDone = g.Context.Done()
+	if _, _, err := net.SplitHostPort(target); err != nil {
+		http.Error(w, "CONNECT needs host:port", 400)
+		return
+	}
+	var upstream net.Conn
+	var connectionCtx context.Context
+	for attempt := 0; attempt < 3; attempt++ {
+		var connectionCancel context.CancelFunc
+		connectionCtx, connectionCancel = context.WithCancel(ctx)
+		g.watchRoute(connectionCtx, connectionCancel, route)
+		upstream, err = dialTunnel(connectionCtx, route.Upstream, target)
+		if err == nil {
+			defer connectionCancel()
+			break
 		}
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ctx.Done():
-				return
-			case <-serverDone:
-				cancel()
-				return
-			case <-ticker.C:
-				current, err := g.Resolve(ctx, id)
-				if err != nil || current.Upstream == nil || current.Revision != route.Revision || current.Node.ID != route.Node.ID || current.Upstream.String() != route.Upstream.String() {
-					cancel()
-					return
-				}
-			}
-		}
-	}()
-	if r.Method == http.MethodConnect {
-		if _, _, err := net.SplitHostPort(target); err != nil {
-			http.Error(w, "CONNECT needs host:port", 400)
-			return
-		}
-		upstream, err := dialTunnel(ctx, route.Upstream, target)
-		if err != nil {
+		quarantined := g.reportProxyFailure(connectionCtx, route, err)
+		connectionCancel()
+		var dial *proxyDialError
+		if !quarantined || route.Strategy != "round_robin" || !errors.As(err, &dial) || attempt == 2 {
 			http.Error(w, "upstream proxy connection failed", 502)
 			return
 		}
-		defer upstream.Close()
+		if g.Audit != nil && g.Audit(route, target, "connect_failed") != nil {
+			http.Error(w, "route audit unavailable", 503)
+			return
+		}
+		route, err = g.selectRoute(ctx, id)
+		if err != nil || route.Upstream == nil {
+			http.Error(w, "task proxy unavailable; direct fallback forbidden", 503)
+			return
+		}
+		if g.Audit != nil && g.Audit(route, target, "accepted") != nil {
+			http.Error(w, "route audit unavailable", 503)
+			return
+		}
+	}
+	defer upstream.Close()
+	if connectionCtx.Err() != nil || g.validateRoute(connectionCtx, route) != nil {
+		http.Error(w, "task proxy route revoked", 503)
+		return
+	}
+	if r.Method == http.MethodConnect {
 		hj, ok := w.(http.Hijacker)
 		if !ok {
 			http.Error(w, "tunneling unavailable", 500)
@@ -198,7 +212,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer client.Close()
-		closeOnCancel := context.AfterFunc(ctx, func() { _ = client.Close(); _ = upstream.Close() })
+		closeOnCancel := context.AfterFunc(connectionCtx, func() { _ = client.Close(); _ = upstream.Close() })
 		defer closeOnCancel()
 		if _, err := buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 			return
@@ -217,7 +231,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = upstream.Close()
 		<-done
 		result = "tunnel_closed"
-		if ctx.Err() != nil {
+		if connectionCtx.Err() != nil {
 			result = "interrupted"
 		}
 		return
@@ -250,7 +264,7 @@ func dialTunnel(ctx context.Context, u *url.URL, target string) (net.Conn, error
 			pw, _ := u.User.Password()
 			auth = &proxy.Auth{User: u.User.Username(), Password: pw}
 		}
-		d, err := proxy.SOCKS5("tcp", u.Host, auth, dialer)
+		d, err := proxy.SOCKS5("tcp", u.Host, auth, &markedProxyDialer{dialer})
 		if err != nil {
 			return nil, errors.New("invalid SOCKS proxy")
 		}
@@ -270,7 +284,10 @@ func dialTunnel(ctx context.Context, u *url.URL, target string) (net.Conn, error
 		return nil, errors.New("unsupported proxy")
 	}
 	if err != nil {
-		return nil, errors.New("proxy dial failed")
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, &proxyDialError{err}
 	}
 	ok := false
 	defer func() {
@@ -295,6 +312,9 @@ func dialTunnel(ctx context.Context, u *url.URL, target string) (net.Conn, error
 		return nil, errors.New("proxy CONNECT response invalid")
 	}
 	if resp.StatusCode != 200 {
+		if resp.StatusCode == http.StatusProxyAuthRequired {
+			return nil, errProxyAuthentication
+		}
 		return nil, errors.New("proxy rejected CONNECT")
 	}
 	if ctx.Err() != nil {

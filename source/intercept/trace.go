@@ -159,6 +159,7 @@ func auditFor(ctx context.Context, dec Decision, input []byte, status string) *d
 	}
 	a.InitialAction, a.InitialReason = dec.Action, dec.Message
 	a.ModelFallback = dec.ModelFallback
+	a.ReviewDurationMS = dec.ReviewDurationMS
 	a.ModelInput, a.ModelInputDigest = dec.ModelInput, dec.ModelInputDigest
 	a.RuleName, a.ConfigDigest, a.ProfileID = dec.RuleName, dec.ConfigDigest, dec.ProfileID
 	a.ExecutionStatus = "not_started"

@@ -54,13 +54,34 @@ func (b *captureBody) snapshot() ([]byte, bool) {
 type completedBody struct {
 	io.ReadCloser
 	once   sync.Once
+	mu     sync.Mutex
+	eof    bool
+	failed bool
 	finish func()
 	err    error
 }
 
+func (b *completedBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	b.mu.Lock()
+	b.eof = b.eof || err == io.EOF
+	b.failed = b.failed || (err != nil && err != io.EOF)
+	b.mu.Unlock()
+	return n, err
+}
+
+func (b *completedBody) complete() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.eof && !b.failed && b.err == nil
+}
+
 func (b *completedBody) Close() error {
 	b.once.Do(func() {
-		b.err = b.ReadCloser.Close()
+		err := b.ReadCloser.Close()
+		b.mu.Lock()
+		b.err = err
+		b.mu.Unlock()
 		b.finish()
 	})
 	return b.err
@@ -69,45 +90,32 @@ func (b *completedBody) Close() error {
 // RoundTrip is for trusted in-process callers with a server-owned task ID.
 // External callers must pass through ServeHTTP authentication.
 func (g *Gateway) RoundTrip(r *http.Request, taskID int64) (*Exchange, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		ex, retry, err := g.roundTripAttempt(r, taskID)
+		if !retry || attempt == 2 {
+			return ex, err
+		}
+	}
+	return nil, errRouteUnavailable
+}
+
+func (g *Gateway) roundTripAttempt(r *http.Request, taskID int64) (*Exchange, bool, error) {
 	if g == nil || g.Resolve == nil || r.URL == nil || r.URL.Hostname() == "" ||
 		(r.URL.Scheme != "http" && r.URL.Scheme != "https") || r.URL.User != nil ||
 		len(r.URL.Host) > 255 || strings.ContainsAny(r.URL.Host, "\r\n") {
-		return nil, errors.New("task proxy unavailable or invalid HTTP target")
+		return nil, false, errors.New("task proxy unavailable or invalid HTTP target")
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
-	route, err := g.Resolve(ctx, taskID)
+	route, err := g.selectRoute(ctx, taskID)
 	if err != nil || route.Upstream == nil {
 		cancel()
-		return nil, errRouteUnavailable
+		return nil, false, errRouteUnavailable
 	}
 	if g.Audit != nil && g.Audit(route, r.URL.Host, "accepted") != nil {
 		cancel()
-		return nil, errRouteAudit
+		return nil, false, errRouteAudit
 	}
-	go func() {
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		var serverDone <-chan struct{}
-		if g.Context != nil {
-			serverDone = g.Context.Done()
-		}
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-serverDone:
-				cancel()
-				return
-			case <-ticker.C:
-				current, err := g.Resolve(ctx, taskID)
-				if err != nil || current.Upstream == nil || current.Revision != route.Revision ||
-					current.Node.ID != route.Node.ID || current.Upstream.String() != route.Upstream.String() {
-					cancel()
-					return
-				}
-			}
-		}
-	}()
+	g.watchRoute(ctx, cancel, route)
 	ex := &Exchange{CaptureStatus: "disabled"}
 	finish := func(result string) {
 		cancel()
@@ -156,8 +164,17 @@ func (g *Gateway) RoundTrip(r *http.Request, taskID int64) (*Exchange, error) {
 	if err != nil {
 		release()
 		tr.CloseIdleConnections()
+		quarantined := g.reportProxyFailure(ctx, route, err)
+		var dial *proxyDialError
+		// Restrict replay to bodyless read requests that never connected.
+		retry := quarantined && route.Strategy == "round_robin" && errors.As(err, &dial) &&
+			(r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+			(r.Body == nil || r.Body == http.NoBody)
 		finish("failed")
-		return nil, errors.New("upstream proxy request failed")
+		return nil, retry, errors.New("upstream proxy request failed")
+	}
+	if resp.StatusCode == http.StatusProxyAuthRequired && r.URL.Scheme == "http" {
+		g.reportProxyFailure(ctx, route, errProxyAuthentication)
 	}
 	ex.Response = resp
 	var responseBody *captureBody
@@ -165,12 +182,15 @@ func (g *Gateway) RoundTrip(r *http.Request, taskID int64) (*Exchange, error) {
 		responseBody = &captureBody{ReadCloser: resp.Body}
 		resp.Body = responseBody
 	}
-	resp.Body = &completedBody{ReadCloser: resp.Body, finish: func() {
+	body := &completedBody{ReadCloser: resp.Body}
+	body.finish = func() {
 		defer release()
 		defer tr.CloseIdleConnections()
 		result := "http_" + strconv.Itoa(resp.StatusCode)
 		if ctx.Err() != nil {
 			result = "interrupted"
+		} else if !body.complete() {
+			result = "response_incomplete"
 		}
 		if capture {
 			reqBytes, reqComplete := requestBody.snapshot()
@@ -188,6 +208,7 @@ func (g *Gateway) RoundTrip(r *http.Request, taskID int64) (*Exchange, error) {
 			result += ":capture_busy"
 		}
 		finish(result)
-	}}
-	return ex, nil
+	}
+	resp.Body = body
+	return ex, false, nil
 }

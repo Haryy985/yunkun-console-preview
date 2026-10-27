@@ -79,6 +79,15 @@ func TestTraceIdenticalParallelCallsAreNeverGuessed(t *testing.T) {
 	}
 }
 
+func TestAuditRecordsModelReviewDuration(t *testing.T) {
+	a := auditFor(context.Background(), Decision{
+		Action: "allow", ReviewDurationMS: 1250,
+	}, []byte(`{}`), "allowed")
+	if a.ReviewDurationMS != 1250 {
+		t.Fatalf("review duration lost: %+v", a)
+	}
+}
+
 func TestTraceSequentialIdenticalCallsAndRunIsolation(t *testing.T) {
 	ctx, trace := WithTrace(context.Background(), "test", nil)
 	input := []byte(`{}`)

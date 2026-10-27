@@ -286,6 +286,7 @@ type Decision struct {
 	ModelInput       json.RawMessage
 	ModelInputDigest string
 	ModelFallback    bool
+	ReviewDurationMS int64
 	RuleName         string
 	ConfigDigest     string
 	ProfileID        int64
@@ -453,10 +454,15 @@ func (i *Interceptor) Judge(ctx context.Context, tool string, arguments json.Raw
 		out = Decision{Action: "ask", ModelFallback: true, Message: "审查上下文不完整，需要人工确认：" + contextErr.Error()}
 	} else {
 		modelInput, _ = json.Marshal(input)
+		reviewStarted := time.Now()
 		out, err = rv(cctx, cfg.ProfileID, cfg.Prompt, input)
+		out.ReviewDurationMS = time.Since(reviewStarted).Milliseconds()
+		if out.ReviewDurationMS == 0 {
+			out.ReviewDurationMS = 1
+		}
 	}
 	if err != nil {
-		out = Decision{ProfileID: out.ProfileID, ModelFallback: true, Action: cfg.FailAction, Message: "模型审批失败,按失败策略处理: " + err.Error()}
+		out = Decision{ProfileID: out.ProfileID, ReviewDurationMS: out.ReviewDurationMS, ModelFallback: true, Action: cfg.FailAction, Message: "模型审批失败,按失败策略处理: " + err.Error()}
 	}
 	switch out.Action {
 	case "allow", "ask", "deny":

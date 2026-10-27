@@ -58,11 +58,13 @@ export function ProxyDiscoveryPanel({
   onCreatePool,
   onOpenPool,
   onChanged,
+  preferredPoolID,
   refreshKey = 0,
 }: {
   onCreatePool: () => void;
   onOpenPool: (poolID: number) => void;
   onChanged: () => void;
+  preferredPoolID?: number | null;
   refreshKey?: number;
 }) {
   const [sources, setSources] = React.useState<ProxyDiscoverySource[]>([]);
@@ -118,7 +120,12 @@ export function ProxyDiscoveryPanel({
       setTargetPool((current) =>
         poolResponse.pools.some((pool) => String(pool.id) === current)
           ? current
-          : String(poolResponse.pools[0]?.id ?? ""),
+          : String(
+              poolResponse.pools.find((pool) => pool.id === preferredPoolID)?.id ??
+                poolResponse.pools.find((pool) => pool.credentials_available !== false)?.id ??
+                poolResponse.pools[0]?.id ??
+                "",
+            ),
       );
       setSelectedSource((current) =>
         current && sourceResponse.sources.some((source) => source.id === current)
@@ -131,7 +138,7 @@ export function ProxyDiscoveryPanel({
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [preferredPoolID]);
 
   React.useEffect(() => {
     void load();
@@ -319,11 +326,17 @@ export function ProxyDiscoveryPanel({
   }
 
   async function approveResult(result: ProxyDiscoveryResult, target: "candidate" | "production") {
-    if (!targetPool) {
-      toast.error("请先选择目标代理池");
+    const reason = admissionReason(result);
+    if (reason) {
+      toast.error(reason);
       return;
     }
-    if (target === "production" && !window.confirm(`将 ${result.address} 加入目标代理池并启用？`)) return;
+    if (
+      target === "production" &&
+      !window.confirm(`将 ${result.address} 加入代理池「${selectedTargetPool?.config.name}」(#${targetPool}) 并启用？`)
+    ) {
+      return;
+    }
     setBusy(true);
     try {
       await api.approveProxyDiscoveryResult(result.id, Number(targetPool), target);
@@ -356,6 +369,12 @@ export function ProxyDiscoveryPanel({
   }
 
   const selectedSourceItem = sources.find((source) => source.id === selectedSource);
+  const selectedTargetPool = pools.find((pool) => String(pool.id) === targetPool);
+  const targetPoolIssue = !selectedTargetPool
+    ? "请选择目标代理池"
+    : selectedTargetPool.credentials_available === false
+      ? `目标代理池「${selectedTargetPool.config.name}」(#${selectedTargetPool.id}) 凭据不可解密，请恢复原密钥或更换目标池`
+      : "";
   const selectableTotal = stateFilter === "approved" ? 0 : stateFilter === "" ? total - summary.approved : total;
   const allSelected = selectableTotal > 0 && selectedIds.size === selectableTotal;
   async function toggleAllResults(checked: boolean) {
@@ -383,7 +402,7 @@ export function ProxyDiscoveryPanel({
     if (!result.authorized) return "候选不在配置的范围内";
     if (result.state === "approved") return "已入池，请在代理 IP 中管理";
     if (result.state !== "verified") return "需先验证通过";
-    if (!targetPool) return "请选择目标代理池";
+    if (targetPoolIssue) return targetPoolIssue;
     return "";
   }
 
@@ -393,8 +412,8 @@ export function ProxyDiscoveryPanel({
     ? "请先勾选候选"
     : !selectedSourceItem?.enabled
       ? "查询来源已停用"
-      : !targetPool
-        ? "请选择目标代理池"
+      : targetPoolIssue
+        ? targetPoolIssue
         : selectedOnPageResults.length === selectedIds.size && eligibleOnPage === 0
           ? "所选候选尚未满足入池条件，请检查验证状态和授权范围"
           : "";
@@ -416,7 +435,9 @@ export function ProxyDiscoveryPanel({
     if (
       action === "approve" &&
       target === "production" &&
-      !window.confirm(`将勾选的 ${ids.length} 个候选入池并启用？仅验证通过且在当前范围内的候选会成功。`)
+      !window.confirm(
+        `将勾选的 ${ids.length} 个候选加入代理池「${selectedTargetPool?.config.name}」(#${targetPool}) 并启用？仅验证通过且在当前范围内的候选会成功。`,
+      )
     )
       return;
     batchLock.current = true;
@@ -678,8 +699,8 @@ export function ProxyDiscoveryPanel({
               >
                 <option value="">选择批准目标代理池</option>
                 {pools.map((pool) => (
-                  <option key={pool.id} value={pool.id}>
-                    {pool.config.name}
+                  <option key={pool.id} value={pool.id} disabled={pool.credentials_available === false}>
+                    {pool.config.name} (#{pool.id}){pool.credentials_available === false ? " · 凭据不可解密" : ""}
                   </option>
                 ))}
               </select>
@@ -694,6 +715,9 @@ export function ProxyDiscoveryPanel({
               ) : null}
             </div>
           </div>
+          {targetPoolIssue && targetPool && (
+            <p className="text-destructive text-sm" role="alert">{targetPoolIssue}</p>
+          )}
           {pools.length === 0 ? (
             <p className="text-sm text-amber-700 dark:text-amber-400">
               尚无目标代理池。可新建空的固定节点池，接收验证通过的候选。

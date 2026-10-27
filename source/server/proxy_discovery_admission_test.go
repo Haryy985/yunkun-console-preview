@@ -144,4 +144,11 @@ func TestProxyDiscoveryAdmissionStateErrors(t *testing.T) {
 	if err != nil || unchanged == nil || unchanged.State != "pending" {
 		t.Fatalf("rejected pending candidate changed: %v %#v", err, unchanged)
 	}
+	changeProxyFixtureVault(t, s)
+	unavailable := proxyAPICall(t, s, "POST", fmt.Sprintf("/api/proxy-discovery/results/%d/approve", ids["203.0.113.15"]),
+		map[string]any{"pool_id": poolID, "target": "production"})
+	if unavailable.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(unavailable.Body.String(), fmt.Sprintf("目标代理池 #%d 凭据不可用", poolID)) {
+		t.Fatalf("unavailable pool ID missing from response: %d %s", unavailable.Code, unavailable.Body.String())
+	}
 }

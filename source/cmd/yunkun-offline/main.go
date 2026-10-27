@@ -202,6 +202,11 @@ func run() error {
 			<-exited
 		}
 	}()
+	if err := writeJSON(filepath.Join(i.home, "launcher.json"), map[string]any{
+		"pid": os.Getpid(), "console_pid": app.Process.Pid,
+	}); err != nil {
+		return err
+	}
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", *port)
 	ready, err := waitReady(ctx, baseURL, exited)
 	if err != nil {
@@ -332,7 +337,7 @@ func (i installation) ensureConfig(path string) error {
 }
 
 func (i installation) preflight() error {
-	for _, tool := range []string{"bash", "ps"} {
+	for _, tool := range []string{"bash"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			return fmt.Errorf("required system command %s is missing; use a full supported OS installation", tool)
 		}
@@ -579,25 +584,7 @@ func (i installation) stop(executable string) error {
 }
 
 func ownedProcess(pid int, executable string) error {
-	uid, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "uid=").Output()
-	if err != nil || strings.TrimSpace(string(uid)) != strconv.Itoa(os.Geteuid()) {
-		return errors.New("process ownership could not be verified; nothing was stopped")
-	}
-	var path string
-	if runtime.GOOS == "linux" {
-		path, err = os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
-	} else {
-		var out []byte
-		out, err = exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
-		path = strings.TrimSpace(string(out))
-		if err == nil && path != executable && !strings.HasPrefix(path, executable+" ") {
-			err = errors.New("process command does not match executable")
-		}
-		if err == nil {
-			return nil
-		}
-	}
-	if err != nil || path != executable {
+	if !selfupdate.ManagedOfflineProcess(pid, executable) {
 		return errors.New("process executable does not match this installation; nothing was stopped")
 	}
 	return nil

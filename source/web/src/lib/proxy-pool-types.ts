@@ -40,6 +40,7 @@ export type ProxyPool = {
   id: number;
   config: ProxyPoolConfig;
   has_credentials: boolean;
+  credentials_available?: boolean;
   quota: ProxyQuota;
 };
 
@@ -49,6 +50,8 @@ export type ProxyGlobalSettings = {
 };
 
 export type ProxyNode = {
+  runtime_cooldown_until?: string;
+  runtime_error?: string;
   id: number;
   pool_id: number;
   address: string;
@@ -120,7 +123,8 @@ export type TaskNetwork = {
   pool_name?: string;
   status?: string;
   reason?: string;
-  binding?: { task_id: number; pool_id: number; node_id?: number; mode: string };
+  binding?: { task_id: number; pool_id: number; node_id?: number; mode: string; strategy?: "round_robin" | "fixed" };
+  routing_strategy?: "round_robin" | "fixed";
   node?: ProxyNode;
   events: ProxyEvent[];
   unmanaged_tools?: string[];

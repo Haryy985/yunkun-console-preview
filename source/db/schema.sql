@@ -1862,6 +1862,19 @@ CREATE INDEX IF NOT EXISTS proxy_nodes_import_pending ON proxy_nodes(id) WHERE i
 
 ALTER TABLE task_proxy_bindings ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
 ALTER TABLE task_proxy_bindings ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
+-- Legacy bindings did not persist whether the selected node was explicit.
+-- New/default routing rotates; operators can explicitly pin a node.
+ALTER TABLE task_proxy_bindings ADD COLUMN IF NOT EXISTS strategy TEXT NOT NULL DEFAULT 'round_robin'
+    CHECK (strategy IN ('round_robin','fixed'));
+ALTER TABLE proxy_pools ADD COLUMN IF NOT EXISTS route_cursor BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE proxy_nodes ADD COLUMN IF NOT EXISTS runtime_cooldown_until TIMESTAMPTZ;
+ALTER TABLE proxy_nodes ADD COLUMN IF NOT EXISTS runtime_error TEXT NOT NULL DEFAULT '';
+CREATE TABLE IF NOT EXISTS proxy_credential_recoveries (
+    id BIGSERIAL PRIMARY KEY,
+    pool_id BIGINT NOT NULL REFERENCES proxy_pools(id),
+    previous_credentials TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS proxy_route_events (
     id BIGSERIAL PRIMARY KEY,
     task_id BIGINT REFERENCES tasks(id) ON DELETE SET NULL,

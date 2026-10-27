@@ -1795,6 +1795,7 @@ export interface InterceptAudit {
   context_truncated?: boolean;
   captured_at: string;
   model_fallback?: boolean;
+  review_duration_ms?: number;
   initial_action: "allow" | "ask" | "deny";
   initial_reason: string;
   effective_action?: "allow" | "deny";

@@ -79,8 +79,19 @@ type offlineTransport func(*http.Request) (*http.Response, error)
 
 func (f offlineTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
+func offlineTestRoot(t *testing.T) string {
+	t.Helper()
+	// macOS commonly exposes temporary directories via /var -> /private/var.
+	// Use the physical root just as the managed launcher does.
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
 func TestOfflineChecksumFailureDoesNotTouchInstallation(t *testing.T) {
-	root := t.TempDir()
+	root := offlineTestRoot(t)
 	private := filepath.Join(root, ".yunkun-local")
 	if err := os.Mkdir(private, 0o700); err != nil {
 		t.Fatal(err)
@@ -174,7 +185,7 @@ func TestOfflineReleaseArchive(t *testing.T) {
 		}
 		return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(data)), Header: make(http.Header)}, nil
 	})}
-	root := t.TempDir()
+	root := offlineTestRoot(t)
 	job, err := PrepareOffline(t.Context(), client, rel, "v1.0.6-offline", OfflineInstall{Root: root}, func(Phase, int, string) {})
 	if err != nil {
 		t.Fatal(err)
@@ -190,7 +201,7 @@ func TestOfflineReleaseArchive(t *testing.T) {
 }
 
 func TestOfflineSnapshotRestoresMatchingDataAndProgram(t *testing.T) {
-	root := t.TempDir()
+	root := offlineTestRoot(t)
 	work := filepath.Join(root, ".yunkun-local", "updates", "fixture")
 	write := func(file, value string) {
 		t.Helper()

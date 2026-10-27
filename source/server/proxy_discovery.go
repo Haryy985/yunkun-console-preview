@@ -1049,7 +1049,7 @@ func (s *Server) approveDiscoveryCandidate(ctx context.Context, id, poolID int64
 	}
 	poolSecrets, err := s.proxyPools.vault.Open(pool.Credentials)
 	if err != nil {
-		return 0, http.StatusServiceUnavailable, errors.New("目标代理池凭据不可用")
+		return 0, http.StatusServiceUnavailable, fmt.Errorf("目标代理池 #%d 凭据不可用，请检查该池的密钥或凭据", poolID)
 	}
 	upstream, err := pool.Config.Upstream(proxypool.Node{Address: result.Address}, poolSecrets)
 	if err != nil {

@@ -85,7 +85,7 @@ func (c *ChatAgent) SetGuard(g *guard.Guard) { c.guard = g }
 // agent's system prompt. Mirrors artifactSpec but without pentest-specific
 // wording ("payload", "抓响应体") that would be odd in a general assistant.
 func chatWorkDirSpec(workDir string) string {
-	return "\n\n**文件输出规约**：需要写文件时，一律写到工作目录 " + workDir + "（这是默认 CWD，相对路径即落在这里，也可用该绝对路径）——不要写 /tmp 或其他绝对路径。"
+	return "\n\n**文件输出规约**：需要写文件时，一律写到工作目录 " + workDir + "（这是默认 CWD，相对路径即落在这里，也可用该绝对路径）——不要写 /tmp 或其他绝对路径。临时下载的前端脚本等可放在 cache/；若具备 cleanup_task_cache 工具，先 preview 再 delete。重要证据保存于 cache/ 外。"
 }
 
 // chatSystem renders the DB-managed prompt body for agentKey. Custom agents have
@@ -125,7 +125,7 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	// Pure assistant: DefaultTools as the base; AugmentTools layers in the key's
 	// visible skills/MCP and lets the DB tools table filter/override. DefaultTools
 	// have no tools-table rows, so they always pass through.
-	base := actool.DefaultTools()
+	base := append(actool.DefaultTools(), taskCacheTool(sessionWorkDir))
 	ri := RunInfoFrom(ctx)
 	ri.SessionID, ri.AgentID = sessionID, agentKey
 	ctx = WithRunInfo(ctx, ri)
