@@ -86,8 +86,26 @@ Copy-Item -LiteralPath $postgres -Destination (Join-Path $stage 'runtime') -Recu
 Copy-Item -LiteralPath $vc -Destination (Join-Path $stage 'runtime\vc_redist.x64.exe') -ErrorAction Stop
 Copy-Item -Path (Join-Path $root 'skills\*') -Destination (Join-Path $stage 'skills') -Recurse -ErrorAction Stop
 
-Compress-Archive -LiteralPath $stage -DestinationPath $archive -CompressionLevel Optimal -ErrorAction Stop
 Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$stream = [IO.File]::Open($archive, [IO.FileMode]::CreateNew)
+try {
+    $writer = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Create, $true)
+    try {
+        foreach ($item in Get-ChildItem -LiteralPath $stage -File -Recurse -Force) {
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw "Linked release file not allowed: $($item.FullName)"
+            }
+            $relative = $item.FullName.Substring($stage.Length + 1).Replace('\', '/')
+            $entry = $writer.CreateEntry("$name/$relative", [IO.Compression.CompressionLevel]::Optimal)
+            $sourceStream = [IO.File]::OpenRead($item.FullName)
+            try {
+                $targetStream = $entry.Open()
+                try { $sourceStream.CopyTo($targetStream) } finally { $targetStream.Dispose() }
+            } finally { $sourceStream.Dispose() }
+        }
+    } finally { $writer.Dispose() }
+} finally { $stream.Dispose() }
 $zip = [IO.Compression.ZipFile]::OpenRead($archive)
 try {
     $entries = @($zip.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
