@@ -172,9 +172,13 @@ func TestOfflineReleaseArchive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	name := AssetName("v1.1.0-offline", "windows", "amd64")
+	version := os.Getenv("YUNKUN_TEST_OFFLINE_VERSION")
+	if version == "" {
+		version = "v1.1.0-offline"
+	}
+	name := AssetName(version, "windows", "amd64")
 	sums := fmt.Sprintf("%x  %s\n", sha256.Sum256(body), name)
-	rel := &Release{TagName: "v1.1.0-offline", Assets: []Asset{
+	rel := &Release{TagName: version, Assets: []Asset{
 		{Name: name, URL: "https://github.com/fixture/package", Size: int64(len(body))},
 		{Name: "SHA256SUMS", URL: "https://github.com/fixture/sums"},
 	}}
