@@ -31,7 +31,9 @@ def main():
     for folder in (root, candidate):
         if (folder / ".yunkun-local").exists():
             raise RuntimeError("Refusing an existing installation with private data")
-    port, db_port = 53513, 55435
+    # The preceding first-install test uses 53513/55435. Reusing those ports
+    # immediately can fail during listener teardown on native CI runners.
+    port, db_port = 53514, 55436
     for number in (port, db_port):
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", number))
