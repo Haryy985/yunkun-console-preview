@@ -147,7 +147,7 @@ def main():
             "chunk_size": 900, "chunk_overlap": 120}, token)
         task = api("/api/tasks", {"description": "upgrade-local-history",
             "goal": "Local fixture only", "seed_first_intent": False}, token)
-        api(f"/api/tasks/{task['id']}/pause", {}, token)
+        api(f"/api/tasks/{task['id']}/control", {"action": "pause"}, token)
         pool = api("/api/proxy-pools", {"config": {"name": "upgrade-fixture-proxy",
             "kind": "fixed", "enabled": False, "addresses": ["http://127.0.0.1:9"]},
             "secrets": {"proxy_username": "fixture", "proxy_password": "synthetic"}}, token)
