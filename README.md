@@ -8,7 +8,7 @@
 
 Rowan · 云鲲安全
 
-**产品介绍与使用指南 · v1.1.2 · 2026-10-27**
+**产品介绍与使用指南 · v1.1.3 · 2026-10-28**
 
 [界面预览](#界面预览) · [功能介绍](#功能介绍) · [使用流程](#使用流程) · [新增与优化](#新增与优化) · [部署说明](#部署说明)
 
@@ -18,14 +18,15 @@ Rowan · 云鲲安全
 
 ## 获取产品
 
-### 2026-10-27 v1.1.2
+### 2026-10-28 v1.1.3
 
-[完整离线包](https://github.com/Haryy985/yunkun-console-preview/releases/tag/v1.1.2-offline) · [本版更新与限制](source/docs/RELEASE_1.1.2.md) · [升级手册](source/docs/OFFLINE_UPDATE.md)
+[完整离线包](https://github.com/Haryy985/yunkun-console-preview/releases/tag/v1.1.3-offline) · [本版更新与限制](source/docs/RELEASE_1.1.3.md) · [升级手册](source/docs/OFFLINE_UPDATE.md)
 
-本版汇总代理默认轮询、故障冷却、凭据显式恢复、发现目标池联动、报告导出错误诊断、
-任务缓存清理及更新下载可靠性改进；macOS接入Unix受管一键更新流程。
+本版恢复原版漏洞登记流程，提供跨页批量删除；报告复现材料使用实际捕获的
+Burp 原始请求包，不再用 curl 冒充。全新阿里云 Linux 3 VPS 可使用
+`install-vps.sh` 安装私有服务及 HTTPS；既有 1.1.2 客户可识别更高的版本号。
 下载对应系统/架构的完整离线包并核对SHA256SUMS，不要用自动生成的Source code ZIP代替。
-历史版本介绍与测试数字见下文，不等于本版全部场景验收结果。
+历史版本介绍与测试数字见下文，不等于本版全部场景验收结果；旧版 1.1.2 保留。
 
 - 源码：[`source/`](source/)
 - Windows 完全离线版：见 [Releases](https://github.com/Haryy985/yunkun-console-preview/releases)

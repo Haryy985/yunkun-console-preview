@@ -4,7 +4,7 @@
 
 # 云鲲自动化渗透控制台
 
-v1.1.2 源码 · Windows / Linux / macOS 完整离线版另见 Releases
+v1.1.3 源码 · Windows / Linux / macOS 完整离线版另见 Releases
 
 对话与任务 · 执行流水 · RAG 知识库 · 代理资源 · HTTP 证据
 
@@ -20,9 +20,9 @@ Rowan / 云鲲安全
 Windows 用户可双击 `setup-and-start.bat`，首次联网下载依赖、编译并启动。
 需自行构建时参考 [原生部署手册](docs/DEPLOYMENT.md)；先生成前端并同步到
 `server/webui/current`，再以 `-tags embedui` 编译，避免得到没有页面的开发二进制。
-源码启动器读取 `VERSION`，本次为 `v1.1.2-offline`。
+源码启动器读取 `VERSION`，本次为 `v1.1.3-offline`。
 
-本次变更见 [1.1.2 更新说明](docs/RELEASE_1.1.2.md)，
+本次变更见 [1.1.3 更新说明](docs/RELEASE_1.1.3.md)，
 既往版本记录仍见 [1.0.3 更新说明](docs/RELEASE_1.0.3.md)。
 源码随附公开工作流和规则资料，不包含维护者的账号、密钥、数据库或日志。
 

@@ -23,23 +23,6 @@ func approveFormalReportFixture(t *testing.T, s *Server, finding *db.RecordedFin
 SET report=$2, report_evidence_version=evidence_version WHERE id=$1`, finding.FindingID, reportBody); err != nil {
 		t.Fatal(err)
 	}
-	quality, err := s.m.pg.GetFindingQuality(finding.FindingID)
-	if err != nil || quality == nil {
-		t.Fatalf("finding quality: %+v, %v", quality, err)
-	}
-	quality.QualityStatus = db.FindingQualityPass
-	quality.VulnerabilityType = "access-control"
-	quality.VerificationType = "controlled identity comparison"
-	quality.BaselineEvidence = "fixture-baseline"
-	quality.ProofEvidence = "fixture-proof"
-	quality.VerificationEvidence = "fixture-retest"
-	quality.ReproductionCount = 3
-	quality.SuccessCount = 3
-	quality.EvidenceIntegrity = "verified"
-	quality.Reviewer = "yunkun"
-	if err := s.m.pg.SetFindingQuality(t.Context(), *quality); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func TestReportsIncludeCapturedHTTPRequest(t *testing.T) {
@@ -157,7 +140,7 @@ func TestTaskReportOnlyCountsCurrentTaskAssets(t *testing.T) {
 	}
 }
 
-func TestTaskReportBlocksUnregisteredFindingsBeyondFirstThousand(t *testing.T) {
+func TestTaskReportIncludesFindingsBeyondFirstPageWithoutQualityGate(t *testing.T) {
 	s, finding, request := trafficEvidenceServer(t)
 	row, err := s.m.pg.GetFinding(finding.FindingID)
 	if err != nil || row == nil || row.TaskID == nil {
@@ -168,17 +151,23 @@ func TestTaskReportBlocksUnregisteredFindingsBeyondFirstThousand(t *testing.T) {
 		t.Fatal("task missing")
 	}
 	_, err = s.m.pg.Exec(`INSERT INTO exploration_nodes(exploration_id, kind, state, payload)
+VALUES($1, 'finding', 'confirmed',
+       jsonb_build_object('name', 'ORIGINAL_REPORT_LIMIT_SENTINEL', 'severity', 'low', 'summary', 'Local fixture'))`, task.ExpID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.m.pg.Exec(`INSERT INTO exploration_nodes(exploration_id, kind, state, payload)
 SELECT $1, 'finding', 'confirmed',
        jsonb_build_object('name', 'Pagination finding ' || i, 'severity', 'low', 'summary', 'Local fixture')
-FROM generate_series(1, 1001) AS i`, task.ExpID)
+FROM generate_series(1, 1000) AS i`, task.ExpID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	response := request("GET", fmt.Sprintf("/api/report?task=%d", *row.TaskID), "")
-	if response.Code != 409 {
-		t.Fatalf("unregistered findings should block formal report: %d %s", response.Code, response.Body.String())
+	if response.Code != 200 {
+		t.Fatalf("quality metadata must not block the original report path: %d %s", response.Code, response.Body.String())
 	}
-	if !strings.Contains(response.Body.String(), "UNREGISTERED") {
-		t.Fatalf("response should explain the quality blocker: %s", response.Body.String())
+	if !strings.Contains(response.Body.String(), "ORIGINAL_REPORT_LIMIT_SENTINEL") {
+		t.Fatal("report dropped a finding beyond the first 1000")
 	}
 }

@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"yunkun/console/notify"
 )
 
 var (
@@ -237,11 +239,7 @@ func bumpEvidenceVersionTx(tx *sql.Tx, findingID int64) error {
 	if _, err := tx.Exec(`UPDATE findings SET evidence_version=evidence_version+1 WHERE id=$1`, findingID); err != nil {
 		return err
 	}
-	_, err := tx.Exec(`UPDATE finding_quality
-		SET quality_status='NEEDS_MORE', reviewer='', reviewed_at=NULL,
-		    blocking_reason='证据绑定发生变化，需要重新审核', updated_at=now()
-		WHERE finding_id=$1 AND quality_status='PASS'`, findingID)
-	return err
+	return nil
 }
 
 func FindingTrafficTx(tx *sql.Tx, findingID int64) (*FindingTraffic, error) {
@@ -336,18 +334,14 @@ type RecordFindingInput struct {
 }
 
 type RecordedFinding struct {
-	FindingID     int64           `json:"finding_id,string"`
-	NodeID        int64           `json:"finding_node_id,string"`
-	Traffic       *FindingTraffic `json:"traffic"`
-	QualityStatus string          `json:"quality_status"`
+	FindingID int64           `json:"finding_id,string"`
+	NodeID    int64           `json:"finding_node_id,string"`
+	Traffic   *FindingTraffic `json:"traffic"`
 }
 
 // ctx 由调用方传入本次事务所用的上下文（而非在内部取 context.Background）：
 // 事务内新加的推送事件写入同样应受调用方的取消与超时约束。
 func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, prepared []PreparedTrafficEvidence) (*RecordedFinding, error) {
-	if class := ExcludedFindingClass(in.VulnClass, in.Name); class != "" {
-		return nil, fmt.Errorf("%s 不能作为独立正式漏洞；请保留为探索线索", class)
-	}
 	if err := LockTaskEvidenceTx(tx, in.TaskID); err != nil {
 		return nil, err
 	}
@@ -394,11 +388,11 @@ VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string
 VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw)).Scan(&out.FindingID); err != nil {
 		return nil, err
 	}
-	quality := evaluateFindingQuality(in, prepared)
-	if err := insertFindingQualityTx(tx, out.FindingID, quality); err != nil {
-		return nil, err
-	}
-	out.QualityStatus = quality.QualityStatus
+	RecordNotificationEventTx(ctx, tx, notify.EventFindingCreated, out.FindingID, notify.Snapshot{
+		Kind: notify.EventFindingCreated, FindingID: out.FindingID, TaskID: in.TaskID,
+		VulnClass: in.VulnClass, Name: in.Name, Severity: in.Severity,
+		Summary: in.Summary, AssetIDs: assets,
+	})
 	if err := AddFindingTrafficTx(tx, out.FindingID, prepared); err != nil {
 		return nil, err
 	}

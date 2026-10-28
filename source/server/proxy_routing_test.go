@@ -91,6 +91,32 @@ func TestProxyRoundRobinDefaultAndConcurrentSelection(t *testing.T) {
 	}
 }
 
+func TestNetworkStatusDescribesBashProxyCoverageAndRotation(t *testing.T) {
+	s := newProxyFixture(t)
+	poolID := createTestPool(t, s, "http://127.0.0.1:19991")
+	task, err := s.m.pg.CreateTaskWithOptions("network status", "local fixture", db.TaskCreateOptions{ProxyPoolID: &poolID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.proxyPools.baseURL = "http://127.0.0.1:5173"
+	status, err := s.networkStatus(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed, _ := status["managed_tools"].([]string)
+	unmanaged, _ := status["unmanaged_tools"].([]string)
+	if status["routing_strategy"] != "round_robin" ||
+		status["failure_policy"] != "same_pool_failover_then_stop" ||
+		!strings.Contains(strings.Join(managed, "\n"), "Bash child HTTP(S)/CONNECT clients honoring HTTP_PROXY, HTTPS_PROXY or ALL_PROXY") ||
+		!strings.Contains(strings.Join(unmanaged, "\n"), "Bash commands that ignore proxy environment variables or open raw sockets") {
+		t.Fatalf("network status does not accurately describe task proxy behavior: %#v", status)
+	}
+	addr, _ := s.taskProxyAddress(task.ID)
+	if !strings.Contains(addr, "127.0.0.1") {
+		t.Fatalf("task Bash proxy is not the local task gateway: %q", addr)
+	}
+}
+
 func TestProxyRoundRobinFixedCooldownAndPolicyChanges(t *testing.T) {
 	s := newProxyFixture(t)
 	poolID := createTestPool(t, s, "http://127.0.0.1:19991")

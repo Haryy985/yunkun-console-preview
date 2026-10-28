@@ -1198,64 +1198,9 @@ CREATE TRIGGER trg_conversation_retest_delete BEFORE DELETE ON conversations
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS evidence_version BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report_evidence_version BIGINT NOT NULL DEFAULT 0;
 
--- Quality is separate from triage status: records can remain available for
--- investigation without being eligible for a formal report.
-CREATE TABLE IF NOT EXISTS finding_quality (
-    finding_id BIGINT PRIMARY KEY REFERENCES findings(id) ON DELETE CASCADE,
-    quality_status TEXT NOT NULL DEFAULT 'NEEDS_MORE'
-        CHECK (quality_status IN ('PASS','NEEDS_MORE','DOWNGRADE','DUPLICATE_RISK','BLOCKED')),
-    vulnerability_type TEXT NOT NULL DEFAULT '',
-    verification_type TEXT NOT NULL DEFAULT '',
-    baseline_evidence TEXT NOT NULL DEFAULT '',
-    proof_evidence TEXT NOT NULL DEFAULT '',
-    verification_evidence TEXT NOT NULL DEFAULT '',
-    verification_rationale TEXT NOT NULL DEFAULT '',
-    reproduction_count INTEGER NOT NULL DEFAULT 0 CHECK (reproduction_count >= 0),
-    success_count INTEGER NOT NULL DEFAULT 0 CHECK (success_count >= 0),
-    blocking_reason TEXT NOT NULL DEFAULT '',
-    duplicate_risk TEXT NOT NULL DEFAULT '',
-    evidence_integrity TEXT NOT NULL DEFAULT '',
-    reviewer TEXT NOT NULL DEFAULT '',
-    reviewed_at TIMESTAMPTZ,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_finding_quality_status
-    ON finding_quality (quality_status, updated_at DESC);
-ALTER TABLE finding_quality ADD COLUMN IF NOT EXISTS verification_rationale TEXT NOT NULL DEFAULT '';
-
-CREATE OR REPLACE FUNCTION invalidate_finding_quality_on_severity_change() RETURNS trigger
-LANGUAGE plpgsql AS $$
-BEGIN
-    UPDATE finding_quality
-       SET quality_status='NEEDS_MORE', reviewer='', reviewed_at=NULL,
-           blocking_reason='严重等级发生变化，需要重新审核', updated_at=now()
-     WHERE finding_id=NEW.id AND quality_status='PASS';
-    RETURN NEW;
-END;
-$$;
+-- Keep historical quality rows in existing databases, but stop using them.
 DROP TRIGGER IF EXISTS trg_finding_quality_severity_change ON findings;
-CREATE TRIGGER trg_finding_quality_severity_change
-AFTER UPDATE OF severity ON findings
-FOR EACH ROW WHEN (OLD.severity IS DISTINCT FROM NEW.severity)
-EXECUTE FUNCTION invalidate_finding_quality_on_severity_change();
-
--- Existing installations predate the quality table. Seed conservative,
--- review-required rows so their detail pages can be reviewed immediately;
--- never promote historical findings to PASS automatically.
-INSERT INTO finding_quality
-    (finding_id, quality_status, vulnerability_type, proof_evidence,
-     blocking_reason, evidence_integrity)
-SELECT f.id,
-       CASE WHEN f.severity = 'low' THEN 'DOWNGRADE' ELSE 'NEEDS_MORE' END,
-       COALESCE(f.vulnclass, ''),
-       COALESCE(f.evidence, ''),
-       CASE WHEN f.severity = 'low'
-            THEN '低危记录不进入中危及以上正式报告'
-            ELSE '历史记录需要人工审核' END,
-       CASE WHEN COALESCE(f.evidence, '') = ''
-            THEN 'incomplete' ELSE 'text_evidence' END
-FROM findings f
-ON CONFLICT (finding_id) DO NOTHING;
+DROP FUNCTION IF EXISTS invalidate_finding_quality_on_severity_change();
 
 CREATE TABLE IF NOT EXISTS traffic_evidence_snapshots (
     id TEXT PRIMARY KEY,

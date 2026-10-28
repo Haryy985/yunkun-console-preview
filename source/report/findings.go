@@ -143,7 +143,7 @@ func redactCurlLines(text string) string {
 		return text
 	}
 	lines := strings.Split(text, "\n")
-	const notice = "[旧版 curl 命令已从交付报告省略；请绑定实际 HTTP 请求包]"
+	const notice = "[curl 命令不作为可复现证据，已从交付报告省略；请查看下方“关联流量证据”中的真实捕获请求包。若无请求包，报告不具备 HTTP 重放条件]"
 	continuation := false
 	for i, line := range lines {
 		if continuation || ContainsCurlCommand(line) {

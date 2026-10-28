@@ -476,6 +476,18 @@ func TestFindingTrafficUTF8SegmentsAndInheritedWrites(t *testing.T) {
 	if _, err = s.m.traffic.DeleteHost("evidence.local"); err != nil {
 		t.Fatal(err)
 	}
+	rejected, err := s.toolUpdateFindingReport().Call(ctx, json.RawMessage(fmt.Sprintf(
+		`{"finding_id":%d,"evidence_version":1,"report":"## 复现\ncurl https://evidence.local/private"}`, f.NodeID)), nil)
+	if err != nil || !rejected.IsError || !strings.Contains(rejected.Flatten(), "不能包含 curl") {
+		t.Fatalf("curl report was not rejected: %v %v", rejected, err)
+	}
+	unchanged, err := s.m.pg.GetFinding(f.FindingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Report != "" {
+		t.Fatalf("rejected curl report was persisted: %q", unchanged.Report)
+	}
 	result, err := s.toolUpdateFindingReport().Call(ctx, json.RawMessage(fmt.Sprintf(`{"finding_id":%d,"evidence_version":1,"report":"## 证据报告\n\n证据 #%d：已验证完整请求响应"}`, f.NodeID, list.Bindings[0].ID)), nil)
 	if err != nil || result.IsError {
 		t.Fatal(result, err)

@@ -919,10 +919,18 @@ func (s *Server) networkStatus(taskID int64) (map[string]any, error) {
 	if b == nil {
 		return map[string]any{"mode": "default", "bound": false, "enforced": false}, nil
 	}
-	out := map[string]any{"bound": true, "binding": b, "enforced": false, "supported_protocols": []string{"HTTP", "HTTPS"}, "failure_policy": "stop", "capture": "connection_metadata_only",
-		"managed_tools":   []string{"HTTP", "WebFetch"},
-		"unmanaged_tools": []string{"Bash (environment only)", "interactive_shell", "browser/MCP", "custom network tools", "asset enrichment", "web_search", "LLM/provider requests"},
-		"coverage":        "managed_http_tools_only"}
+	out := map[string]any{"bound": true, "binding": b, "enforced": false, "supported_protocols": []string{"HTTP", "HTTPS", "CONNECT"},
+		"failure_policy": "stop", "capture": "connection_metadata_only",
+		"managed_tools": []string{
+			"HTTP", "WebFetch",
+			"Bash child HTTP(S)/CONNECT clients honoring HTTP_PROXY, HTTPS_PROXY or ALL_PROXY",
+		},
+		"unmanaged_tools": []string{
+			"Bash commands that ignore proxy environment variables or open raw sockets",
+			"interactive_shell", "browser/MCP", "custom network tools", "asset enrichment",
+			"web_search", "LLM/provider requests",
+		},
+		"coverage": "task_proxy_aware_tools_only; Bash proxy environment is advisory, not enforced"}
 	out["routing_strategy"] = b.Strategy
 	if b.Strategy == "round_robin" {
 		out["failure_policy"] = "same_pool_failover_then_stop"

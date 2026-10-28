@@ -170,13 +170,13 @@ func TestFindingWorkflowAutoHintToPlannerAndSetting(t *testing.T) {
 	// assembled tool, even if the model sends the old optional evidence fields.
 	offProof := map[string]any{"authorization": "fixture scope", "asset": "local service", "identity": "test account", "preconditions": "fixture",
 		"baseline": "normal response", "mutation": "bounded request", "observed_delta": "changed response", "security_impact": "verified difference", "cleanup": "no state change"}
-	offResult := workflowCall(t, ctx, report, map[string]any{"vulnclass": "TEST", "severity": "low", "summary": "off",
-		"evidence": "fixture evidence", "validation": offProof, "evidence_hint_id": hints.IDs[0]}, true)
-	if !strings.Contains(offResult, "evidence_step_ids") {
-		t.Fatal("finding without non-HTTP proof should be rejected when traffic binding is disabled", offResult)
+	offResult := workflowCall(t, ctx, report, map[string]any{"vulnclass": "CORS", "severity": "low", "summary": "off",
+		"evidence": "", "validation": offProof, "evidence_hint_id": hints.IDs[0]}, false)
+	if !strings.Contains(offResult, `"finding_id"`) {
+		t.Fatal("original finding contract rejected low severity or optional evidence", offResult)
 	}
-	if notices != 1 {
-		t.Fatal("rejected report notified the planner")
+	if notices != 2 {
+		t.Fatal("saved finding did not notify the planner")
 	}
 	intentID, err := task.Store.AddIntent(map[string]any{"summary": "non-HTTP proof"}, 1, nil, "planner")
 	if err != nil {
@@ -200,14 +200,14 @@ func TestFindingWorkflowAutoHintToPlannerAndSetting(t *testing.T) {
 	if offRecord.FindingID <= 0 || len(offRecord.Traffic.Bindings) != 0 || offRecord.EvidenceStatus != "not_bound" || !strings.Contains(offRecord.EvidenceNote, "已关闭") {
 		t.Fatal("disabled binding discarded non-HTTP finding or bound evidence", offResult)
 	}
-	if notices != 2 {
+	if notices != 3 {
 		t.Fatal("non-HTTP proof failed")
 	}
 	workflowCall(t, ctx, s.toolGetFindingTraffic(), map[string]any{"finding_id": recorded.FindingID}, false)
 	tools, def, closeTools := agent.AugmentTools(ctx, "planner", ts.PlannerTools())
 	defer closeTools()
-	if !strings.Contains(def.FindingGuidance, "漏洞质量门槛") || strings.Contains(def.FindingGuidance, "报告前自动关联流量") {
-		t.Fatal("disabled binding removed quality guidance or kept auto-binding guidance")
+	if strings.Contains(def.FindingGuidance, "漏洞质量门槛") || strings.Contains(def.FindingGuidance, "报告前自动关联流量") {
+		t.Fatal("disabled binding retained the removed quality gate or auto-binding guidance")
 	}
 	for _, tool := range tools {
 		if tool.Name() == "bind_finding_traffic" {
@@ -283,7 +283,7 @@ func TestFindingWorkflowMigrationPreservesUserConfiguration(t *testing.T) {
 	}
 }
 
-func TestFindingQualitySchemaMigrationPreservesUserConfiguration(t *testing.T) {
+func TestRestoreOriginalFindingSchemaPreservesUserConfiguration(t *testing.T) {
 	s, _, _ := trafficEvidenceServer(t)
 	pg := s.m.pg
 	original, err := pg.GetTool("report_finding")
@@ -299,26 +299,18 @@ func TestFindingQualitySchemaMigrationPreservesUserConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 	properties := objectProperty(schema, "properties")
-	delete(properties, "validation")
-	delete(properties, "learning")
+	properties["validation"] = map[string]any{"type": "object"}
+	properties["learning"] = map[string]any{"type": "object"}
+	properties["custom_field"] = map[string]any{"type": "string"}
 	properties["summary"] = map[string]any{"type": "string", "description": "USER SUMMARY"}
 	required, _ := schema["required"].([]any)
-	kept := make([]any, 0, len(required))
-	for _, item := range required {
-		if item != "validation" {
-			kept = append(kept, item)
-		}
-	}
-	schema["required"] = kept
+	schema["required"] = append(required, "validation")
 	custom, _ := json.Marshal(schema)
 	if err := pg.UpdateTool("report_finding", "USER DESCRIPTION", custom, json.RawMessage(`["worker"]`), false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pg.Exec(`DELETE FROM settings WHERE key='finding_quality_schema_v1'`); err != nil {
-		t.Fatal(err)
-	}
-	s.seedFindingQualitySchema()
-	s.seedFindingQualitySchema()
+	s.restoreOriginalFindingSchema()
+	s.restoreOriginalFindingSchema()
 	after, err := pg.GetTool("report_finding")
 	if err != nil || after == nil {
 		t.Fatal(err)
@@ -331,18 +323,19 @@ func TestFindingQualitySchemaMigrationPreservesUserConfiguration(t *testing.T) {
 	}
 	properties = objectProperty(schema, "properties")
 	summary, _ := properties["summary"].(map[string]any)
-	if summary["description"] != "USER SUMMARY" || properties["validation"] == nil || properties["learning"] == nil {
-		t.Fatal("migration lost custom description or missing quality parameters")
+	if summary["description"] != "USER SUMMARY" || properties["validation"] != nil ||
+		properties["learning"] != nil || properties["custom_field"] == nil {
+		t.Fatal("migration did not remove validation or preserve custom fields")
 	}
 	required, _ = schema["required"].([]any)
 	count := 0
 	for _, item := range required {
-		if item == "validation" {
+		if item == "validation" || item == "learning" {
 			count++
 		}
 	}
-	if count != 1 {
-		t.Fatalf("validation requirement repeated or absent: %d", count)
+	if count != 0 {
+		t.Fatalf("validation requirement still present: %d", count)
 	}
 }
 
@@ -361,7 +354,10 @@ func TestFindingWorkflowReporterBindsBeforeWritingReport(t *testing.T) {
 	seedServerEvidenceFlow(t, s, "reporter-baseline", []byte("local normal response"))
 	tools, def, cleanup := agent.AugmentTools(ctx, "reporter", nil)
 	defer cleanup()
-	if !strings.Contains(def.FindingGuidance, "报告前自动关联流量") || !strings.Contains(def.FindingGuidance, "绑定成功后重新调用") {
+	if !strings.Contains(def.FindingGuidance, "报告前自动关联流量") ||
+		!strings.Contains(def.FindingGuidance, "绑定成功后重新调用") ||
+		!strings.Contains(def.FindingGuidance, "最终报告严禁包含 curl 命令") ||
+		!strings.Contains(def.FindingGuidance, "Burp Repeater") {
 		t.Fatal("reporter did not receive binding workflow")
 	}
 	for _, name := range []string{"traffic_search", "traffic_get", "get_task_worker_trace", "get_task_node_detail", "bind_finding_traffic", "get_finding_traffic", "update_finding_report"} {

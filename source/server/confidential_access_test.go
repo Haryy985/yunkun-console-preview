@@ -42,7 +42,6 @@ func TestConfidentialAccessFailsClosed(t *testing.T) {
 		for _, path := range []string{
 			"/api/exploration/findings/export",
 			"/api/exploration/findings/1",
-			"/api/exploration/findings/1/quality",
 			"/api/exploration/findings/1/traffic/2",
 			"/api/exploration/findings/1/traffic/2/body",
 			"/api/report",
@@ -51,9 +50,6 @@ func TestConfidentialAccessFailsClosed(t *testing.T) {
 			if roleAllows(role, "GET", path) {
 				t.Fatalf("%s can access %s", role, path)
 			}
-		}
-		if roleAllows(role, "PUT", "/api/exploration/findings/1/quality") {
-			t.Fatalf("%s can modify finding quality", role)
 		}
 	}
 	r := httptest.NewRequest("GET", "/api/confidential-access-events", nil)

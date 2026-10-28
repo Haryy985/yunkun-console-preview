@@ -1248,36 +1248,16 @@ func (t *ToolSet) goalMet() actool.CoreTool {
 // --- worker write tools ---
 
 func (t *ToolSet) addFinding() actool.CoreTool {
-	return writeTool("report_finding", "仅记录证据齐全且有实际安全影响的已确认漏洞。不要把 CORS、IDOR、BOLA 作为独立正式漏洞；它们只有在已证明数据读取、权限提升或重大业务影响链时才按最终影响报告，否则用 record_fact 保存线索。validation 填写授权、目标、身份、基线、受控变异、实际差异、影响和清理；提供本任务成功工具结果的 evidence_step_ids 或核实的 traffic_refs。缺失则用 record_fact 记录待验证线索，不得硬报。返回 finding_id 与 finding_node_id。", obj(map[string]any{
+	return writeTool("report_finding", "记录确认的漏洞，用 evidence 提供命令输出、日志等可验证证据。任务上下文传当前 intent_id。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。", obj(map[string]any{
 		"vulnclass": str("漏洞类别"), "name": str("漏洞名称"), "severity": str("critical|high|medium|low"), "summary": str("发现摘要"),
 		"intent_id": idp("当前任务的意图 id"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "受影响资产 id"},
-		"evidence": str("实际验证的关键输出；不得填推测"),
-		"validation": obj(map[string]any{
-			"authorization": str("授权依据与边界"), "asset": str("确切资产/接口/端口"),
-			"identity":      str("测试账号/角色；匿名则明确写匿名"),
-			"preconditions": str("复现所需前置条件；无则写无"),
-			"baseline":      str("正常请求或对照行为"), "mutation": str("一次受控变异"),
-			"observed_delta":    str("实际观察到的响应或状态差异"),
-			"security_impact":   str("实际验证的安全影响，不写假设中的最坏情况"),
-			"cleanup":           str("清理/回滚及最终状态；无需清理则写无状态变更"),
-			"evidence_step_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本意图已成功执行的工具结果步骤 ID；有真实流量引用时可留空"},
-		}, "authorization", "asset", "identity", "preconditions", "baseline", "mutation", "observed_delta", "security_impact", "cleanup"),
-		"learning": obj(map[string]any{
-			"reusable":          map[string]any{"type": "boolean", "description": "是否确有可在其他授权任务复用的新方法；不确定填 false"},
-			"knowledge_base_id": intp("可复用时填任务已授权的知识库 ID"),
-			"title":             str("通用方法标题，不含目标标识"),
-			"method":            str("经实际验证的通用方法摘要，不含凭据或目标请求包"),
-			"applicability":     str("适用前提和范围"),
-			"limitations":       str("局限、未验证条件和避免误报的检查"),
-		}, "reusable"),
+		"evidence": str("证据/PoC 文本"),
 		"evidence_hint_id": idp("可选：本任务中对应此漏洞的提示节点 ID，自动携带其结构化 traffic_refs；不能引用继承提示或其他漏洞的提示"),
 		"traffic_refs": map[string]any{"type": "array", "description": "可选；HTTP/HTTPS 漏洞先检索并逐条核实请求/响应确实支持漏洞结论，再按复现顺序填写真实 ID。TCP 等非 HTTP 漏洞、未采集或找不到确切记录时省略或传 []，不阻止上报；可在 evidence 说明原因并提供其他可验证证据。不要猜测 ID、按域名/时间推定关联或仅为补包重复探测。用途 baseline 正常对照 / proof 漏洞证明 / verification 补充验证 / supporting 辅助证据。",
 			"items": obj(map[string]any{"traffic_id": str("traffic_search 返回的真实流量 ID"), "role": map[string]any{"type": "string", "enum": []string{"baseline", "proof", "verification", "supporting"}}, "note": str("该流量如何支持漏洞结论")}, "traffic_id")},
-	}, "vulnclass", "severity", "summary", "evidence", "validation"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+	}, "vulnclass", "severity", "summary"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 		var a struct {
 			VulnClass, Name, Severity, Summary, Evidence string
-			Validation                                   FindingValidation `json:"validation"`
-			Learning                                     *findingLearning  `json:"learning"`
 			IntentID                                     json.RawMessage   `json:"intent_id"`
 			AssetIDs                                     []json.RawMessage `json:"asset_ids"`
 			TrafficRefs                                  []db.TrafficRef   `json:"traffic_refs"`
@@ -1285,9 +1265,6 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		}
 		if err := json.Unmarshal(in, &a); err != nil {
 			return actool.Errorf(err.Error()), nil
-		}
-		if class := db.ExcludedFindingClass(a.VulnClass, a.Name); class != "" {
-			return actool.Errorf(fmt.Sprintf("%s 已被任务策略排除，不登记为独立正式漏洞；用 record_fact 保留线索。不得只改标签或夸大影响绕过审核", class)), nil
 		}
 		if t.ts == nil {
 			return actool.Errorf("report_finding 需要任务上下文；平台对话请通过 add_task_hint 向对应任务交接漏洞，并在提示中携带已有的 traffic_refs，由任务 Agent 登记。已登记漏洞可用 bind_finding_traffic 补绑。"), nil
@@ -1307,24 +1284,8 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if err != nil {
 			return actool.Errorf(err.Error()), nil
 		}
-		if strings.TrimSpace(a.Evidence) == "" {
-			return actool.Errorf("evidence 不能为空；证据不足请用 record_fact 标记待验证"), nil
-		}
 		intentID := pid(a.IntentID)
-		runIntentID := RunInfoFrom(ctx).IntentID
-		if runIntentID > 0 && intentID > 0 && intentID != runIntentID {
-			return actool.Errorf("intent_id 与当前 Worker 意图不一致"), nil
-		}
-		if intentID <= 0 {
-			intentID = runIntentID
-		}
-		if intentID <= 0 {
-			intentID = t.ownerNode
-		}
-		if err := validateFindingProof(a.Validation, refs, t.ts, intentID); err != nil {
-			return actool.Errorf(err.Error()), nil
-		}
-		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: intentID, VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: findingProofText(a.Validation, a.Evidence), Worker: t.worker, AssetIDs: pidList(a.AssetIDs)}
+		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: intentID, VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs)}
 		var recorded *db.RecordedFinding
 		if t.findingRecorder != nil {
 			recorded, err = t.findingRecorder.Record(ctx, input, refs)
@@ -1353,30 +1314,9 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		}
 		result := struct {
 			*db.RecordedFinding
-			EvidenceStatus     string `json:"evidence_status"`
-			EvidenceNote       string `json:"evidence_note,omitempty"`
-			LearningProposalID int64  `json:"learning_proposal_id,omitempty"`
-			LearningNote       string `json:"learning_note,omitempty"`
+			EvidenceStatus string `json:"evidence_status"`
+			EvidenceNote   string `json:"evidence_note,omitempty"`
 		}{RecordedFinding: recorded, EvidenceStatus: "bound"}
-		if a.Learning != nil && a.Learning.Reusable {
-			proposal, proposalErr := a.Learning.proposal(t.taskID, recorded.FindingID, t.worker)
-			if proposalErr == nil && t.ragDB != nil {
-				proposalErr = t.canProposeRAG(ctx)
-				if proposalErr == nil {
-					var pending *db.RAGChangeProposal
-					pending, proposalErr = t.ragDB.CreateRAGProposal(proposal)
-					if proposalErr == nil {
-						result.LearningProposalID = pending.ID
-						result.LearningNote = "可复用经验已提交待人工审核，尚未进入检索。"
-					}
-				}
-			} else if proposalErr == nil {
-				proposalErr = fmt.Errorf("RAG 数据库不可用")
-			}
-			if proposalErr != nil {
-				result.LearningNote = "漏洞已保存，但知识提案未创建：" + proposalErr.Error()
-			}
-		}
 		if len(recorded.Traffic.Bindings) == 0 {
 			result.EvidenceStatus = "not_bound"
 			result.EvidenceNote = "漏洞已保存，未绑定流量。TCP/无包情形可正常继续；若已有核实的 HTTP 流量，请用可用的 bind_finding_traffic 或漏洞页面补绑，再完成证据交接。不要重复创建漏洞。"

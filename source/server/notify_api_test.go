@@ -92,8 +92,7 @@ func newNotifyFixture(t *testing.T) *notifyFixture {
 	return f
 }
 
-// record 走真实的证据写入路径落一条漏洞，再完成质量审核。
-// 未通过审核的低危线索不会产生漏洞通知。
+// record walks the real finding persistence path; creation queues notification immediately.
 func (f *notifyFixture) record(t *testing.T, vulnclass, severity string) int64 {
 	t.Helper()
 	out, err := f.s.evidenceStore().Record(context.Background(), db.RecordFindingInput{
@@ -108,24 +107,6 @@ func (f *notifyFixture) record(t *testing.T, vulnclass, severity string) int64 {
 	}, nil)
 	if err != nil {
 		t.Fatalf("记录漏洞失败: %v", err)
-	}
-	if severity != "low" {
-		quality, err := f.pg.GetFindingQuality(out.FindingID)
-		if err != nil || quality == nil {
-			t.Fatalf("读取质量状态失败: %v", err)
-		}
-		quality.QualityStatus = db.FindingQualityPass
-		quality.Reviewer = "notify-test-reviewer"
-		quality.VerificationType = "controlled_reproduction"
-		quality.ProofEvidence = "local proof"
-		quality.VerificationEvidence = "local verification"
-		quality.VerificationRationale = "baseline compared against controlled request"
-		quality.ReproductionCount = 3
-		quality.SuccessCount = 3
-		quality.EvidenceIntegrity = "verified"
-		if err := f.pg.SetFindingQuality(context.Background(), *quality); err != nil {
-			t.Fatalf("审核漏洞失败: %v", err)
-		}
 	}
 	return out.FindingID
 }

@@ -9,8 +9,6 @@ import (
 )
 
 const findingIDGuidance = "\n\n**漏洞编号约定**：finding_id 是独立漏洞记录 ID；finding_node_id 是探索节点 ID。list_findings / list_task_findings / node_detail / get_task_node_detail 的 id 保留为探索节点 ID，应从同一返回的 finding_id 读取独立编号。get_finding_traffic / bind_finding_traffic 用独立 finding_id。旧 update_finding_report 的 finding_id 参数仍传 finding_node_id。不要把 report_finding 第一行的数字用于证据工具，也不要遇到编号错误后猜测其他数字。"
-const findingQualityGuidance = "\n\n**漏洞质量门槛**：report_finding 的 validation 必须填写授权、目标、身份、前置条件、正常基线、受控变异、实际差异、已验证影响与清理结果。引用本任务成功的工具结果步骤 ID（可由 get_worker_trace 查看），或交接已逐条核实的真实流量 ID；缺失时工具拒绝入库。本项目按用户偏好排除 CORS／IDOR／BOLA 专项及正式报告，已有此类观察只用 record_fact 保留线索。这是项目排除项，不代表这些类别普遍无危害；不得改名、隐藏类型或推高等级来绕过排除规则。其他候选也必须有可重复的实际安全影响才能上报。版本、扫描器告警、路由名称或单个错误码只是线索；不得编造复现。没有捕获 HTTP 报文但有真实工具结果的，可记录证据缺口，不得补造请求包。"
-const ragLearningGuidance = "\n\n**知识积累**：已验证漏洞若带来确实可复用的新方法，report_finding 的 learning 填 reusable=true、已授权知识库 ID、通用方法、适用条件与局限；且当前 Agent 获得 propose_rag_change 权限时，工具成功保存漏洞后自动生成待审核提案，并以 finding ID 追溯来源。不确定、只是目标特有信息或没有授权知识库时填 reusable=false。单独的新思路或用户强调的通用规则可用 propose_rag_change 提案，注明待验证程度。不得包含凭据、个人数据或目标请求包，不为积累知识额外探测；人工批准前不会进入检索。"
 const reporterHTTPGuidance = ` 
 
 **报告交付格式（优先于旧模板的通用字段）**：正式漏洞报告按以下顺序组织，缺少证据的字段明确写“未验证”或“未提供”，不得推断补齐：
@@ -25,7 +23,7 @@ const reporterHTTPGuidance = `
 
 各大块之间单独使用全角分隔行“＃”。描述和危害用清楚、精炼的中文，不写科普或未经验证的权限影响。报告不得把“未登录”当作“匿名未授权”，也不得把带会话的操作标成匿名。CVSS 只有在向量和分值可从证据可靠计算时才填写，否则省略。
 
-**HTTP 请求包**：对已绑定并核实的 HTTP 漏洞，复现步骤引用捕获的原始 HTTP 请求包，包含实际保存的请求行、Host、请求头、空行和完整文本正文，并标记绑定编号及 baseline / proof / verification 用途。不得从 URL、curl 或模型记忆补造请求包、头字段、Cookie 或正文；不要把 curl 当作 HTTP 请求包。正文分段时必须读完，遇到缺失、二进制或无法读取时，明确说明并引用证据编号。非 HTTP 漏洞使用实际验证过的命令或记录，不强行套 HTTP 格式。敏感原始包只保存在受限的保密报告路径中。`
+**HTTP 请求包**：对已绑定并核实的 HTTP 漏洞，报告正文必须引用捕获的原始 HTTP 请求包，包含实际保存的请求行、Host、请求头、空行和完整文本正文，并标记绑定编号及 baseline / proof / verification 用途，格式应可直接粘贴到 Burp Repeater。最终报告严禁包含 curl 命令。不得从 URL、curl、响应或模型记忆转换、补造请求包、头字段、Cookie 或正文。正文分段时必须读完；遇到缺失、二进制、过大或无法读取时，明确说明未捕获可复现的原始请求包并引用证据编号，不得用 curl 代替或声称可复现。敏感原始包只保存在受限的保密报告路径中。`
 
 // The server supplies the persisted setting. A missing setting/host is off.
 // Consulted at assembly and again on writes so an already-running session
@@ -64,11 +62,11 @@ func findingWorkflowTools(agentKey string, tools []actool.CoreTool) ([]actool.Co
 		if agentKey == "reporter" {
 			for _, tool := range out {
 				if tool.Name() == "update_finding_report" {
-					return out, reporterHTTPGuidance + qualityAndLearningGuidance(out)
+					return out, reporterHTTPGuidance
 				}
 			}
 		}
-		return out, qualityAndLearningGuidance(out)
+		return out, ""
 	}
 	out := append([]actool.CoreTool(nil), tools...)
 	has := map[string]bool{}
@@ -106,20 +104,7 @@ func findingWorkflowTools(agentKey string, tools []actool.CoreTool) ([]actool.Co
 	if agentKey == "reporter" && has["update_finding_report"] {
 		guidance += reporterHTTPGuidance
 	}
-	return out, guidance + qualityAndLearningGuidance(out)
-}
-
-func qualityAndLearningGuidance(tools []actool.CoreTool) string {
-	guidance := ""
-	for _, tool := range tools {
-		switch tool.Name() {
-		case "report_finding":
-			guidance += findingQualityGuidance
-		case "propose_rag_change":
-			guidance += ragLearningGuidance
-		}
-	}
-	return guidance
+	return out, guidance
 }
 
 func stripTrafficParameters(schema map[string]any) {

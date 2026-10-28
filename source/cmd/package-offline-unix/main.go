@@ -49,6 +49,7 @@ func main() {
 
 func run() error {
 	source := flag.String("source", ".", "current reviewed source directory")
+	candidateVersion := flag.String("candidate-version", "", "local review build version; must extend the source VERSION")
 	cache := flag.String("runtime-cache", "", "directory containing pinned v1.0.3 runtime archives")
 	systemCache := flag.String("system-runtime-cache", "", "directory containing pinned Debian GCC runtime packages and licenses")
 	platform := flag.String("platform", "", "linux-amd64, linux-arm64, darwin-amd64 or darwin-arm64")
@@ -64,8 +65,11 @@ func run() error {
 		return err
 	}
 	version := strings.TrimSpace(string(versionBytes))
-	if !regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+-offline$`).MatchString(version) {
+	if !validPackageVersion(version, *candidateVersion) {
 		return errors.New("invalid offline version")
+	}
+	if *candidateVersion != "" {
+		version = *candidateVersion
 	}
 	runtimeArchive := filepath.Join(*cache, "yunkun-v1.0.3-offline-"+spec.label+".tar.gz")
 	entries, err := readRuntime(runtimeArchive, spec)
@@ -126,6 +130,12 @@ func run() error {
 			return err
 		}
 		entries["Start-Yunkun.command"] = entry{bytes.ReplaceAll(b, []byte("\r\n"), []byte("\n")), 0755}
+	} else {
+		b, err := regularFile(filepath.Join(*source, "scripts", "install-vps.sh"))
+		if err != nil {
+			return err
+		}
+		entries["install-vps.sh"] = entry{bytes.ReplaceAll(b, []byte("\r\n"), []byte("\n")), 0755}
 	}
 	skillRoot := filepath.Join(*source, "skills")
 	if err := filepath.WalkDir(skillRoot, func(p string, d fs.DirEntry, err error) error {
@@ -244,6 +254,17 @@ func run() error {
 	done = true
 	fmt.Printf("%s\nSHA256 %s\n%d reviewed entries; no installation directory read\n", archive, sum, len(names))
 	return nil
+}
+
+func validPackageVersion(base, candidate string) bool {
+	if !regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+-offline$`).MatchString(base) {
+		return false
+	}
+	if candidate == "" {
+		return true
+	}
+	return regexp.MustCompile(`^\+[a-z0-9][a-z0-9.-]*$`).MatchString(strings.TrimPrefix(candidate, base)) &&
+		strings.HasPrefix(candidate, base+"+")
 }
 
 func safeName(name string) error {

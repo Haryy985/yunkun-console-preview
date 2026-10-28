@@ -33,11 +33,7 @@ func TestReportFindingOptionalTrafficWithoutCapture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stepID, err := ts.ts.AppendActivity(db.Activity{NodeID: &intent, Kind: "tool_result", Tool: "Bash", Detail: "fixture observed result"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	proof := fmt.Sprintf(`"intent_id":%d,"validation":{"authorization":"fixture scope","asset":"local TCP service","identity":"test account","preconditions":"fixture","baseline":"normal response","mutation":"one bounded request","observed_delta":"changed response","security_impact":"verified state difference","cleanup":"no state change","evidence_step_ids":[%d]},"learning":{"reusable":false}`, intent, stepID)
+	proof := fmt.Sprintf(`"intent_id":%d`, intent)
 	notices := 0
 	ts.notifyFinding = func(int64, string) { notices++ }
 	for _, refs := range []string{"", `,"traffic_refs":[]`, `,"traffic_refs":null`} {
@@ -56,6 +52,18 @@ func TestReportFindingOptionalTrafficWithoutCapture(t *testing.T) {
 	}
 	if notices != 3 {
 		t.Fatalf("successful reports notified %d times", notices)
+	}
+	res, err := ts.addFinding().Call(t.Context(), json.RawMessage(`{"vulnclass":"TCP","severity":"low","summary":"optional evidence fixture","intent_id":`+fmt.Sprint(intent)+`}`), nil)
+	if err != nil || !strings.HasPrefix(res.Flatten(), "finding recorded: ") {
+		t.Fatalf("original optional-evidence contract rejected: %v %s", err, res.Flatten())
+	}
+	var optional db.RecordedFinding
+	if err := json.Unmarshal([]byte(strings.SplitN(res.Flatten(), "\n", 2)[1]), &optional); err != nil {
+		t.Fatal(err)
+	}
+	f, err := d.GetFinding(optional.FindingID)
+	if err != nil || f == nil || f.Evidence != "" {
+		t.Fatalf("optional evidence was not stored as empty: %+v %v", f, err)
 	}
 }
 
@@ -78,11 +86,7 @@ func TestReportFindingAtomicContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stepID, err := ts.ts.AppendActivity(db.Activity{NodeID: &intent, Kind: "tool_result", Tool: "Bash", Detail: "verified"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	proof := fmt.Sprintf(`"evidence":"verified","intent_id":%d,"validation":{"authorization":"fixture scope","asset":"local test","identity":"test account","preconditions":"fixture","baseline":"normal","mutation":"bounded test","observed_delta":"changed response","security_impact":"observed difference","cleanup":"no state change","evidence_step_ids":[%d]},"learning":{"reusable":false}`, intent, stepID)
+	proof := fmt.Sprintf(`"evidence":"verified","intent_id":%d`, intent)
 	notices := 0
 	ts.notifyFinding = func(int64, string) { notices++ }
 	call := func(body string) string {

@@ -538,13 +538,13 @@ func TestSetFindingStatusWithNotifyOnlyEmitsOnRealChange(t *testing.T) {
 	}
 	t.Cleanup(func() { d.Exec(`DELETE FROM notification_events WHERE finding_id=$1`, f.FindingID) })
 
-	// 未审核的漏洞不能产生正式漏洞通知。
+	// Finding creation emits one event; setting the same status must not add another.
 	var base int
 	if err := d.QueryRow(`SELECT count(*) FROM notification_events WHERE finding_id=$1`, f.FindingID).Scan(&base); err != nil {
 		t.Fatal(err)
 	}
-	if base != 0 {
-		t.Fatal("未审核漏洞不应登记通知事件")
+	if base != 1 {
+		t.Fatalf("finding creation should record one event, got %d", base)
 	}
 
 	// 改成同一个状态：不该产生事件（避免重复提交刷出推送噪音）。
@@ -557,6 +557,13 @@ func TestSetFindingStatusWithNotifyOnlyEmitsOnRealChange(t *testing.T) {
 	}
 	if from != "pending" {
 		t.Fatalf("应返回变更前状态 pending，得到 %q", from)
+	}
+	var unchanged int
+	if err := d.QueryRow(`SELECT count(*) FROM notification_events WHERE finding_id=$1`, f.FindingID).Scan(&unchanged); err != nil {
+		t.Fatal(err)
+	}
+	if unchanged != base {
+		t.Fatalf("same status created another event: before=%d after=%d", base, unchanged)
 	}
 
 	// 真正变更：应登记事件并记录 from/to。

@@ -9,10 +9,11 @@ import (
 	"strings"
 	"time"
 
-	"yunkun/console/agent"
-	"yunkun/console/db"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
+	"yunkun/console/agent"
+	"yunkun/console/db"
+	"yunkun/console/report"
 )
 
 // jsonResult marshals v to a JSON tool result.
@@ -448,6 +449,9 @@ func (s *Server) toolUpdateFindingReport() actool.CoreTool {
 			nodeID := parseProfileID(a.FindingID) // 复用「数字或数字字符串」解析
 			if nodeID <= 0 {
 				return actool.Errorf("finding_id 无效"), nil
+			}
+			if report.ContainsCurlCommand(a.Report) {
+				return actool.Errorf("报告不能包含 curl 命令。HTTP 漏洞请先读取并引用已绑定的真实原始 HTTP 请求包（Burp Repeater 格式）；无可用捕获包时如实标注证据缺失，不得用 curl 或 URL 重建请求。"), nil
 			}
 			n, err := s.m.pg.SetFindingReportVersionByNodeID(ctx, nodeID, a.Report, a.EvidenceVersion)
 			if err != nil {

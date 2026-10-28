@@ -1,5 +1,21 @@
 云鲲控制台离线部署
 
+Alibaba Cloud Linux 3 公网首次安装
+  将当前 Linux CPU 对应 ZIP、同目录 SHA256SUMS 和 install-vps.sh 放在 VPS 同一目录。
+  阿里云安全组预先允许 TCP 80 从公网进入（IP 证书验证和续期），
+  TCP 443 从管理员自己的公网 IP 进入；不要放行 5173 或 PostgreSQL 5433。
+  以 root 在该目录执行一次 bash install-vps.sh；脚本在元数据无法获取
+  公网 IPv4 时提示输入 IP，并提示输入证书邮箱及新管理员密码。
+  脚本仅支持全新的 Alibaba Cloud Linux 3 安装，拒绝已有服务/目录。
+  成功后地址为 https://<公网IP>/login/；用户 yunkun，密码为输入值。
+  脚本安装 nginx、Python 3.11/Certbot（需要系统仓库/PyPI 联网）和 systemd
+  服务；应用本体及私有 PostgreSQL 仍离线，保持仅本机监听。
+  证书申请不成功、首次管理员未初始化时不会启用公网反代。
+  运行日志：journalctl -u yunkun-console；私有数据在 /opt/yunkun-console/.yunkun-local。
+  此为首次安装，不迁移已有版本；云安全组无法在没有云账号权限时由脚本修改。
+  systemd 托管环境的应用内离线更新仍需单独验收升级后的进程归属，
+  在完成该项前不要在正式业务机执行一键更新。
+
 适用环境
   Linux x86_64 / ARM64：完整的 Ubuntu 20.04+、Debian 11+ 等 glibc 发行版。
   运行时引用的最高 GLIBC 符号版本为 2.27；不支持 Alpine / musl。

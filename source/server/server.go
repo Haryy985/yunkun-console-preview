@@ -827,8 +827,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/confidential-access-events", s.listConfidentialAccess)
 	s.registerFindingTraffic(mux)
 	mux.HandleFunc("GET /api/exploration/findings/{id}", s.getFinding)
-	mux.HandleFunc("GET /api/exploration/findings/{id}/quality", s.getFindingQuality)
-	mux.HandleFunc("PUT /api/exploration/findings/{id}/quality", s.updateFindingQuality)
 	mux.HandleFunc("GET /api/exploration/findings/{id}/lineage", s.findingLineage)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/deepen", s.deepenFinding)
 	mux.HandleFunc("GET /api/exploration/findings/{id}/retests", s.listFindingRetests)
@@ -836,6 +834,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/exploration/findings/{id}/retests", s.startFindingRetest)
 	mux.HandleFunc("PATCH /api/exploration/findings/{id}", s.patchFinding)
 	mux.HandleFunc("DELETE /api/exploration/findings/{id}", s.deleteFinding)
+	mux.HandleFunc("POST /api/exploration/findings/batch-delete", s.deleteFindingsBatch)
 	mux.HandleFunc("GET /api/exploration/intents", s.intents)
 	mux.HandleFunc("GET /api/exploration/graph", s.explorationGraph)
 	mux.HandleFunc("GET /api/exploration/nodes", s.explorationNodes)
@@ -2221,11 +2220,6 @@ func (s *Server) getFinding(w http.ResponseWriter, r *http.Request) {
 	}
 	assets := s.resolveAssetIDs(f.AssetIDs)
 	dto := findingFromDB(f, assets)
-	dto.Quality, err = s.m.pg.GetFindingQuality(f.ID)
-	if err != nil {
-		writeErr(w, http.StatusServiceUnavailable, "无法读取漏洞质量状态")
-		return
-	}
 	if contextTaskID := strings.TrimSpace(r.URL.Query().Get("context_task")); contextTaskID != "" {
 		contextTask := s.m.ResolveTask(contextTaskID)
 		if contextTask == nil {
@@ -2297,20 +2291,6 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
-	}
-	if format == "md-single" || format == "md-zip" || format == "json" {
-		blockers, qualityErr := s.m.pg.FormalFindingExportBlockers(fs)
-		if qualityErr != nil {
-			writeErr(w, http.StatusServiceUnavailable, "无法核验漏洞质量状态")
-			return
-		}
-		if len(blockers) > 0 {
-			writeJSON(w, http.StatusConflict, map[string]any{
-				"error":    "存在未通过质量门禁的漏洞，不能生成正式交付报告",
-				"blockers": blockers,
-			})
-			return
-		}
 	}
 
 	stage, err := os.MkdirTemp("", "yunkun-finding-export-")
@@ -2555,6 +2535,32 @@ func (s *Server) deleteFinding(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"deleted": true, "id": id})
 }
 
+func (s *Server) deleteFindingsBatch(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
+		writeErr(w, 400, "invalid finding ids")
+		return
+	}
+	if len(body.IDs) == 0 || len(body.IDs) > 100 {
+		writeErr(w, 400, "select 1 to 100 findings")
+		return
+	}
+	if err := s.m.pg.DeleteFindingsAtomic(r.Context(), body.IDs); err != nil {
+		if errors.Is(err, db.ErrFindingNotFound) {
+			writeErr(w, 409, "some findings no longer exist; refresh and retry")
+			return
+		}
+		if errors.Is(err, db.ErrInvalidFindingSelection) {
+			writeErr(w, 400, err.Error())
+			return
+		}
+		writeErr(w, 500, "failed to delete findings")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"deleted": len(body.IDs)})
+}
 func (s *Server) intents(w http.ResponseWriter, r *http.Request) {
 	t := s.m.ResolveTask(r.URL.Query().Get("task"))
 	if t == nil {
@@ -4070,18 +4076,6 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "读取报告证据失败")
 		return
 	}
-	blockers, err := s.taskReportQualityBlockers(findings, references)
-	if err != nil {
-		writeErr(w, http.StatusServiceUnavailable, "无法核验漏洞质量状态")
-		return
-	}
-	if len(blockers) > 0 {
-		writeJSON(w, http.StatusConflict, map[string]any{
-			"error":    "存在未通过质量门禁的漏洞，不能生成正式任务报告",
-			"blockers": blockers,
-		})
-		return
-	}
 	snapshots := map[int64]db.TrafficEvidenceSnapshot{}
 	for _, ref := range references {
 		for _, item := range ref.Traffic {
@@ -4109,62 +4103,6 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 	w.WriteHeader(200)
 	_, _ = w.Write([]byte(md))
-}
-
-// taskReportQualityBlockers keeps the task report on the same formal-delivery
-// path as the findings export. Exploration nodes are not enough on their own:
-// every finding must have a persisted record, an approved quality review, and
-// a report whose evidence version still matches the bound evidence.
-func (s *Server) taskReportQualityBlockers(
-	findings []*db.Node,
-	references map[int64]db.TaskReportReference,
-) ([]string, error) {
-	nodeIDs := make([]int64, 0, len(findings))
-	for _, finding := range findings {
-		if finding != nil {
-			nodeIDs = append(nodeIDs, finding.ID)
-		}
-	}
-	ids := make([]int64, 0, len(references))
-	for _, ref := range references {
-		ids = append(ids, ref.FindingID)
-	}
-	quality, err := s.m.pg.ListFindingQuality(ids)
-	if err != nil {
-		return nil, err
-	}
-	blockers := make([]string, 0)
-	seen := make(map[string]struct{})
-	add := func(value string) {
-		if _, ok := seen[value]; ok {
-			return
-		}
-		seen[value] = struct{}{}
-		blockers = append(blockers, value)
-	}
-	for _, nodeID := range nodeIDs {
-		ref, ok := references[nodeID]
-		if !ok {
-			add(fmt.Sprintf("node#%d:UNREGISTERED", nodeID))
-			continue
-		}
-		for _, blocker := range db.FindingDeliveryMetadataBlockers(ref.FindingID, ref.Severity, ref.Status) {
-			add(blocker)
-		}
-		q := quality[ref.FindingID]
-		if q == nil {
-			add(fmt.Sprintf("#%d:UNREVIEWED", ref.FindingID))
-		} else if q.QualityStatus != db.FindingQualityPass {
-			add(fmt.Sprintf("#%d:%s", ref.FindingID, q.QualityStatus))
-		}
-		if strings.TrimSpace(ref.Report) == "" {
-			add(fmt.Sprintf("#%d:REPORT_MISSING", ref.FindingID))
-		}
-		if ref.ReportEvidenceVersion != ref.EvidenceVersion {
-			add(fmt.Sprintf("#%d:REPORT_EVIDENCE_STALE", ref.FindingID))
-		}
-	}
-	return blockers, nil
 }
 
 func (s *Server) getAudit(w http.ResponseWriter, r *http.Request) {

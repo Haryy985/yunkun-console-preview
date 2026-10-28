@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+var ErrInvalidFindingSelection = errors.New("invalid finding selection")
+
 // DBFinding is a row in the standalone findings table. It persists across task
 // deletion unless the caller explicitly requests related finding cleanup.
 type DBFinding struct {
@@ -730,19 +732,110 @@ func (d *DB) DeleteFinding(id int64) (n int64, err error) {
 			}
 			return err
 		}
-		var nodeID sql.NullInt64
-		if err := tx.QueryRow(`DELETE FROM findings WHERE id=$1 RETURNING node_id`, id).Scan(&nodeID); err != nil {
+		if err := deleteFindingTx(tx, id); err != nil {
 			return err
-		}
-		if nodeID.Valid {
-			if _, err := tx.Exec(`DELETE FROM exploration_nodes WHERE id=$1 AND kind='finding'`, nodeID.Int64); err != nil {
-				return err
-			}
 		}
 		n = 1
 		return nil
 	})
 	return
+}
+
+func deleteFindingTx(tx *sql.Tx, id int64) error {
+	var nodeID sql.NullInt64
+	if err := tx.QueryRow(`DELETE FROM findings WHERE id=$1 RETURNING node_id`, id).Scan(&nodeID); err != nil {
+		return err
+	}
+	if nodeID.Valid {
+		_, err := tx.Exec(`DELETE FROM exploration_nodes WHERE id=$1 AND kind='finding'`, nodeID.Int64)
+		return err
+	}
+	return nil
+}
+
+// DeleteFindingsAtomic either removes every requested finding and its graph node
+// or leaves all of them untouched. Stable ordering avoids cross-request deadlocks.
+func (d *DB) DeleteFindingsAtomic(ctx context.Context, ids []int64) error {
+	if len(ids) == 0 || len(ids) > 100 {
+		return fmt.Errorf("%w: select 1 to 100 findings", ErrInvalidFindingSelection)
+	}
+	ordered := append([]int64(nil), ids...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	for i, id := range ordered {
+		if id <= 0 || (i > 0 && id == ordered[i-1]) {
+			return fmt.Errorf("%w: invalid or duplicate finding id", ErrInvalidFindingSelection)
+		}
+	}
+	return d.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT id, COALESCE(task_id,0)
+FROM findings WHERE id=ANY($1::bigint[]) ORDER BY id`, ordered)
+		if err != nil {
+			return err
+		}
+		foundIDs := make([]int64, 0, len(ordered))
+		taskSet := map[int64]struct{}{}
+		for rows.Next() {
+			var id, taskID int64
+			if err := rows.Scan(&id, &taskID); err != nil {
+				rows.Close()
+				return err
+			}
+			foundIDs = append(foundIDs, id)
+			if taskID > 0 {
+				taskSet[taskID] = struct{}{}
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		if len(foundIDs) != len(ordered) {
+			return ErrFindingNotFound
+		}
+		taskIDs := make([]int64, 0, len(taskSet))
+		for taskID := range taskSet {
+			taskIDs = append(taskIDs, taskID)
+		}
+		sort.Slice(taskIDs, func(i, j int) bool { return taskIDs[i] < taskIDs[j] })
+		for _, taskID := range taskIDs {
+			if err := LockTaskEvidenceTx(tx, taskID); err != nil {
+				return err
+			}
+		}
+		lockedRows, err := tx.QueryContext(ctx, `SELECT id FROM findings
+WHERE id=ANY($1::bigint[]) ORDER BY id FOR UPDATE`, ordered)
+		if err != nil {
+			return err
+		}
+		locked := 0
+		for lockedRows.Next() {
+			var id int64
+			if err := lockedRows.Scan(&id); err != nil {
+				lockedRows.Close()
+				return err
+			}
+			if id != ordered[locked] {
+				lockedRows.Close()
+				return fmt.Errorf("%w: finding set changed during batch delete", ErrFindingNotFound)
+			}
+			locked++
+		}
+		if err := lockedRows.Err(); err != nil {
+			lockedRows.Close()
+			return err
+		}
+		lockedRows.Close()
+		if locked != len(ordered) {
+			return ErrFindingNotFound
+		}
+		for _, id := range ordered {
+			if err := deleteFindingTx(tx, id); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // DeleteFindingsByTask removes all findings rows of a task. The originating

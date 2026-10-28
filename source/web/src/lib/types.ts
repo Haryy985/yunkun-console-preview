@@ -585,7 +585,6 @@ export interface Finding {
   summary: string;
   evidence: string;
   report?: string; // 详细报告(Markdown);仅详情接口返回,列表为空
-  quality?: FindingQuality;
   intent_id?: string;
   param_id?: string;
   task_id?: string;
@@ -594,27 +593,6 @@ export interface Finding {
   inherited?: boolean;
   assets?: FindingAsset[];
   ts: string;
-}
-
-export type FindingQualityStatus = "PASS" | "NEEDS_MORE" | "DOWNGRADE" | "DUPLICATE_RISK" | "BLOCKED";
-
-export interface FindingQuality {
-  finding_id: number;
-  quality_status: FindingQualityStatus;
-  vulnerability_type: string;
-  verification_type: string;
-  baseline_evidence: string;
-  proof_evidence: string;
-  verification_evidence: string;
-  verification_rationale: string;
-  reproduction_count: number;
-  success_count: number;
-  blocking_reason: string;
-  duplicate_risk: string;
-  evidence_integrity: string;
-  reviewer: string;
-  reviewed_at?: string;
-  updated_at: string;
 }
 
 // FindingsPage 是发现列表的服务端分页响应。

@@ -774,12 +774,6 @@ export const api = {
     get<Finding>(
       `/exploration/findings/${id}${contextTaskId ? `?context_task=${encodeURIComponent(contextTaskId)}` : ""}`,
     ),
-  findingQuality: (id: string) => get<import("@/lib/types").FindingQuality>(`/exploration/findings/${id}/quality`),
-  updateFindingQuality: (id: string, input: Partial<import("@/lib/types").FindingQuality>) =>
-    http<import("@/lib/types").FindingQuality>(`/exploration/findings/${id}/quality`, {
-      method: "PUT",
-      body: JSON.stringify(input),
-    }),
   findingTraffic: (id: string, contextTask?: string) =>
     get<FindingTraffic>(
       `/exploration/findings/${id}/traffic${contextTask ? `?context_task=${encodeURIComponent(contextTask)}` : ""}`,
@@ -858,6 +852,8 @@ export const api = {
   ) => patch<Finding>(`/exploration/findings/${id}`, fields),
   // 删除漏洞:移除 findings 记录 + 来源探索节点(从发现列表/任务发现 Tab/探索图一并消失)。
   deleteFinding: (id: string) => del<{ deleted: boolean; id: number }>(`/exploration/findings/${id}`),
+  deleteFindingsBatch: (ids: string[]) =>
+    post<{ deleted: number }>("/exploration/findings/batch-delete", { ids: ids.map(Number) }),
   findingRetests: (id: string) =>
     get<{ retests: FindingRetest[] }>(`/exploration/findings/${encodeURIComponent(id)}/retests`).then((r) =>
       arr(r.retests),

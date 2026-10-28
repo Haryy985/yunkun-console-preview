@@ -19,11 +19,8 @@ func TestReportExportStatusAndLoginLimitIsolation(t *testing.T) {
 	}
 	for _, path := range paths {
 		response := request("GET", path, "")
-		if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), `"blockers"`) {
-			t.Fatalf("quality gate must be 409 with reasons: %s status=%d body=%s", path, response.Code, response.Body)
-		}
-		if response.Header().Get("Content-Disposition") != "" {
-			t.Fatal("blocked response was offered as a report download")
+		if response.Code != http.StatusOK || strings.Contains(response.Body.String(), `"blockers"`) {
+			t.Fatalf("original report export must not require review: %s status=%d body=%s", path, response.Code, response.Body)
 		}
 	}
 	for i := 0; i <= loginUserLimit; i++ {
@@ -32,7 +29,7 @@ func TestReportExportStatusAndLoginLimitIsolation(t *testing.T) {
 			t.Fatal("fixture did not reach login limit", response.Code)
 		}
 	}
-	approveFormalReportFixture(t, s, finding, "Approved local report")
+	approveFormalReportFixture(t, s, finding, "Reviewed local report")
 	for i := 0; i < loginUserLimit+2; i++ {
 		for _, path := range paths {
 			response := request("GET", path, "")

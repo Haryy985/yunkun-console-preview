@@ -21,6 +21,25 @@ func TestDebianMemberBounds(t *testing.T) {
 	}
 }
 
+func TestPackageCandidateVersion(t *testing.T) {
+	for _, tc := range []struct {
+		base, candidate string
+		valid           bool
+	}{
+		{"v1.1.3-offline", "", true},
+		{"v1.1.3-offline", "v1.1.3-offline+review.20261028", true},
+		{"dev", "dev+review", false},
+		{"v1.1.3-offline", "v1.1.4-offline+review", false},
+		{"v1.1.3-offline", "v1.1.3-offline+../../data", false},
+		{"v1.1.3-offline", "v1.1.3-offline+bad name", false},
+		{"v1.1.3-offline", "v1.1.3-offline+", false},
+	} {
+		if got := validPackageVersion(tc.base, tc.candidate); got != tc.valid {
+			t.Errorf("validPackageVersion(%q, %q) = %v, want %v", tc.base, tc.candidate, got, tc.valid)
+		}
+	}
+}
+
 func TestSafeNameRejectsPrivateDataAndTraversal(t *testing.T) {
 	for _, name := range []string{
 		"../config.json", "/runtime/bin/postgres", "runtime/../../secrets",

@@ -15,7 +15,8 @@ import (
 )
 
 func (s *Server) seedFindingWorkflowTools() {
-	s.seedFindingQualitySchema()
+	s.refreshDefaultFindingDescription()
+	s.restoreOriginalFindingSchema()
 	const hostSearchDescriptionFlag = "finding_workflow_tools_v3_host_search_description"
 	if value, _, _ := s.m.pg.GetSetting(hostSearchDescriptionFlag); value != "true" {
 		// Only replace the original built-in text. A user-edited description is
@@ -107,30 +108,29 @@ func (s *Server) seedFindingWorkflowTools() {
 	_ = s.m.pg.SetSetting(flag, "true")
 }
 
-// Existing installations keep their edited descriptions, bindings and switch.
-// Only the newly introduced parameters and validation requirement are merged.
-func (s *Server) seedFindingQualitySchema() {
-	const flag = "finding_quality_schema_v1"
-	if value, ok, err := s.m.pg.GetSetting(flag); err != nil {
-		log.Printf("[finding] read quality migration: %v", err)
-		return
-	} else if ok && value == "true" {
-		return
-	}
-	var defaults map[string]any
+const previousFindingDescription = "仅记录证据齐全且有实际安全影响的已确认漏洞。不要把 CORS、IDOR、BOLA 作为独立正式漏洞；它们只有在已证明数据读取、权限提升或重大业务影响链时才按最终影响报告，否则用 record_fact 保存线索。validation 填写授权、目标、身份、基线、受控变异、实际差异、影响和清理；提供本任务成功工具结果的 evidence_step_ids 或核实的 traffic_refs。缺失则用 record_fact 记录待验证线索，不得硬报。返回 finding_id 与 finding_node_id。"
+const restrictedFindingDescription = "仅记录证据齐全且有实际安全影响的已确认漏洞。本项目排除 CORS、IDOR、BOLA 专项和正式报告；相关观察只用 record_fact 保存线索，不得改标签或夸大影响绕过排除规则。validation 填写授权、目标、身份、基线、受控变异、实际差异、影响和清理；提供本任务成功工具结果的 evidence_step_ids 或核实的 traffic_refs。缺失则用 record_fact 记录待验证线索，不得硬报。返回 finding_id 与 finding_node_id。"
+
+// Update only the previously shipped default. A customized tool description
+// remains the administrator's choice and is never replaced here.
+func (s *Server) refreshDefaultFindingDescription() {
 	for _, seed := range agent.BuiltinToolSeeds() {
-		if seed.Key == "report_finding" {
-			defaults = seed.Schema
-			break
+		if seed.Key != "report_finding" {
+			continue
 		}
-	}
-	props, _ := defaults["properties"].(map[string]any)
-	if props == nil {
+		if _, err := s.m.pg.Exec(`UPDATE tools SET description=$1,updated_at=now()
+WHERE key='report_finding' AND system AND description IN ($2,$3)`, seed.Desc, previousFindingDescription, restrictedFindingDescription); err != nil {
+			log.Printf("[finding] refresh default description: %v", err)
+		}
 		return
 	}
+}
+
+// Remove only finding-specific fields added by the review workflow.
+func (s *Server) restoreOriginalFindingSchema() {
 	row, err := s.m.pg.GetTool("report_finding")
 	if err != nil || row == nil || !row.System {
-		log.Printf("[finding] load report_finding quality schema: %v", err)
+		log.Printf("[finding] load report_finding schema: %v", err)
 		return
 	}
 	var schema map[string]any
@@ -142,30 +142,39 @@ func (s *Server) seedFindingQualitySchema() {
 		return
 	}
 	existing := objectProperty(schema, "properties")
-	for _, name := range []string{"validation", "learning"} {
-		if _, ok := existing[name]; !ok {
-			existing[name] = props[name]
-		}
+	changed := false
+	if _, ok := existing["validation"]; ok {
+		delete(existing, "validation")
+		changed = true
+	}
+	if _, ok := existing["learning"]; ok {
+		delete(existing, "learning")
+		changed = true
 	}
 	required, _ := schema["required"].([]any)
-	found := false
+	kept := make([]any, 0, len(required))
 	for _, name := range required {
-		found = found || name == "validation"
+		if name != "validation" && name != "learning" {
+			kept = append(kept, name)
+		} else {
+			changed = true
+		}
 	}
-	if !found {
-		schema["required"] = append(required, "validation")
+	schema["required"] = kept
+	if !changed {
+		return
 	}
 	raw, _ := json.Marshal(schema)
+	if string(raw) == string(row.Schema) {
+		return
+	}
 	res, err := s.m.pg.Exec(`UPDATE tools SET schema=$2::jsonb, updated_at=now()
 WHERE key='report_finding' AND system AND schema=$1::jsonb`, string(row.Schema), string(raw))
 	if err != nil {
-		log.Printf("[finding] migrate report_finding schema: %v", err)
+		log.Printf("[finding] restore report_finding schema: %v", err)
 		return
 	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return
-	}
-	_ = s.m.pg.SetSetting(flag, "true")
+	_, _ = res.RowsAffected()
 }
 
 func objectProperty(parent map[string]any, key string) map[string]any {

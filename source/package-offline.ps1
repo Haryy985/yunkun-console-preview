@@ -62,7 +62,7 @@ foreach ($file in @(
     'bin\yunkun.exe', 'setup-and-start-offline.bat', 'setup-and-start-offline.ps1',
     'stop-offline.bat', 'upgrade-offline.ps1', 'README.md', 'CHANGELOG.md',
     'NOTICE.md', 'LICENSE', 'config.example.json',
-    'docs\README.md', 'docs\OFFLINE_UPDATE.md', 'docs\RELEASE_1.1.0.md', 'docs\RELEASE_1.1.2.md', 'docs\DEPLOYMENT.md',
+    'docs\README.md', 'docs\OFFLINE_UPDATE.md', 'docs\RELEASE_1.1.0.md', 'docs\RELEASE_1.1.2.md', 'docs\RELEASE_1.1.3.md', 'docs\DEPLOYMENT.md',
     'docs\WINDOWS.md', 'docs\agent-reliability-2026-10-16.md',
     'screenshots\dashboard.png', 'screenshots\llm.png', 'screenshots\proxy-pools.png',
     'screenshots\rag.png', 'screenshots\settings-dark.png'

@@ -186,6 +186,7 @@ func TestRoleAllowsTaskAndSensitiveAPIsAdminOnly(t *testing.T) {
 		{"POST", "/api/tasks/1/control"},
 		{"POST", "/api/tasks/1/network/lease"},
 		{"GET", "/api/exploration/findings"},
+		{"POST", "/api/exploration/findings/batch-delete"},
 		{"GET", "/api/exploration/findings/1/traffic"},
 		{"GET", "/api/exploration/activity/history"},
 		{"GET", "/api/proxy-pools"},

@@ -14,7 +14,7 @@ import (
 
 const maxInlineRequestBody = 16 * 1024
 
-var curlCommand = regexp.MustCompile(`(?im)^\s*(?:\$\s*)?curl(?:\.exe)?\s`)
+var curlCommand = regexp.MustCompile(`(?im)(?:^\s*(?:(?:[-*+>]|\d+[.)])\s*)?(?:\$\s*|PS [^>\r\n]*>\s*)?curl(?:\.exe)?\s|` + "`curl(?:\\.exe)?\\s)")
 
 func ContainsCurlCommand(text string) bool {
 	return curlCommand.MatchString(text)

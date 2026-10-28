@@ -749,28 +749,28 @@ export default function FindingsPage() {
     batchDeleteLock.current = true;
     setBatchDeleting(true);
     setDeleteProgress(0);
-    const deleted = new Set<string>();
-    const failures: string[] = [];
     try {
-      for (const [index, id] of deleteCandidates.entries()) {
-        try {
-          await api.deleteFinding(id);
-          deleted.add(id);
-        } catch (error) {
-          failures.push(`${id}: ${(error as Error).message}`);
-        }
-        setDeleteProgress(index + 1);
-      }
+      await api.deleteFindingsBatch(deleteCandidates);
+    } catch (error) {
+      toast.error(`批量删除失败，未删除任何记录：${(error as Error).message}`);
+      batchDeleteLock.current = false;
+      setBatchDeleting(false);
+      return;
+    }
+    try {
+      const deleted = new Set(deleteCandidates);
+      setDeleteProgress(deleted.size);
       setFindings((items) => items.filter((item) => !item.finding_id || !deleted.has(item.finding_id)));
       setSelectedIds((current) => new Set([...current].filter((id) => !deleted.has(id))));
       setExpanded(null);
-      if (deleted.size) toast.success(`已删除 ${deleted.size} 条发现`);
-      if (failures.length) toast.error(`${failures.length} 条删除失败，已保留勾选`, { description: failures[0] });
+      toast.success(`已删除 ${deleted.size} 条发现`);
       await api.findingStats().then(setStats).catch(() => toast.error("删除结果已保存，统计刷新失败"));
       await Promise.all([loadFlat(), refreshGroups(), loadAssetTree()]);
       for (const [key, state] of Object.entries(groupFindingsRef.current)) {
         if (state.loaded) await loadGroup(key, state.page, state.pageSize);
       }
+    } catch (error) {
+      toast.error(`删除已完成，但列表刷新失败：${(error as Error).message}`);
     } finally {
       batchDeleteLock.current = false;
       setBatchDeleting(false);
@@ -1026,13 +1026,14 @@ export default function FindingsPage() {
             <DialogHeader>
               <DialogTitle>删除 {deleteCandidates.length} 条发现？</DialogTitle>
               <DialogDescription>
-                将永久删除所有勾选的发现，包括其他分页中的勾选项，同时移除任务发现与探索图中的关联。此操作不可撤销。
+                将永久删除所有勾选的发现，包括其他分页中的勾选项，同时移除任务发现与探索图中的关联。一次最多 100 条，全部成功或全部不删除。此操作不可撤销。
               </DialogDescription>
             </DialogHeader>
+            {deleteCandidates.length > 100 ? <p role="alert" className="text-sm text-destructive">一次最多删除 100 条，请缩小勾选范围。</p> : null}
             {batchDeleting ? <p role="status" className="text-sm">已处理 {deleteProgress}/{deleteCandidates.length}</p> : null}
             <DialogFooter>
               <Button variant="outline" disabled={batchDeleting} onClick={() => setDeleteCandidates([])}>取消</Button>
-              <Button variant="destructive" disabled={batchDeleting} onClick={() => void deleteSelectedFindings()}>
+              <Button variant="destructive" disabled={batchDeleting || deleteCandidates.length > 100} onClick={() => void deleteSelectedFindings()}>
                 <Trash2Icon /> 确认删除
               </Button>
             </DialogFooter>

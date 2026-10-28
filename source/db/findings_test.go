@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,69 @@ import (
 	"testing"
 	"time"
 )
+
+func TestDeleteFindingsAtomic(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable: %v", err)
+	}
+	defer d.Close()
+	task, err := d.CreateTask("batch-delete-fixture", "local", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.DeleteTask(task.ID)
+	var ids, nodes []int64
+	for range 2 {
+		f, err := d.Exploration(task.ExplorationID).RecordFinding(context.Background(), RecordFindingInput{
+			TaskID: task.ID, Worker: "fixture", VulnClass: "access control", Severity: SeverityHigh,
+			Summary: "local test", Evidence: "proof",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, f.FindingID)
+		nodes = append(nodes, f.NodeID)
+	}
+	for _, selection := range [][]int64{nil, {ids[0], ids[0]}, {ids[0], -1}, {ids[0], 999999999}} {
+		if err := d.DeleteFindingsAtomic(context.Background(), selection); err == nil {
+			t.Fatalf("invalid selection %v succeeded", selection)
+		}
+		for _, id := range ids {
+			if f, err := d.GetFinding(id); err != nil || f == nil {
+				t.Fatalf("invalid selection partially removed %d: %+v, %v", id, f, err)
+			}
+		}
+	}
+	if err := d.DeleteFindingsAtomic(context.Background(), []int64{ids[1], ids[0]}); err != nil {
+		t.Fatal(err)
+	}
+	for i, id := range ids {
+		f, err := d.GetFinding(id)
+		if err != nil || f != nil {
+			t.Fatalf("finding %d survived: %+v, %v", id, f, err)
+		}
+		var count int
+		if err := d.QueryRow(`SELECT count(*) FROM exploration_nodes WHERE id=$1`, nodes[i]).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("graph node %d survived: %d, %v", nodes[i], count, err)
+		}
+	}
+}
+
+func TestDeleteFindingsAtomicRejectsInvalidSelectionsBeforeDatabase(t *testing.T) {
+	d := &DB{}
+	for _, ids := range [][]int64{
+		nil,
+		{1, 1},
+		{0},
+		{-1},
+		make([]int64, 101),
+	} {
+		if err := d.DeleteFindingsAtomic(context.Background(), ids); !errors.Is(err, ErrInvalidFindingSelection) {
+			t.Fatalf("selection %v: got %v, want ErrInvalidFindingSelection", ids, err)
+		}
+	}
+}
 
 // TestDeleteFinding verifies删除漏洞 removes both the findings row and its
 // originating exploration node (kind='finding').
